@@ -116,13 +116,110 @@ app = Flask(__name__)
 CORS(app)
 
 # =============================================================================
-# Utility helpers
+# Runtime CLI config
 # =============================================================================
 
-def log_debug(*args: Any) -> None:
-    if DEBUG_LOG:
-        print(*args)
+def get_cache_first_messages() -> int:
+    """
+    Runtime value. Initially loaded from .env, but may be changed from the CLI.
+    """
+    return CACHE_FIRST_MESSAGES
 
+
+def set_cache_first_messages(value: int) -> int:
+    """
+    Updates CACHE_FIRST_MESSAGES in memory only.
+    Does not write to .env.
+    """
+    global CACHE_FIRST_MESSAGES
+
+    if value < 0:
+        raise ValueError("CACHE_FIRST_MESSAGES must be >= 0.")
+
+    CACHE_FIRST_MESSAGES = value
+    return CACHE_FIRST_MESSAGES
+
+
+def print_runtime_status() -> None:
+    print()
+    print("=== Runtime config ===")
+    print(f"PROMPT_CACHE         = {PROMPT_CACHE}")
+    print(f"CACHE_TTL            = {CACHE_TTL}")
+    print(f"CACHE_SYSTEM_PROMPT  = {CACHE_SYSTEM_PROMPT}")
+    print(f"CACHE_FIRST_MESSAGES = {get_cache_first_messages()}")
+    print("======================")
+    print()
+
+
+def admin_cli_loop() -> None:
+    """
+    Tiny local CLI for changing runtime-only settings.
+    """
+    print("Runtime CLI ready. Type 'help' for commands.")
+    print()
+
+    while True:
+        try:
+            line = input("> ").strip()
+        except EOFError:
+            return
+        except KeyboardInterrupt:
+            print()
+            return
+
+        if not line:
+            continue
+
+        parts   = line.split()
+        command = parts[0].lower()
+
+        try:
+            if command in {"cache_first_messages", "cfm"}:
+                if len(parts) != 2:
+                    print("Usage: cache_first_messages <number>")
+                    continue
+
+                value = int(parts[1])
+                updated = set_cache_first_messages(value)
+                print(f"Now caching {updated} messages.")
+                continue
+
+            if command in {"show", "status"}:
+                print_runtime_status()
+                continue
+
+            if command == "help":
+                print()
+                print("Commands:")
+                print("  cache_first_messages <number>  Set cached message count")
+                print("    cfm <number>")
+                print("  show                           Show runtime settings")
+                print("  help                           Show this help")
+                print("  quit                           Stop the process")
+                print("    exit")
+                print()
+                continue
+
+            if command in {"quit", "exit"}:
+                print("Stopping proxy.")
+                os._exit(0)
+
+            print(f"Unknown command: {command}")
+            print("Type 'help' for commands.")
+
+        except ValueError as exc:
+            print(f"Invalid value: {exc}")
+        except Exception as exc:
+            print(f"CLI error: {exc}")
+
+
+def start_admin_cli() -> None:
+    thread = threading.Thread(target=admin_cli_loop, daemon=True)
+    thread.start()
+
+# =============================================================================
+# Utility helpers
+# =============================================================================
 
 def write_error_log(body: Any) -> None:
     try:
@@ -382,15 +479,15 @@ def format_system_for_claude(system_prompt: Optional[str]) -> Optional[Any]:
     if not blocks:
         return None
 
-    system_prompt: List[Dict[str, Any]] = []
+    formatted_system: List[Dict[str, Any]] = []
 
     for block in blocks:
         new_block: Dict[str, Any] = dict(block)
         if (PROMPT_CACHE and CACHE_SYSTEM_PROMPT and new_block.get("type") == "text" and new_block.get("text", "").strip()):
             new_block["cache_control"] = make_cache_control()
-        system_prompt.append(new_block)
+        formatted_system.append(new_block)
 
-    return system_prompt
+    return formatted_system
 
 
 def format_to_claude_messages(mlist: List[Dict[str, str]]) -> List[Dict[str, Any]]:
@@ -406,10 +503,10 @@ def format_to_claude_messages(mlist: List[Dict[str, str]]) -> List[Dict[str, Any
     to the last user message instead.
     """
 
-    cache_target_index = 0
+    cache_first_messages = get_cache_first_messages()
+    cache_target_index   = 0
     if PROMPT_CACHE and CACHE_FIRST_MESSAGES > 0 and mlist:
-        # If fewer than N messages exist, cache through the last available message.
-        cache_target_index = min(CACHE_FIRST_MESSAGES, len(mlist))
+        cache_target_index = min(cache_first_messages, len(mlist))
 
     formatted = [{"role": "user", "content": "<OOC>\nBegin the scenario.\n</OOC>"}]
     old_role  = "user"
@@ -473,10 +570,6 @@ def trim_to_end_sentence(input_str: str, include_newline: bool = False) -> str:
     return input_str[: last + 1].rstrip()
 
 
-def auto_trim_text(text: str) -> str:
-    return trim_to_end_sentence(text)
-
-
 def extract_text_from_anthropic_message(message: Any) -> str:
     """
     Collects text blocks from an Anthropic response.
@@ -491,8 +584,9 @@ def extract_text_from_anthropic_message(message: Any) -> str:
 
     return "".join(chunks)
 
+
 def token_cost_usd(tokens: int, usd_per_million_tokens: float) -> float:
-    return (tokens * usd_per_million_tokens) / 1_000_000.0
+    return (tokens*usd_per_million_tokens)/1_000_000.0
 def format_usd(amount: float) -> str:
     sign = "-" if amount < 0 else ""
     return f"{sign}${abs(amount):,.6f}"
@@ -502,8 +596,11 @@ def cache_net_label(net_cost_usd: float) -> str:
     if net_cost_usd > 0:
         return f"{format_usd(net_cost_usd)} lost"
     return "$0.000000 break-even"
-def print_openai_usage(usage: Any) -> None:
+
+def print_usage(usage: Any) -> None:
     global SESSION_TOTAL_SPENT_USD, SESSION_CACHE_NET_COST_USD
+    if not DEBUG_LOG:
+        return
 
     cache_creation       = getattr(usage, "cache_creation", {}) or {}
     ephemeral_1h         = int(getattr(cache_creation, "ephemeral_1h_input_tokens", 0) or 0)
@@ -552,7 +649,7 @@ def print_openai_usage(usage: Any) -> None:
         session_total_spent    = SESSION_TOTAL_SPENT_USD
         session_cache_net_cost = SESSION_CACHE_NET_COST_USD
 
-    log_debug("=== Claude usage ===")
+    print("=== Claude usage start ===")
     print("Total input tokens =   uncached + cache read + cache write (        1h +         5m)")
     print("{:18d} = {:10d} + {:10d} + {:11d} ({:10d} + {:10d})".format(ttl_tokens, input_tokens, cache_read, cache_creation_input, ephemeral_1h, ephemeral_5m))
     print("{:>18s} = {:>10s} + {:>10s} + {:>11s} ({:>10s} + {:>10s})".format(format_usd(total_input_cost), format_usd(input_cost), format_usd(cache_read_cost), format_usd(cache_write_cost), format_usd(cache_write_1h_cost), format_usd(cache_write_5m_cost)))
@@ -561,7 +658,8 @@ def print_openai_usage(usage: Any) -> None:
     print("Session cache cost = {} ({})".format(format_usd(session_cache_net_cost), cache_net_label(session_cache_net_cost)))
     print("Request total cost = {}".format(format_usd(request_total_cost)))
     print("Session total cost = {}".format(format_usd(session_total_spent)))
-    log_debug("=== End Claude usage ===")
+    print("=== Claude usage end ===")
+    print("> ", end="", flush=True)
 
 
 def usage_to_openai_dict(usage: Any) -> Dict[str, int]:
@@ -663,11 +761,11 @@ def build_claude_kwargs(payload: Dict[str, Any], route_model: str) -> Dict[str, 
     return kwargs
 
 
-def make_openai_nonstream_response(message: Any, model: str) -> Dict[str, Any]:
+def make_openai_non_stream_response(message: Any, model: str) -> Dict[str, Any]:
     output_text = extract_text_from_anthropic_message(message)
 
     if AUTO_TRIM:
-        output_text = auto_trim_text(output_text)
+        output_text = trim_to_end_sentence(output_text)
 
     usage = getattr(message, "usage", None)
 
@@ -736,31 +834,35 @@ def make_error_response(exc: Exception, payload: Optional[Dict[str, Any]] = None
 # =============================================================================
 # Generation
 # =============================================================================
+def print_payload(kwargs: Dict[str, Any]) -> None:
+    if not DEBUG_LOG:
+        return
+    print("")
+    print("=== Claude payload start ===")
+    print(json.dumps(kwargs, indent=2, ensure_ascii=False))
+    print("=== Claude payload end ===")
 
-def generate_nonstream(payload: Dict[str, Any], route_model: str) -> Dict[str, Any]:
+
+def generate_non_stream(payload: Dict[str, Any], route_model: str) -> Dict[str, Any]:
     client = get_anthropic_client()
     kwargs = build_claude_kwargs(payload, route_model)
 
-    log_debug("=== Payload sent to Claude ===")
-    log_debug(json.dumps(kwargs, indent=2, ensure_ascii=False))
-    log_debug("=== End Claude payload ===")
+    print_payload(kwargs)
 
     message = client.messages.create(**kwargs)
 
     usage = getattr(message, "usage", None)
-    print_openai_usage(usage)
+    print_usage(usage)
 
     model_used = kwargs.get("model", route_model)
-    return make_openai_nonstream_response(message, model_used)
+    return make_openai_non_stream_response(message, model_used)
 
 
 def generate_stream(payload: Dict[str, Any], route_model: str):
     client = get_anthropic_client()
     kwargs = build_claude_kwargs(payload, route_model)
 
-    log_debug("=== Payload sent to Claude ===")
-    log_debug(json.dumps(kwargs, indent=2, ensure_ascii=False))
-    log_debug("=== End Claude payload ===")
+    print_payload(kwargs)
 
     model_used = kwargs.get("model", route_model)
 
@@ -789,7 +891,7 @@ def generate_stream(payload: Dict[str, Any], route_model: str):
         final_message = stream.get_final_message()
 
         usage = getattr(final_message, "usage", None)
-        print_openai_usage(usage)
+        print_usage(usage)
 
         final_event = {
             "id": getattr(final_message, "id", "claude"),
@@ -834,7 +936,7 @@ def handle_chat_completion(route_model: str):
                 },
             )
 
-        response = generate_nonstream(payload, route_model)
+        response = generate_non_stream(payload, route_model)
         return jsonify(response)
 
     except Exception as exc:
@@ -948,4 +1050,5 @@ if __name__ == "__main__":
         print("Requests will fail until you configure one of these modes.")
         print()
 
+    start_admin_cli()
     serve(app, host=HOST, port=PORT)
