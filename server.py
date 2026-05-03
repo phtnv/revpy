@@ -14,19 +14,31 @@ from waitress import serve
 
 load_dotenv()
 
-# =============================================================================
 # Configuration
-# =============================================================================
 def getenv_float(name: str, default: float) -> float:
-    """
-    Reads a float from the environment while keeping startup resilient if a
-    value is missing or malformed.
-    """
     raw = os.getenv(name, str(default)).strip()
     try:
         return float(raw)
     except ValueError:
         print(f"WARNING: {name} must be a number. Defaulting to {default}.")
+        return default
+def getenv_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"true", "1", "yes", "y", "on"}:
+        return True
+    if value in {"false", "0", "no", "n", "off"}:
+        return False
+    print(f"WARNING: {name} must be boolean. Defaulting to {default}.")
+    return default
+def getenv_int(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"WARNING: {name} must be an integer. Defaulting to {default}.")
         return default
 
 HOST = os.getenv("HOST", "127.0.0.1")
@@ -59,17 +71,14 @@ AUTO_TRIM = os.getenv("AUTO_TRIM", "true").lower() == "true"
 # For safety and reliability, keep this blank unless you have a benign reason to use it.
 ASSISTANT_PREFILL = os.getenv("ASSISTANT_PREFILL", "")
 
-# assistant: old behavior, sends ASSISTANT_PREFILL as an assistant message/prefill.
-# instruction: appends an OOC instruction containing ASSISTANT_PREFILL to the last user message.
+# assistant   : sends ASSISTANT_PREFILL as an assistant message/prefill.
+# instruction : appends an OOC instruction containing ASSISTANT_PREFILL to the last user message.
 # PREFILL_MODE is accepted as a shorter backwards-compatible alias.
 ASSISTANT_PREFILL_MODE = os.getenv("ASSISTANT_PREFILL_MODE", os.getenv("PREFILL_MODE", "assistant")).strip().lower()
 
 VALID_ASSISTANT_PREFILL_MODES = {"assistant", "instruction"}
 if ASSISTANT_PREFILL_MODE not in VALID_ASSISTANT_PREFILL_MODES:
-    print(
-        "WARNING: ASSISTANT_PREFILL_MODE must be 'assistant' or 'instruction'. "
-        "Defaulting to 'assistant'."
-    )
+    print("WARNING: ASSISTANT_PREFILL_MODE must be 'assistant' or 'instruction'. Defaulting to 'assistant'.")
     ASSISTANT_PREFILL_MODE = "assistant"
 
 # Generation defaults
@@ -81,14 +90,12 @@ TOP_K                = int(os.getenv("TOP_K", "75"))
 DEFAULT_MAX_TOKENS   = int(os.getenv("DEFAULT_MAX_TOKENS", "1000"))
 
 # Cost tracking.
-# Values are USD per 1 million tokens. Defaults are Anthropic's Claude Sonnet
-# 4.5 API prices: input $3/MTok, output $15/MTok, 5m cache write $3.75/MTok,
-# 1h cache write $6/MTok, and cache read $0.30/MTok.
-INPUT_TOKEN_COST_USD      = getenv_float("INPUT_TOKEN_COST_USD"   ,  3.00)
-OUTPUT_TOKEN_COST_USD     = getenv_float("OUTPUT_TOKEN_COST_USD"  , 15.00)
-CACHE_WRITE_5M_COST_USD   = getenv_float("CACHE_WRITE_5M_COST_USD",  3.75)
-CACHE_WRITE_1H_COST_USD   = getenv_float("CACHE_WRITE_1H_COST_USD",  6.00)
-CACHE_READ_COST_USD       = getenv_float("CACHE_READ_COST_USD"    ,  0.30)
+# Values are USD per 1 million tokens. Defaults are Anthropic's Claude Sonnet 4.5 API prices.
+INPUT_TOKEN_COST_USD    = getenv_float("INPUT_TOKEN_COST_USD"   ,  3.00)
+OUTPUT_TOKEN_COST_USD   = getenv_float("OUTPUT_TOKEN_COST_USD"  , 15.00)
+CACHE_WRITE_5M_COST_USD = getenv_float("CACHE_WRITE_5M_COST_USD",  3.75)
+CACHE_WRITE_1H_COST_USD = getenv_float("CACHE_WRITE_1H_COST_USD",  6.00)
+CACHE_READ_COST_USD     = getenv_float("CACHE_READ_COST_USD"    ,  0.30)
 
 # Prompt caching.
 # Anthropic supports automatic top-level caching and explicit block-level caching.
@@ -101,7 +108,6 @@ CACHE_FIRST_MESSAGES = max(0, int(os.getenv("CACHE_FIRST_MESSAGES", "0")))
 
 ERROR_LOG_PATH = os.getenv("ERROR_LOG_PATH", "claude_error_log.txt")
 
-
 # Session cost totals since this process started.
 # SESSION_CACHE_NET_COST_USD is positive when caching has cost extra money and
 # negative when caching has saved money.
@@ -109,45 +115,108 @@ SESSION_TOTAL_SPENT_USD    = 0.0
 SESSION_CACHE_NET_COST_USD = 0.0
 SESSION_COST_LOCK          = threading.Lock()
 
-# =============================================================================
 # Flask app
-# =============================================================================
 app = Flask(__name__)
 CORS(app)
 
-# =============================================================================
 # Runtime CLI config
-# =============================================================================
+def reload_runtime_env() -> None:
+    """
+    Reloads runtime configuration from .env.
+
+    HOST and PORT are intentionally not reloaded because Waitress is already
+    bound to them. Changing those requires restarting the process.
+    """
+    global DEFAULT_MODEL, HAIKU_MODEL, SONNET_MODEL, SONNET35_MODEL, OPUS_MODEL, ANTHROPIC_API_KEY, PROXY_KEY
+    global REQUIRE_PROXY_KEY, ALLOW_KEY_PASSTHROUGH, DEBUG_LOG, AUTO_TRIM, ASSISTANT_PREFILL, ASSISTANT_PREFILL_MODE
+    global TEMPERATURE_OVERRIDE, DEFAULT_TEMPERATURE, SEND_TOP_P, TOP_P, TOP_K, DEFAULT_MAX_TOKENS
+    global INPUT_TOKEN_COST_USD, OUTPUT_TOKEN_COST_USD, CACHE_WRITE_5M_COST_USD, CACHE_WRITE_1H_COST_USD, CACHE_READ_COST_USD
+    global PROMPT_CACHE, CACHE_TTL, CACHE_SYSTEM_PROMPT, CACHE_FIRST_MESSAGES, ERROR_LOG_PATH
+
+    # override=True is important. Without it, changed .env values would not replace values already loaded into os.environ.
+    load_dotenv(override=True)
+
+    DEFAULT_MODEL          = os.getenv("DEFAULT_MODEL", "claude-sonnet-4-5-20250929")
+    HAIKU_MODEL            = os.getenv("HAIKU_MODEL", DEFAULT_MODEL)
+    SONNET_MODEL           = os.getenv("SONNET_MODEL", DEFAULT_MODEL)
+    SONNET35_MODEL         = os.getenv("SONNET35_MODEL", DEFAULT_MODEL)
+    OPUS_MODEL             = os.getenv("OPUS_MODEL", DEFAULT_MODEL)
+    ANTHROPIC_API_KEY      = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    PROXY_KEY              = os.getenv("PROXY_KEY", "").strip()
+    REQUIRE_PROXY_KEY      = getenv_bool("REQUIRE_PROXY_KEY", True)
+    ALLOW_KEY_PASSTHROUGH  = getenv_bool("ALLOW_KEY_PASSTHROUGH", False)
+    DEBUG_LOG              = getenv_bool("DEBUG_LOG", True)
+    AUTO_TRIM              = getenv_bool("AUTO_TRIM", True)
+    ASSISTANT_PREFILL      = os.getenv("ASSISTANT_PREFILL", "")
+    ASSISTANT_PREFILL_MODE = os.getenv("ASSISTANT_PREFILL_MODE", os.getenv("PREFILL_MODE", "assistant")).strip().lower()
+    if ASSISTANT_PREFILL_MODE not in VALID_ASSISTANT_PREFILL_MODES:
+        print("WARNING: ASSISTANT_PREFILL_MODE must be 'assistant' or 'instruction'. Defaulting to 'assistant'.")
+        ASSISTANT_PREFILL_MODE = "assistant"
+
+    TEMPERATURE_OVERRIDE = getenv_float("TEMPERATURE_OVERRIDE", -1.0)
+    DEFAULT_TEMPERATURE  = getenv_float("DEFAULT_TEMPERATURE", 0.9)
+    SEND_TOP_P           = getenv_bool("SEND_TOP_P", False)
+    TOP_P                = getenv_float("TOP_P", 0.9)
+    TOP_K                = getenv_int("TOP_K", 75)
+    DEFAULT_MAX_TOKENS   = getenv_int("DEFAULT_MAX_TOKENS", 1000)
+
+    INPUT_TOKEN_COST_USD    = getenv_float("INPUT_TOKEN_COST_USD"   ,  3.00)
+    OUTPUT_TOKEN_COST_USD   = getenv_float("OUTPUT_TOKEN_COST_USD"  , 15.00)
+    CACHE_WRITE_5M_COST_USD = getenv_float("CACHE_WRITE_5M_COST_USD",  3.75)
+    CACHE_WRITE_1H_COST_USD = getenv_float("CACHE_WRITE_1H_COST_USD",  6.00)
+    CACHE_READ_COST_USD     = getenv_float("CACHE_READ_COST_USD"    ,  0.30)
+
+    PROMPT_CACHE         = getenv_bool("PROMPT_CACHE", True)
+    CACHE_TTL            = os.getenv("CACHE_TTL", "5m").strip()
+    CACHE_SYSTEM_PROMPT  = getenv_bool("CACHE_SYSTEM_PROMPT", True)
+    CACHE_FIRST_MESSAGES = max(0, getenv_int("CACHE_FIRST_MESSAGES", 0))
+
+    ERROR_LOG_PATH = os.getenv("ERROR_LOG_PATH", "claude_error_log.txt")
+
+    print("Reloaded runtime configuration from .env.")
+    print("HOST and PORT were not changed; restart the process to change bind address.")
+
 
 def get_cache_first_messages() -> int:
-    """
-    Runtime value. Initially loaded from .env, but may be changed from the CLI.
-    """
     return CACHE_FIRST_MESSAGES
 
 
 def set_cache_first_messages(value: int) -> int:
-    """
-    Updates CACHE_FIRST_MESSAGES in memory only.
-    Does not write to .env.
-    """
     global CACHE_FIRST_MESSAGES
-
     if value < 0:
         raise ValueError("CACHE_FIRST_MESSAGES must be >= 0.")
-
     CACHE_FIRST_MESSAGES = value
     return CACHE_FIRST_MESSAGES
 
 
 def print_runtime_status() -> None:
     print()
-    print("=== Runtime config ===")
-    print(f"PROMPT_CACHE         = {PROMPT_CACHE}")
-    print(f"CACHE_TTL            = {CACHE_TTL}")
-    print(f"CACHE_SYSTEM_PROMPT  = {CACHE_SYSTEM_PROMPT}")
-    print(f"CACHE_FIRST_MESSAGES = {get_cache_first_messages()}")
-    print("======================")
+    print("=== Runtime config start ===")
+    print(f"HOST                   = {HOST} (restart required to change)")
+    print(f"PORT                   = {PORT} (restart required to change)")
+    print(f"DEFAULT_MODEL          = {DEFAULT_MODEL}")
+    print(f"HAIKU_MODEL            = {HAIKU_MODEL}")
+    print(f"SONNET_MODEL           = {SONNET_MODEL}")
+    print(f"SONNET35_MODEL         = {SONNET35_MODEL}")
+    print(f"OPUS_MODEL             = {OPUS_MODEL}")
+    print(f"REQUIRE_PROXY_KEY      = {REQUIRE_PROXY_KEY}")
+    print(f"ALLOW_KEY_PASSTHROUGH  = {ALLOW_KEY_PASSTHROUGH}")
+    print(f"DEBUG_LOG              = {DEBUG_LOG}")
+    print(f"AUTO_TRIM              = {AUTO_TRIM}")
+    print(f"ASSISTANT_PREFILL      = {'set' if ASSISTANT_PREFILL.strip() else 'empty'}")
+    print(f"ASSISTANT_PREFILL_MODE = {ASSISTANT_PREFILL_MODE}")
+    print(f"TEMPERATURE_OVERRIDE   = {TEMPERATURE_OVERRIDE}")
+    print(f"DEFAULT_TEMPERATURE    = {DEFAULT_TEMPERATURE}")
+    print(f"SEND_TOP_P             = {SEND_TOP_P}")
+    print(f"TOP_P                  = {TOP_P}")
+    print(f"TOP_K                  = {TOP_K}")
+    print(f"DEFAULT_MAX_TOKENS     = {DEFAULT_MAX_TOKENS}")
+    print(f"PROMPT_CACHE           = {PROMPT_CACHE}")
+    print(f"CACHE_TTL              = {CACHE_TTL}")
+    print(f"CACHE_SYSTEM_PROMPT    = {CACHE_SYSTEM_PROMPT}")
+    print(f"CACHE_FIRST_MESSAGES   = {get_cache_first_messages()}")
+    print(f"ERROR_LOG_PATH         = {ERROR_LOG_PATH}")
+    print("=== Runtime config end ===")
     print()
 
 
@@ -184,6 +253,14 @@ def admin_cli_loop() -> None:
                 print(f"Now caching {updated} messages.")
                 continue
 
+            if command in {"reload_env", "reload", "env"}:
+                if len(parts) != 1:
+                    print("Usage: reload_env")
+                    continue
+                reload_runtime_env()
+                print_runtime_status()
+                continue
+
             if command in {"show", "status"}:
                 print_runtime_status()
                 continue
@@ -193,6 +270,9 @@ def admin_cli_loop() -> None:
                 print("Commands:")
                 print("  cache_first_messages <number>  Set cached message count")
                 print("    cfm <number>")
+                print("  reload_env                     Reload runtime settings from .env")
+                print("    reload")
+                print("    env")
                 print("  show                           Show runtime settings")
                 print("  help                           Show this help")
                 print("  quit                           Stop the process")
