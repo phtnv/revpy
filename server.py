@@ -106,14 +106,16 @@ CACHE_TTL            = os.getenv("CACHE_TTL", "5m").strip() # "5m" or "1h"
 CACHE_SYSTEM_PROMPT  = os.getenv("CACHE_SYSTEM_PROMPT", "true").lower() == "true"
 CACHE_FIRST_MESSAGES = max(0, int(os.getenv("CACHE_FIRST_MESSAGES", "0")))
 
-ERROR_LOG_PATH = os.getenv("ERROR_LOG_PATH", "claude_error_log.txt")
+# Session cost tracking variables
+SESSION_TTL_SPENT_USD       = 0.0
+SESSION_TTL_INPUT_COST_USD  = 0.0
+SESSION_TTL_OUTPUT_COST_USD = 0.0
+SESSION_TTL_INPUT_TOK       = 0
+SESSION_TTL_OUTPUT_TOK      = 0
+SESSION_CACHE_NET_COST_USD  = 0.0
+SESSION_COST_LOCK           = threading.Lock()
 
-# Session cost totals since this process started.
-# SESSION_CACHE_NET_COST_USD is positive when caching has cost extra money and
-# negative when caching has saved money.
-SESSION_TOTAL_SPENT_USD    = 0.0
-SESSION_CACHE_NET_COST_USD = 0.0
-SESSION_COST_LOCK          = threading.Lock()
+ERROR_LOG_PATH = os.getenv("ERROR_LOG_PATH", "claude_error_log.txt")
 
 # Flask app
 app = Flask(__name__)
@@ -124,8 +126,7 @@ def reload_runtime_env() -> None:
     """
     Reloads runtime configuration from .env.
 
-    HOST and PORT are intentionally not reloaded because Waitress is already
-    bound to them. Changing those requires restarting the process.
+    HOST and PORT are intentionally not reloaded because Waitress is already bound to them.
     """
     global DEFAULT_MODEL, HAIKU_MODEL, SONNET_MODEL, SONNET35_MODEL, OPUS_MODEL, ANTHROPIC_API_KEY, PROXY_KEY
     global REQUIRE_PROXY_KEY, ALLOW_KEY_PASSTHROUGH, DEBUG_LOG, AUTO_TRIM, ASSISTANT_PREFILL, ASSISTANT_PREFILL_MODE
@@ -133,7 +134,6 @@ def reload_runtime_env() -> None:
     global INPUT_TOKEN_COST_USD, OUTPUT_TOKEN_COST_USD, CACHE_WRITE_5M_COST_USD, CACHE_WRITE_1H_COST_USD, CACHE_READ_COST_USD
     global PROMPT_CACHE, CACHE_TTL, CACHE_SYSTEM_PROMPT, CACHE_FIRST_MESSAGES, ERROR_LOG_PATH
 
-    # override=True is important. Without it, changed .env values would not replace values already loaded into os.environ.
     load_dotenv(override=True)
 
     DEFAULT_MODEL          = os.getenv("DEFAULT_MODEL", "claude-sonnet-4-5-20250929")
@@ -179,8 +179,6 @@ def reload_runtime_env() -> None:
 
 def get_cache_first_messages() -> int:
     return CACHE_FIRST_MESSAGES
-
-
 def set_cache_first_messages(value: int) -> int:
     global CACHE_FIRST_MESSAGES
     if value < 0:
@@ -511,6 +509,9 @@ def split_system_prompt_into_text_blocks(system_prompt: str) -> List[Dict[str, s
 
     The split marker stays in the first block.
     Anything after it becomes the second block, usually lorebook / extra context.
+
+    TODO (phtnv) : This does not currently account for voice samples section janitor sometimes uses. I think it comes
+                   last, and will be bundles with the lorebook section right now.
     """
     if not system_prompt or not system_prompt.strip():
         return []
@@ -605,15 +606,13 @@ def format_to_claude_messages(mlist: List[Dict[str, str]]) -> List[Dict[str, Any
         old_role = claude_role
 
         # Mark only the configured first-N-message prefix.
-        # Later messages are still sent to Claude, but are not part of the
-        # explicit conversation cache breakpoint.
+        # Later messages are still sent to Claude, but are not part of the explicit conversation cache breakpoint.
         if idx == cache_target_index:
             formatted[-1]["content"] = add_cache_control_to_content(formatted[-1]["content"])
 
     # Optional Claude prefill.
     # assistant mode preserves the original assistant-message/prefill behavior.
-    # instruction mode avoids assistant prefill and appends an OOC instruction
-    # to the last user message instead.
+    # instruction mode avoids assistant prefill and appends an OOC instruction to the last user message instead.
     if ASSISTANT_PREFILL.strip():
         if ASSISTANT_PREFILL_MODE == "instruction":
             append_prefill_instruction_to_last_user_message(formatted, ASSISTANT_PREFILL)
@@ -664,80 +663,95 @@ def extract_text_from_anthropic_message(message: Any) -> str:
 
     return "".join(chunks)
 
+def average_cost_per_token_usd(total_cost_usd: float, total_tokens: int) -> float:
+    if total_tokens <= 0:
+        return 0.0
+    return total_cost_usd/total_tokens
 
-def token_cost_usd(tokens: int, usd_per_million_tokens: float) -> float:
-    return (tokens*usd_per_million_tokens)/1_000_000.0
-def format_usd(amount: float) -> str:
-    sign = "-" if amount < 0 else ""
-    return f"{sign}${abs(amount):,.6f}"
-def cache_net_label(net_cost_usd: float) -> str:
-    if net_cost_usd < 0:
-        return f"{format_usd(abs(net_cost_usd))} saved"
-    if net_cost_usd > 0:
-        return f"{format_usd(net_cost_usd)} lost"
-    return "$0.000000 break-even"
 
 def print_usage(usage: Any) -> None:
-    global SESSION_TOTAL_SPENT_USD, SESSION_CACHE_NET_COST_USD
-    if not DEBUG_LOG:
-        return
+    global SESSION_TTL_SPENT_USD, SESSION_CACHE_NET_COST_USD, SESSION_TTL_INPUT_COST_USD, SESSION_TTL_OUTPUT_COST_USD, SESSION_TTL_INPUT_TOK, SESSION_TTL_OUTPUT_TOK
+
+    def tok_usd(tokens: int, usd_per_million_tokens: float) -> float:
+        return (tokens*usd_per_million_tokens)/1_000_000.0
+    def fmt_usd(amount: float) -> str:
+        sign = "-" if amount < 0 else ""
+        return f"{sign}${abs(amount):,.6f}"
+    def cache_lbl(net_cost_usd: float) -> str:
+        if net_cost_usd < 0: return f"{fmt_usd(abs(net_cost_usd))} saved"
+        if net_cost_usd > 0: return f"{fmt_usd(net_cost_usd)} lost"
+        return "$0.000000 break-even"
 
     cache_creation       = getattr(usage, "cache_creation", {}) or {}
     ephemeral_1h         = int(getattr(cache_creation, "ephemeral_1h_input_tokens", 0) or 0)
     ephemeral_5m         = int(getattr(cache_creation, "ephemeral_5m_input_tokens", 0) or 0)
-    input_tokens         = int(getattr(usage, "input_tokens", 0) or 0)
-    output_tokens        = int(getattr(usage, "output_tokens", 0) or 0)
+    input_tok            = int(getattr(usage, "input_tokens", 0) or 0)
+    output_tok           = int(getattr(usage, "output_tokens", 0) or 0)
     cache_read           = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
     cache_creation_input = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
-    ttl_tokens = input_tokens + cache_read + cache_creation_input;
+    ttl_tokens = input_tok + cache_read + cache_creation_input;
 
-    # Older SDK responses may expose only cache_creation_input_tokens without
-    # the 5m/1h split. Attribute that unknown split to the configured TTL so
-    # the cost row still matches the printed cache-write token total.
+    # Older SDK responses may expose only cache_creation_input_tokens without the 5m/1h split.
+    # Assume it's the cached defined in our environment then.
     known_cache_write = ephemeral_1h + ephemeral_5m
     if cache_creation_input > known_cache_write:
         unknown_cache_write = cache_creation_input - known_cache_write
-        if CACHE_TTL == "1h":
-            ephemeral_1h += unknown_cache_write
-        else:
-            ephemeral_5m += unknown_cache_write
+        if CACHE_TTL == "1h" : ephemeral_1h += unknown_cache_write
+        else                 : ephemeral_5m += unknown_cache_write
 
     cache_creation_input = ephemeral_1h + ephemeral_5m
-    ttl_tokens           = input_tokens + cache_read + cache_creation_input
+    ttl_tokens           = input_tok + cache_read + cache_creation_input
 
-    input_cost          = token_cost_usd(input_tokens, INPUT_TOKEN_COST_USD)
-    cache_read_cost     = token_cost_usd(cache_read, CACHE_READ_COST_USD)
-    cache_write_1h_cost = token_cost_usd(ephemeral_1h, CACHE_WRITE_1H_COST_USD)
-    cache_write_5m_cost = token_cost_usd(ephemeral_5m, CACHE_WRITE_5M_COST_USD)
+    input_cost          = tok_usd(input_tok, INPUT_TOKEN_COST_USD)
+    cache_read_cost     = tok_usd(cache_read, CACHE_READ_COST_USD)
+    cache_write_1h_cost = tok_usd(ephemeral_1h, CACHE_WRITE_1H_COST_USD)
+    cache_write_5m_cost = tok_usd(ephemeral_5m, CACHE_WRITE_5M_COST_USD)
     cache_write_cost    = cache_write_1h_cost + cache_write_5m_cost
     total_input_cost    = input_cost + cache_read_cost + cache_write_cost
 
-    output_cost        = token_cost_usd(output_tokens, OUTPUT_TOKEN_COST_USD)
+    output_cost        = tok_usd(output_tok, OUTPUT_TOKEN_COST_USD)
     request_total_cost = total_input_cost + output_cost
 
     cache_write_extra_cost = (
-        token_cost_usd(ephemeral_1h, CACHE_WRITE_1H_COST_USD - INPUT_TOKEN_COST_USD)
+        tok_usd(ephemeral_1h, CACHE_WRITE_1H_COST_USD - INPUT_TOKEN_COST_USD)
         +
-        token_cost_usd(ephemeral_5m, CACHE_WRITE_5M_COST_USD - INPUT_TOKEN_COST_USD)
+        tok_usd(ephemeral_5m, CACHE_WRITE_5M_COST_USD - INPUT_TOKEN_COST_USD)
     )
-    cache_read_saved_cost  = token_cost_usd(cache_read, INPUT_TOKEN_COST_USD - CACHE_READ_COST_USD)
+    cache_read_saved_cost  = tok_usd(cache_read, INPUT_TOKEN_COST_USD - CACHE_READ_COST_USD)
     request_cache_net_cost = cache_write_extra_cost - cache_read_saved_cost
 
     with SESSION_COST_LOCK:
-        SESSION_TOTAL_SPENT_USD    += request_total_cost
-        SESSION_CACHE_NET_COST_USD += request_cache_net_cost
-        session_total_spent    = SESSION_TOTAL_SPENT_USD
-        session_cache_net_cost = SESSION_CACHE_NET_COST_USD
+        SESSION_TTL_SPENT_USD       += request_total_cost
+        SESSION_TTL_INPUT_COST_USD  += total_input_cost
+        SESSION_TTL_OUTPUT_COST_USD += output_cost
+        SESSION_TTL_INPUT_TOK       += ttl_tokens
+        SESSION_TTL_OUTPUT_TOK      += output_tok
+        SESSION_CACHE_NET_COST_USD  += request_cache_net_cost
+        session_total_spent          = SESSION_TTL_SPENT_USD
+        session_total_input_cost     = SESSION_TTL_INPUT_COST_USD
+        session_total_output_cost    = SESSION_TTL_OUTPUT_COST_USD
+        session_total_input_tok      = SESSION_TTL_INPUT_TOK
+        session_total_output_tok     = SESSION_TTL_OUTPUT_TOK
+        session_cache_net_cost       = SESSION_CACHE_NET_COST_USD
+        session_average_input_cost   = average_cost_per_token_usd(session_total_input_cost, session_total_input_tok)
+
+    if not DEBUG_LOG:
+        return
 
     print("=== Claude usage start ===")
-    print("Total input tokens =   uncached + cache read + cache write (        1h +         5m)")
-    print("{:18d} = {:10d} + {:10d} + {:11d} ({:10d} + {:10d})".format(ttl_tokens, input_tokens, cache_read, cache_creation_input, ephemeral_1h, ephemeral_5m))
-    print("{:>18s} = {:>10s} + {:>10s} + {:>11s} ({:>10s} + {:>10s})".format(format_usd(total_input_cost), format_usd(input_cost), format_usd(cache_read_cost), format_usd(cache_write_cost), format_usd(cache_write_1h_cost), format_usd(cache_write_5m_cost)))
-    print("Output tokens = {:d} ({})".format(output_tokens, format_usd(output_cost)))
-    print("Request cache cost = {} ({})".format(format_usd(request_cache_net_cost), cache_net_label(request_cache_net_cost)))
-    print("Session cache cost = {} ({})".format(format_usd(session_cache_net_cost), cache_net_label(session_cache_net_cost)))
-    print("Request total cost = {}".format(format_usd(request_total_cost)))
-    print("Session total cost = {}".format(format_usd(session_total_spent)))
+    print("Request:")
+    print("    Input tokens       =   uncached + cache read + cache write (        1h +         5m)")
+    print("    {:18d} = {:10d} + {:10d} + {:11d} ({:10d} + {:10d})".format(ttl_tokens, input_tok, cache_read, cache_creation_input, ephemeral_1h, ephemeral_5m))
+    print("    {:>18s} = {:>10s} + {:>10s} + {:>11s} ({:>10s} + {:>10s})".format(fmt_usd(total_input_cost), fmt_usd(input_cost), fmt_usd(cache_read_cost), fmt_usd(cache_write_cost), fmt_usd(cache_write_1h_cost), fmt_usd(cache_write_5m_cost)))
+    print("    Output tokens      = {:d} ({})".format(output_tok, fmt_usd(output_cost)))
+    print("    Cache cost         = {} ({})".format(fmt_usd(request_cache_net_cost), cache_lbl(request_cache_net_cost)))
+    print("    Total cost         = {}".format(fmt_usd(request_total_cost)))
+    print("Session:")
+    print("    Input tokens       = {:d} ({})".format(session_total_input_tok, fmt_usd(session_total_input_cost)))
+    print("    Output tokens      = {:d} ({})".format(session_total_output_tok, fmt_usd(session_total_output_cost)))
+    print("    Cache cost         = {} ({})".format(fmt_usd(session_cache_net_cost), cache_lbl(session_cache_net_cost)))
+    print("    Average input cost = {} / MTok.".format(fmt_usd(session_average_input_cost*1_000_000)))
+    print("    Total cost         = {} ({} input / {} output)".format(fmt_usd(session_total_spent), fmt_usd(session_total_input_cost), fmt_usd(session_total_output_cost)))
     print("=== Claude usage end ===")
     print("> ", end="", flush=True)
 
@@ -757,20 +771,20 @@ def usage_to_openai_dict(usage: Any) -> Dict[str, int]:
 
     This preserves both.
     """
-    input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
-    output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
-    cache_read = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+    input_tokens   = int(getattr(usage, "input_tokens", 0) or 0)
+    output_tokens  = int(getattr(usage, "output_tokens", 0) or 0)
+    cache_read     = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
     cache_creation = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
 
     prompt_tokens = input_tokens + cache_read + cache_creation
 
     return {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": output_tokens,
-        "total_tokens": prompt_tokens + output_tokens,
-        "input_tokens_uncached": input_tokens,
-        "cache_creation_input_tokens": cache_creation,
-        "cache_read_input_tokens": cache_read,
+        "prompt_tokens"               : prompt_tokens,
+        "completion_tokens"           : output_tokens,
+        "total_tokens"                : prompt_tokens + output_tokens,
+        "input_tokens_uncached"       : input_tokens,
+        "cache_creation_input_tokens" : cache_creation,
+        "cache_read_input_tokens"     : cache_read,
     }
 
 
@@ -780,42 +794,53 @@ def get_temperature(payload: Dict[str, Any]) -> float:
     return float(payload.get("temperature", DEFAULT_TEMPERATURE))
 
 
-def split_system_and_messages(mlist: List[Dict[str, Any]]) -> Tuple[Optional[str], List[Dict[str, str]]]:
+def split_system_and_messages(raw_messages: Any) -> Tuple[Optional[str], List[Dict[str, str]]]:
     """
-    Claude wants system prompt separately from messages.
+    Validates and normalizes OpenAI-style chat messages.
 
-    Empty system messages are discarded.
-    Non-system messages are preserved as user/assistant text messages.
+    Accepts untrusted request payload data.
+    Returns:
+        - system_prompt: joined system messages, or None
+        - chat_messages: list of normalized {"role": str, "content": str} dicts
+
+    Invalid message lists abort with 400 and do not return.
     """
-    system_parts  = []
-    chat_messages = []
+    if not isinstance(raw_messages, list):
+        abort(400, description="Request body must include a messages list.")
+        raise RuntimeError("unreachable")
 
-    for msg in mlist:
-        role = msg.get("role", "user")
-        content = content_to_plain_text(msg.get("content", ""))
+    system_parts  : List[str]            = []
+    chat_messages : List[Dict[str, str]] = []
+
+    for idx, msg in enumerate(raw_messages):
+        if not isinstance(msg, dict):
+            abort(400, description=f"Message at index {idx} must be an object.")
+            raise RuntimeError("unreachable")
+
+        raw_role = msg.get("role", "user")
+        role     = raw_role if isinstance(raw_role, str) else "user"
+        content  = content_to_plain_text(msg.get("content", ""))
 
         if role == "system":
             if content.strip():
                 system_parts.append(content.strip())
-        else:
-            if role not in ("user", "assistant"):
-                role = "user"
+            continue
 
-            chat_messages.append({"role": role, "content": content})
+        if role not in ("user", "assistant"):
+            role = "user"
+
+        chat_messages.append({"role": role, "content": content})
 
     system_prompt = "\n\n".join(system_parts) if system_parts else None
     return system_prompt, chat_messages
 
-
 def build_claude_kwargs(payload: Dict[str, Any], route_model: str) -> Dict[str, Any]:
-    messages = payload.get("messages")
 
-    if not isinstance(messages, list):
-        abort(400, description="Request body must include a messages list.")
+    system_prompt, chat_messages = split_system_and_messages(payload.get("messages"))
 
-    system_prompt, chat_messages = split_system_and_messages(messages)
     if chat_messages and chat_messages[0].get("role") == "user" and chat_messages[0].get("content", "").strip() == ".":
         chat_messages = chat_messages[1:]
+
     formatted_messages = format_to_claude_messages(chat_messages)
 
     # Route model wins by default.
@@ -1032,8 +1057,13 @@ def running():
     base_url = request.base_url.rstrip("/")
 
     with SESSION_COST_LOCK:
-        session_total_spent    = SESSION_TOTAL_SPENT_USD
-        session_cache_net_cost = SESSION_CACHE_NET_COST_USD
+        session_total_spent         = SESSION_TTL_SPENT_USD
+        session_total_input_cost    = SESSION_TTL_INPUT_COST_USD
+        session_total_output_cost   = SESSION_TTL_OUTPUT_COST_USD
+        session_total_input_tokens  = SESSION_TTL_INPUT_TOK
+        session_total_output_tokens = SESSION_TTL_OUTPUT_TOK
+        session_cache_net_cost      = SESSION_CACHE_NET_COST_USD
+        session_average_input_cost  = average_cost_per_token_usd(session_total_input_cost, session_total_input_tokens)
 
     return jsonify(
         {
@@ -1042,14 +1072,18 @@ def running():
             "prompt_cache"  : PROMPT_CACHE,
             "cache_ttl"     : CACHE_TTL,
             "cost_tracking" : {
-                "input_token_cost_usd"       : INPUT_TOKEN_COST_USD,
-                "output_token_cost_usd"      : OUTPUT_TOKEN_COST_USD,
-                "cache_write_5m_cost_usd"    : CACHE_WRITE_5M_COST_USD,
-                "cache_write_1h_cost_usd"    : CACHE_WRITE_1H_COST_USD,
-                "cache_read_cost_usd"        : CACHE_READ_COST_USD,
-                "session_total_spent_usd"    : session_total_spent,
-                "session_cache_net_cost_usd" : session_cache_net_cost,
-                "session_cache_net_meaning"  : "positive = lost money, negative = saved money",
+                "input_token_cost_usd"                             : INPUT_TOKEN_COST_USD,
+                "output_token_cost_usd"                            : OUTPUT_TOKEN_COST_USD,
+                "cache_write_5m_cost_usd"                          : CACHE_WRITE_5M_COST_USD,
+                "cache_write_1h_cost_usd"                          : CACHE_WRITE_1H_COST_USD,
+                "cache_read_cost_usd"                              : CACHE_READ_COST_USD,
+                "session_total_spent_usd"                          : session_total_spent,
+                "session_total_input_token_cost_usd"               : session_total_input_cost,
+                "session_total_output_token_cost_usd"              : session_total_output_cost,
+                "session_total_input_tokens"                       : session_total_input_tokens,
+                "session_total_output_tokens"                      : session_total_output_tokens,
+                "session_average_input_token_cost_usd_per_million" : session_average_input_cost*1_000_000,
+                "session_cache_net_cost_usd"                       : session_cache_net_cost,
             },
             "routes": {
                 "chat_completions" : base_url + "/chat/completions",
