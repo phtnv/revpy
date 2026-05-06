@@ -1,16 +1,16 @@
+import anthropic
 import json
 import os
 import re
 import time
 import traceback
 import threading
-from typing import Any, Dict, List, Optional, Tuple
 
-import anthropic
-from dotenv import load_dotenv
-from flask import Flask, Response, abort, jsonify, request, stream_with_context
+from dotenv     import load_dotenv
+from flask      import Flask, Response, abort, jsonify, request, stream_with_context
 from flask_cors import CORS
-from waitress import serve
+from typing     import Any, Dict, List, Optional, Tuple
+from waitress   import serve
 
 load_dotenv()
 
@@ -117,6 +117,14 @@ SESSION_COST_LOCK           = threading.Lock()
 
 ERROR_LOG_PATH = os.getenv("ERROR_LOG_PATH", "claude_error_log.txt")
 
+MODEL_LIST_TIMEOUT_SECONDS                   = getenv_float("MODEL_LIST_TIMEOUT_SECONDS", 10.0)
+ANTHROPIC_TIMEOUT_ERROR                      = getattr(anthropic, "APITimeoutError", TimeoutError)
+ANTHROPIC_MODELS      : List[Dict[str, Any]] = []
+SELECTED_MODEL_ID     : Optional[str]        = DEFAULT_MODEL
+MODEL_LIST_LAST_ERROR : Optional[str]        = None
+MODEL_LIST_LAST_TIMEOUT                      = False
+MODEL_LOCK                                   = threading.Lock()
+
 # Flask app
 app = Flask(__name__)
 CORS(app)
@@ -173,6 +181,8 @@ def reload_runtime_env() -> None:
 
     ERROR_LOG_PATH = os.getenv("ERROR_LOG_PATH", "claude_error_log.txt")
 
+    refresh_anthropic_models()
+
     print("Reloaded runtime configuration from .env.")
     print("HOST and PORT were not changed; restart the process to change bind address.")
 
@@ -197,6 +207,7 @@ def print_runtime_status() -> None:
     print(f"SONNET_MODEL           = {SONNET_MODEL}")
     print(f"SONNET35_MODEL         = {SONNET35_MODEL}")
     print(f"OPUS_MODEL             = {OPUS_MODEL}")
+    print(f"SELECTED_MODEL_ID      = {get_selected_model_id()}")
     print(f"REQUIRE_PROXY_KEY      = {REQUIRE_PROXY_KEY}")
     print(f"ALLOW_KEY_PASSTHROUGH  = {ALLOW_KEY_PASSTHROUGH}")
     print(f"DEBUG_LOG              = {DEBUG_LOG}")
@@ -216,6 +227,172 @@ def print_runtime_status() -> None:
     print(f"ERROR_LOG_PATH         = {ERROR_LOG_PATH}")
     print("=== Runtime config end ===")
     print()
+
+
+def anthropic_object_to_dict(obj: Any) -> Dict[str, Any]:
+    """
+    Converts Anthropic SDK model objects into JSON-printable dictionaries.
+    """
+    if isinstance(obj, dict)      : return dict(obj)
+    if hasattr(obj, "model_dump") : return obj.model_dump(mode="json")
+    if hasattr(obj, "dict")       : return obj.dict()
+
+    if hasattr(obj, "__dict__"):
+        return {
+            key: value
+            for key, value in vars(obj).items()
+            if not key.startswith("_")
+        }
+
+    return {"value": str(obj)}
+
+
+def model_id_from_info(model_info: Dict[str, Any]) -> str:
+    return str(model_info.get("id") or model_info.get("model") or "").strip()
+
+
+def anthropic_exception_message(exc: Exception) -> str:
+    body = getattr(exc, "body", None)
+
+    if isinstance(body, dict):
+        error_obj = body.get("error", {})
+        if isinstance(error_obj, dict):
+            message = error_obj.get("message")
+            if message:
+                return str(message)
+
+        return json.dumps(body, ensure_ascii=False, default=str)
+
+    return str(exc) or exc.__class__.__name__
+
+
+def refresh_anthropic_models() -> bool:
+    """
+    Fetches the available Anthropic models and stores them for CLI use.
+    """
+    global ANTHROPIC_MODELS, MODEL_LIST_LAST_ERROR, MODEL_LIST_LAST_TIMEOUT
+
+    try:
+        if not ANTHROPIC_API_KEY: raise RuntimeError("ANTHROPIC_API_KEY is not configured; model list cannot be retrieved at startup.")
+
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        page   = client.models.list(limit=100, timeout=MODEL_LIST_TIMEOUT_SECONDS)
+
+        raw_models = getattr(page, "data", None)
+        if raw_models is None:
+            raw_models = list(page)
+
+        models = [anthropic_object_to_dict(model) for model in raw_models]
+
+        with MODEL_LOCK:
+            ANTHROPIC_MODELS        = models
+            MODEL_LIST_LAST_ERROR   = None
+            MODEL_LIST_LAST_TIMEOUT = False
+
+        if models : print(f"Retrieved {len(models)} Anthropic model(s).")
+        else      : print("Anthropic returned an empty model list. Using default model: {DEFAULT_MODEL}")
+
+        return True
+
+    except (ANTHROPIC_TIMEOUT_ERROR, TimeoutError) as exc:
+        with MODEL_LOCK:
+            ANTHROPIC_MODELS        = []
+            MODEL_LIST_LAST_ERROR   = None
+            MODEL_LIST_LAST_TIMEOUT = True
+        print("WARNING: Could not retrieve a model list from Anthropic. Timeout.")
+        return False
+
+    except Exception as exc:
+        with MODEL_LOCK:
+            ANTHROPIC_MODELS        = []
+            MODEL_LIST_LAST_ERROR   = anthropic_exception_message(exc)
+            MODEL_LIST_LAST_TIMEOUT = False
+        print(f"WARNING: Could not retrieve a model list from Anthropic. {anthropic_exception_message(exc)}.")
+        return False
+
+
+def get_selected_model_id() -> Optional[str]:
+    with MODEL_LOCK:
+        return SELECTED_MODEL_ID
+
+
+def print_no_model_list_available() -> None:
+    print("No Anthropic model list is available.")
+    print(f"Requests will continue using the configured model: {get_selected_model_id() or DEFAULT_MODEL}")
+
+    with MODEL_LOCK:
+        last_timeout = MODEL_LIST_LAST_TIMEOUT
+        last_error = MODEL_LIST_LAST_ERROR
+
+    if   last_timeout : print("Last retrieval failed: timeout")
+    elif last_error   : print(f"Last retrieval failed: error: {last_error}")
+
+
+def print_model_list() -> None:
+    with MODEL_LOCK:
+        models            = list(ANTHROPIC_MODELS)
+        selected_model_id = SELECTED_MODEL_ID
+    if not models:
+        print_no_model_list_available()
+        return
+
+    number_width = len(str(len(models)))
+
+    for index, model_info in enumerate(models, start=1):
+        model_id     = model_id_from_info(model_info)
+        display_name = str(model_info.get("display_name") or model_info.get("name") or "")
+        created_at   = str(model_info.get("created_at") or "")
+
+        number      = str(index).rjust(number_width)
+        number_cell = f"[{number}]" if model_id == selected_model_id else f" {number} "
+
+        extra_parts = []
+        if display_name : extra_parts.append(display_name)
+        if created_at   : extra_parts.append(created_at)
+
+        extra  = "  ".join(extra_parts)
+        suffix = f"  {extra}" if extra else ""
+
+        print(f"{number_cell}  {model_id:<42}{suffix}")
+
+
+def select_model_by_number(index: int) -> None:
+    global SELECTED_MODEL_ID
+
+    with MODEL_LOCK:
+        if not ANTHROPIC_MODELS:
+            print_no_model_list_available()
+            return
+
+        if index < 1 or index > len(ANTHROPIC_MODELS):
+            print(f"Model number out of range. Use 1 through {len(ANTHROPIC_MODELS)}.")
+            return
+
+        model_info = ANTHROPIC_MODELS[index - 1]
+        model_id   = model_id_from_info(model_info)
+
+        if not model_id:
+            print(f"Model {index} does not have an id and cannot be selected.")
+            return
+
+        SELECTED_MODEL_ID = model_id
+
+    print(f"Selected model {index}: {model_id}")
+
+
+def print_model_info(index: int) -> None:
+    with MODEL_LOCK:
+        if not ANTHROPIC_MODELS:
+            print_no_model_list_available()
+            return
+
+        if index < 1 or index > len(ANTHROPIC_MODELS):
+            print(f"Model number out of range. Use 1 through {len(ANTHROPIC_MODELS)}.")
+            return
+
+        model_info = dict(ANTHROPIC_MODELS[index - 1])
+
+    print(json.dumps(model_info, indent=2, ensure_ascii=False, default=str))
 
 
 def admin_cli_loop() -> None:
@@ -259,6 +436,24 @@ def admin_cli_loop() -> None:
                 print_runtime_status()
                 continue
 
+            if command in {"model", "models"}:
+                if len(parts) == 2 and parts[1].lower() == "list":
+                    print_model_list()
+                    continue
+                if len(parts) == 3 and parts[1].lower() == "select":
+                    value = int(parts[2])
+                    select_model_by_number(value)
+                    continue
+                if len(parts) == 3 and parts[1].lower() == "info":
+                    value = int(parts[2])
+                    print_model_info(value)
+                    continue
+                print("Usage:")
+                print("  model list")
+                print("  model select <number>")
+                print("  model info   <number>")
+                continue
+
             if command in {"show", "status"}:
                 print_runtime_status()
                 continue
@@ -268,6 +463,9 @@ def admin_cli_loop() -> None:
                 print("Commands:")
                 print("  cache_first_messages <number>  Set cached message count")
                 print("    cfm <number>")
+                print("  model list                     List available Anthropic models")
+                print("  model select <number>          Select model by list number")
+                print("  model info   <number>          Show all stored info for a model")
                 print("  reload_env                     Reload runtime settings from .env")
                 print("    reload")
                 print("    env")
@@ -285,10 +483,8 @@ def admin_cli_loop() -> None:
             print(f"Unknown command: {command}")
             print("Type 'help' for commands.")
 
-        except ValueError as exc:
-            print(f"Invalid value: {exc}")
-        except Exception as exc:
-            print(f"CLI error: {exc}")
+        except ValueError as exc : print(f"Invalid value: {exc}")
+        except Exception  as exc : print(f"CLI error: {exc}")
 
 
 def start_admin_cli() -> None:
@@ -318,8 +514,7 @@ def get_bearer_token() -> str:
 def get_anthropic_client() -> anthropic.Anthropic:
     """
     Recommended public-tunnel mode:
-        .env contains ANTHROPIC_API_KEY and PROXY_KEY.
-        JanitorAI uses PROXY_KEY as the reverse proxy key.
+        .env contains ANTHROPIC_API_KEY and PROXY_KEY. JanitorAI uses PROXY_KEY as the reverse proxy key.
 
     Optional compatibility mode:
         ALLOW_KEY_PASSTHROUGH=true lets incoming Bearer token act as Anthropic key.
@@ -381,10 +576,8 @@ def add_cache_control_to_content(content: Any) -> Any:
     if isinstance(content, list):
         blocks = []
         for block in content:
-            if isinstance(block, dict):
-                blocks.append(dict(block))
-            else:
-                blocks.append({"type": "text", "text": str(block)})
+            if isinstance(block, dict) : blocks.append(dict(block))
+            else                       : blocks.append({"type": "text", "text": str(block)})
 
         for i in range(len(blocks) - 1, -1, -1):
             if blocks[i].get("type") == "text" and blocks[i].get("text", "").strip():
@@ -449,8 +642,7 @@ def append_prefill_instruction_to_last_user_message(formatted: List[Dict[str, An
             formatted[i]["content"] = append_text_to_content(formatted[i].get("content", ""), instruction)
             return
 
-    # Defensive fallback. The current formatter always creates an initial user
-    # message, but keep this here in case that changes later.
+    # Defensive fallback. The current formatter always creates an initial user message, but keep this here in case that changes later.
     formatted.append({"role": "user", "content": instruction})
 
 
@@ -1134,5 +1326,6 @@ if __name__ == "__main__":
         print("Requests will fail until you configure one of these modes.")
         print()
 
+    refresh_anthropic_models()
     start_admin_cli()
     serve(app, host=HOST, port=PORT)
