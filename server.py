@@ -318,24 +318,18 @@ def get_bearer_token() -> str:
 def get_anthropic_client() -> anthropic.Anthropic:
     """
     Recommended public-tunnel mode:
-      .env contains ANTHROPIC_API_KEY and PROXY_KEY.
-      JanitorAI uses PROXY_KEY as the reverse proxy key.
+        .env contains ANTHROPIC_API_KEY and PROXY_KEY.
+        JanitorAI uses PROXY_KEY as the reverse proxy key.
 
     Optional compatibility mode:
-      ALLOW_KEY_PASSTHROUGH=true lets incoming Bearer token act as Anthropic key.
+        ALLOW_KEY_PASSTHROUGH=true lets incoming Bearer token act as Anthropic key.
     """
     provided_key = get_bearer_token()
 
     if ANTHROPIC_API_KEY:
         if REQUIRE_PROXY_KEY:
             if not PROXY_KEY:
-                abort(
-                    500,
-                    description=(
-                        "Server is configured with REQUIRE_PROXY_KEY=true, "
-                        "but PROXY_KEY is missing from .env."
-                    ),
-                )
+                abort(500, description=("Server is configured with REQUIRE_PROXY_KEY=true, but PROXY_KEY is missing from .env."))
 
             if provided_key != PROXY_KEY:
                 abort(401, description="Invalid proxy key.")
@@ -347,19 +341,12 @@ def get_anthropic_client() -> anthropic.Anthropic:
             abort(401, description="Missing Authorization bearer token.")
         return anthropic.Anthropic(api_key=provided_key)
 
-    abort(
-        500,
-        description=(
-            "ANTHROPIC_API_KEY is not configured. Either set ANTHROPIC_API_KEY "
-            "and PROXY_KEY in .env, or set ALLOW_KEY_PASSTHROUGH=true."
-        ),
-    )
+    abort(500, description=("ANTHROPIC_API_KEY is not configured. Either set ANTHROPIC_API_KEY and PROXY_KEY in .env, or set ALLOW_KEY_PASSTHROUGH=true."))
 
 
 def make_cache_control() -> Dict[str, str]:
     """
-    5-minute cache is default. 1-hour cache is more expensive but useful
-    if there are longer pauses between messages.
+    5-minute cache is default. 1-hour cache is more expensive but useful for longer pauses.
     """
     cache_control = {"type": "ephemeral"}
     if CACHE_TTL == "1h":
@@ -485,10 +472,8 @@ def content_to_plain_text(content: Any) -> str:
         parts = []
         for item in content:
             if isinstance(item, dict):
-                if item.get("type") == "text":
-                    parts.append(str(item.get("text", "")))
-                else:
-                    parts.append(json.dumps(item, ensure_ascii=False))
+                if item.get("type") == "text" : parts.append(str(item.get("text", "")))
+                else                          : parts.append(json.dumps(item, ensure_ascii=False))
             else:
                 parts.append(str(item))
         return "\n".join(parts)
@@ -500,15 +485,18 @@ PERSONA_END_RE = re.compile(r"</[^<>]*\bPersona>", re.IGNORECASE)
 
 def split_system_prompt_into_text_blocks(system_prompt: str) -> List[Dict[str, str]]:
     """
-    Always returns Anthropic system content as list-form text blocks.
+    For more efficient caching, we split the character definition into the core definition (which never changes),
+    and the lorebook / user script additions (which can change in one chat). That way we never have to re-cache
+    the core definition.
 
     Split priority:
-      1. After </Scenario>, if present.
-      2. Otherwise after the last </* Persona> marker, if present.
-      3. Otherwise keep the whole system prompt as one block.
+        1. After </Scenario>, if present.
+        2. Otherwise after the last </* Persona> marker, if present.
+        3. Otherwise keep the whole system prompt as one block.
 
-    The split marker stays in the first block.
-    Anything after it becomes the second block, usually lorebook / extra context.
+    Anything after it becomes the second block, usually lorebook / extra context. Should the split be performed incorrectly
+    (due to user scripts doing something 'interesting'), the definition will still be sent correctly. Just the caching
+    efficiency will degrade.
 
     TODO (phtnv) : This does not currently account for voice samples section janitor sometimes uses. I think it comes
                    last, and will be bundles with the lorebook section right now.
@@ -520,22 +508,20 @@ def split_system_prompt_into_text_blocks(system_prompt: str) -> List[Dict[str, s
 
     # Priority 1: split after </Scenario>
     scenario_marker = "</Scenario>"
-    scenario_idx = text.find(scenario_marker)
+    scenario_idx    = text.find(scenario_marker)
     if scenario_idx != -1:
         split_at = scenario_idx + len(scenario_marker)
     else:
         # Priority 2: split after the last </* Persona> closing tag.
         persona_matches = list(PERSONA_END_RE.finditer(text))
-        if persona_matches:
-            split_at = persona_matches[-1].end()
-        else:
-            split_at = -1
+        if persona_matches : split_at = persona_matches[-1].end()
+        else               : split_at = -1
 
     if split_at == -1 or split_at >= len(text):
         return [{"type": "text", "text": text}]
 
     before = text[:split_at].rstrip()
-    after = text[split_at:].strip()
+    after  = text[split_at:].strip()
 
     blocks = [{"type": "text", "text": before}]
 
@@ -550,8 +536,7 @@ def format_system_for_claude(system_prompt: Optional[str]) -> Optional[Any]:
     """
     Optionally cache the system prompt separately.
 
-    This helps when JanitorAI sends large character cards, scenario text,
-    behavior rules, or examples as system content.
+    This helps when JanitorAI sends large character cards, scenario text, behavior rules, or examples as system content.
     """
     if system_prompt is None:
         return None
@@ -617,10 +602,8 @@ def format_to_claude_messages(mlist: List[Dict[str, str]]) -> List[Dict[str, Any
         if ASSISTANT_PREFILL_MODE == "instruction":
             append_prefill_instruction_to_last_user_message(formatted, ASSISTANT_PREFILL)
         else:
-            if formatted[-1]["role"] == "user":
-                formatted.append({"role" : "assistant", "content" : ASSISTANT_PREFILL})
-            else:
-                formatted[-1]["content"] = append_text_to_content(formatted[-1]["content"], ASSISTANT_PREFILL)
+            if formatted[-1]["role"] == "user" : formatted.append({"role" : "assistant", "content" : ASSISTANT_PREFILL})
+            else                               : formatted[-1]["content"] = append_text_to_content(formatted[-1]["content"], ASSISTANT_PREFILL)
 
     return formatted
 
@@ -633,10 +616,8 @@ def trim_to_end_sentence(input_str: str, include_newline: bool = False) -> str:
         char = input_str[i]
 
         if char in punctuation:
-            if i > 0 and input_str[i - 1] in [" ", "\n"]:
-                last = i - 1
-            else:
-                last = i
+            if i > 0 and input_str[i - 1] in [" ", "\n"] : last = i - 1
+            else                                         : last = i
             break
 
         if include_newline and char == "\n":
@@ -914,19 +895,8 @@ def make_error_response(exc: Exception, payload: Optional[Dict[str, Any]] = None
             message = error_obj.get("message", message)
             error_type = error_obj.get("type", error_type)
 
-    error_body = {
-        "error": {
-            "message": message,
-            "type": error_type,
-            "code": status_code,
-        }
-    }
-
-    log_body = {
-        "error": error_body,
-        "request": payload,
-        "traceback": traceback.format_exc(),
-    }
+    error_body = { "error": { "message": message, "type": error_type, "code": status_code } }
+    log_body   = { "error": error_body, "request": payload, "traceback": traceback.format_exc() }
     write_error_log(log_body)
 
     return Response(
