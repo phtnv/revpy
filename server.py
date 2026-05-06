@@ -689,25 +689,23 @@ def split_system_prompt_into_text_blocks(system_prompt: str) -> List[Dict[str, s
     Anything after it becomes the second block, usually lorebook / extra context. Should the split be performed incorrectly
     (due to user scripts doing something 'interesting'), the definition will still be sent correctly. Just the caching
     efficiency will degrade.
-
-    TODO (phtnv) : This does not currently account for voice samples section janitor sometimes uses. I think it comes
-                   last, and will be bundles with the lorebook section right now.
     """
     if not system_prompt or not system_prompt.strip():
         return []
 
     text = system_prompt.strip()
 
-    # Priority 1: split after </Scenario>
-    scenario_marker = "</Scenario>"
-    scenario_idx    = text.find(scenario_marker)
-    if scenario_idx != -1:
-        split_at = scenario_idx + len(scenario_marker)
-    else:
-        # Priority 2: split after the last </* Persona> closing tag.
+    split_marker = "</example_dialogs>"
+    split_idx    = text.find(split_marker)
+    if (split_idx == -1):
+        split_marker = "</Scenario>"
+        split_idx    = text.find(split_marker)
+    if (split_idx == -1):
         persona_matches = list(PERSONA_END_RE.finditer(text))
         if persona_matches : split_at = persona_matches[-1].end()
         else               : split_at = -1
+    else:
+        split_at = split_idx + len(split_marker)
 
     if split_at == -1 or split_at >= len(text):
         return [{"type": "text", "text": text}]
