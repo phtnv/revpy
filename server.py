@@ -1014,11 +1014,12 @@ def build_claude_kwargs(payload: Dict[str, Any], route_model: str) -> Dict[str, 
 
     formatted_messages = format_to_claude_messages(chat_messages)
 
-    # Route model wins by default.
+    # CLI-selected model wins over route aliases.
     # If you want JanitorAI/client to choose model from JSON, set ALLOW_CLIENT_MODEL=true.
-    allow_client_model = os.getenv("ALLOW_CLIENT_MODEL", "false").lower() == "true"
-    selected_model = payload.get("model") if allow_client_model else route_model
-    selected_model = selected_model or route_model
+    effective_route_model = get_selected_model_id() or route_model
+    allow_client_model    = os.getenv("ALLOW_CLIENT_MODEL", "false").lower() == "true"
+    selected_model        = payload.get("model") if allow_client_model else effective_route_model
+    selected_model        = selected_model or effective_route_model
 
     kwargs: Dict[str, Any] = {
         "model"       : selected_model,
@@ -1301,10 +1302,6 @@ def sonnet35():
 def opus():
     return handle_chat_completion(OPUS_MODEL)
 
-
-# =============================================================================
-# Main
-# =============================================================================
 
 if __name__ == "__main__":
     print("Starting Claude reverse proxy")
