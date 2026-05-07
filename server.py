@@ -363,18 +363,14 @@ def select_model_by_number(index: int) -> None:
         if not ANTHROPIC_MODELS:
             print_no_model_list_available()
             return
-
         if index < 1 or index > len(ANTHROPIC_MODELS):
             print(f"Model number out of range. Use 1 through {len(ANTHROPIC_MODELS)}.")
             return
-
         model_info = ANTHROPIC_MODELS[index - 1]
         model_id   = model_id_from_info(model_info)
-
         if not model_id:
             print(f"Model {index} does not have an id and cannot be selected.")
             return
-
         SELECTED_MODEL_ID = model_id
 
     print(f"Selected model {index}: {model_id}")
@@ -385,11 +381,9 @@ def print_model_info(index: int) -> None:
         if not ANTHROPIC_MODELS:
             print_no_model_list_available()
             return
-
         if index < 1 or index > len(ANTHROPIC_MODELS):
             print(f"Model number out of range. Use 1 through {len(ANTHROPIC_MODELS)}.")
             return
-
         model_info = dict(ANTHROPIC_MODELS[index - 1])
 
     print(json.dumps(model_info, indent=2, ensure_ascii=False, default=str))
@@ -487,13 +481,7 @@ def admin_cli_loop() -> None:
         except Exception  as exc : print(f"CLI error: {exc}")
 
 
-def start_admin_cli() -> None:
-    thread = threading.Thread(target=admin_cli_loop, daemon=True)
-    thread.start()
-
-# =============================================================================
 # Utility helpers
-# =============================================================================
 
 def write_error_log(body: Any) -> None:
     try:
@@ -525,10 +513,8 @@ def get_anthropic_client() -> anthropic.Anthropic:
         if REQUIRE_PROXY_KEY:
             if not PROXY_KEY:
                 abort(500, description=("Server is configured with REQUIRE_PROXY_KEY=true, but PROXY_KEY is missing from .env."))
-
             if provided_key != PROXY_KEY:
                 abort(401, description="Invalid proxy key.")
-
         return anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     if ALLOW_KEY_PASSTHROUGH:
@@ -590,13 +576,7 @@ def add_cache_control_to_content(content: Any) -> Any:
     if not text.strip():
         return content
 
-    return [
-        {
-            "type": "text",
-            "text": text,
-            "cache_control": cache_control,
-        }
-    ]
+    return [{"type": "text", "text": text, "cache_control": cache_control}]
 
 
 def append_text_to_content(content: Any, text: str) -> Any:
@@ -606,11 +586,8 @@ def append_text_to_content(content: Any, text: str) -> Any:
     if text is None:
         text = ""
 
-    if isinstance(content, str):
-        return content + "\n" + text
-
-    if isinstance(content, list):
-        return content + [{"type": "text", "text": "\n" + text}]
+    if isinstance(content,  str) : return content + "\n" + text
+    if isinstance(content, list) : return content + [{"type": "text", "text": "\n" + text}]
 
     return str(content) + "\n" + text
 
@@ -682,8 +659,9 @@ def split_system_prompt_into_text_blocks(system_prompt: str) -> List[Dict[str, s
     the core definition.
 
     Split priority:
-        1. After </Scenario>, if present.
-        2. Otherwise after the last </* Persona> marker, if present.
+        1. After </example_dialogs>.
+        1. After </Scenario>.
+        2. Otherwise after the last </* Persona> marker.
         3. Otherwise keep the whole system prompt as one block.
 
     Anything after it becomes the second block, usually lorebook / extra context. Should the split be performed incorrectly
@@ -825,12 +803,9 @@ def extract_text_from_anthropic_message(message: Any) -> str:
     Collects text blocks from an Anthropic response.
     """
     chunks = []
-
     for block in getattr(message, "content", []) or []:
-        if getattr(block, "type", None) == "text":
-            chunks.append(getattr(block, "text", ""))
-        elif isinstance(block, dict) and block.get("type") == "text":
-            chunks.append(block.get("text", ""))
+        if   getattr(block, "type", None) == "text"                  : chunks.append(getattr(block, "text", ""))
+        elif isinstance(block, dict) and block.get("type") == "text" : chunks.append(block.get("text", ""))
 
     return "".join(chunks)
 
@@ -1047,17 +1022,17 @@ def make_openai_non_stream_response(message: Any, model: str) -> Dict[str, Any]:
     usage = getattr(message, "usage", None)
 
     return {
-        "id": getattr(message, "id", "claude"),
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": f"anthropic/{model}",
-        "choices": [
+        "id"      : getattr(message, "id", "claude"),
+        "object"  : "chat.completion",
+        "created" : int(time.time()),
+        "model"   : f"anthropic/{model}",
+        "choices" : [
             {
-                "index": 0,
-                "finish_reason": getattr(message, "stop_reason", "stop"),
-                "message": {
-                    "role": "assistant",
-                    "content": output_text,
+                "index"         : 0,
+                "finish_reason" : getattr(message, "stop_reason", "stop"),
+                "message"       : {
+                    "role"    : "assistant",
+                    "content" : output_text,
                 },
             }
         ],
@@ -1082,19 +1057,15 @@ def make_error_response(exc: Exception, payload: Optional[Dict[str, Any]] = None
     if hasattr(exc, "body"):
         body = getattr(exc, "body", None)
         if isinstance(body, dict):
-            error_obj = body.get("error", {})
-            message = error_obj.get("message", message)
+            error_obj  = body.get("error", {})
+            message    = error_obj.get("message", message)
             error_type = error_obj.get("type", error_type)
 
     error_body = { "error": { "message": message, "type": error_type, "code": status_code } }
     log_body   = { "error": error_body, "request": payload, "traceback": traceback.format_exc() }
     write_error_log(log_body)
 
-    return Response(
-        json.dumps(error_body, ensure_ascii=False),
-        status=status_code,
-        content_type="application/json",
-    )
+    return Response(json.dumps(error_body, ensure_ascii=False), status=status_code, content_type="application/json")
 
 
 # =============================================================================
@@ -1135,17 +1106,17 @@ def generate_stream(payload: Dict[str, Any], route_model: str):
     with client.messages.stream(**kwargs) as stream:
         for text in stream.text_stream:
             event = {
-                "id": "claude",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": f"anthropic/{model_used}",
-                "choices": [
+                "id"      : "claude",
+                "object"  : "chat.completion.chunk",
+                "created" : int(time.time()),
+                "model"   : f"anthropic/{model_used}",
+                "choices" : [
                     {
-                        "index": 0,
-                        "finish_reason": None,
-                        "delta": {
-                            "role": "assistant",
-                            "content": text,
+                        "index"         : 0,
+                        "finish_reason" : None,
+                        "delta"         : {
+                            "role"    : "assistant",
+                            "content" : text,
                         },
                     }
                 ],
@@ -1160,18 +1131,18 @@ def generate_stream(payload: Dict[str, Any], route_model: str):
         print_usage(usage)
 
         final_event = {
-            "id": getattr(final_message, "id", "claude"),
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": f"anthropic/{model_used}",
-            "choices": [
+            "id"      : getattr(final_message, "id", "claude"),
+            "object"  : "chat.completion.chunk",
+            "created" : int(time.time()),
+            "model"   : f"anthropic/{model_used}",
+            "choices" : [
                 {
-                    "index": 0,
-                    "finish_reason": getattr(final_message, "stop_reason", "stop"),
-                    "delta": {},
+                    "index"         : 0,
+                    "finish_reason" : getattr(final_message, "stop_reason", "stop"),
+                    "delta"         : {},
                 }
             ],
-            "usage": usage_to_openai_dict(getattr(final_message, "usage", None)),
+            "usage" : usage_to_openai_dict(getattr(final_message, "usage", None)),
         }
 
         yield f"data: {json.dumps(final_event, ensure_ascii=False)}\n\n"
@@ -1183,11 +1154,7 @@ def handle_chat_completion(route_model: str):
     payload = request.get_json(silent=True)
 
     if not isinstance(payload, dict):
-        return Response(
-            json.dumps({"error": {"message": "Invalid JSON body."}}),
-            status=400,
-            content_type="application/json",
-        )
+        return Response(json.dumps({"error": {"message": "Invalid JSON body."}}), status=400, content_type="application/json")
 
     try:
         stream = bool(payload.get("stream", False))
@@ -1322,5 +1289,6 @@ if __name__ == "__main__":
         print()
 
     refresh_anthropic_models()
-    start_admin_cli()
+    thread = threading.Thread(target=admin_cli_loop, daemon=True)
+    thread.start()
     serve(app, host=HOST, port=PORT)
