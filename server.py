@@ -12,9 +12,9 @@ from flask_cors import CORS
 from typing     import Any, Dict, List, Optional, Tuple
 from waitress   import serve
 
-load_dotenv()
+ENABLE_VALUES  = {"true" , "1", "yes", "y", "enable" , "on" }
+DISABLE_VALUES = {"false", "0", "no" , "n", "disable", "off"}
 
-# Configuration
 def getenv_float(name: str, default: float) -> float:
     raw = os.getenv(name, str(default)).strip()
     try:
@@ -27,10 +27,8 @@ def getenv_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     value = raw.strip().lower()
-    if value in {"true", "1", "yes", "y", "on"}:
-        return True
-    if value in {"false", "0", "no", "n", "off"}:
-        return False
+    if value in ENABLE_VALUES  : return True
+    if value in DISABLE_VALUES : return False
     print(f"WARNING: {name} must be boolean. Defaulting to {default}.")
     return default
 def getenv_int(name: str, default: int) -> int:
@@ -54,77 +52,129 @@ def getenv_cache_ttl(name: str, default: str = "5m") -> str:
     print(f"WARNING: {name} must be '5m' or '1h'. Defaulting to {normalized_default}.")
     return normalized_default
 
-HOST = os.getenv("HOST", "127.0.0.1")
-PORT = int(os.getenv("PORT", "5001"))
 
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "claude-sonnet-4-5-20250929")
+class RuntimeConfig:
 
-# Route-specific model aliases. If unset, they fall back to DEFAULT_MODEL.
-HAIKU_MODEL    = os.getenv("HAIKU_MODEL", DEFAULT_MODEL)
-SONNET_MODEL   = os.getenv("SONNET_MODEL", DEFAULT_MODEL)
-SONNET35_MODEL = os.getenv("SONNET35_MODEL", DEFAULT_MODEL)
-OPUS_MODEL     = os.getenv("OPUS_MODEL", DEFAULT_MODEL)
+    def reload_from_env(self) -> None:
+        self.host = os.getenv("HOST", "127.0.0.1")
+        self.port = getenv_int("PORT", 5001)
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
-PROXY_KEY         = os.getenv("PROXY_KEY", "").strip()
+        self.default_model = os.getenv("DEFAULT_MODEL", "claude-sonnet-4-5-20250929")
 
-# Safer default for a public Cloudflare Tunnel:
-# JanitorAI sends PROXY_KEY, while your real Anthropic key stays local in .env.
-REQUIRE_PROXY_KEY = os.getenv("REQUIRE_PROXY_KEY", "true").lower() == "true"
+        # Route-specific model aliases. If unset, they fall back to default_model.
+        self.haiku_model    = os.getenv("HAIKU_MODEL", self.default_model)
+        self.sonnet_model   = os.getenv("SONNET_MODEL", self.default_model)
+        self.sonnet35_model = os.getenv("SONNET35_MODEL", self.default_model)
+        self.opus_model     = os.getenv("OPUS_MODEL", self.default_model)
 
-# Compatibility fallback: if true and ANTHROPIC_API_KEY is not set,
-# the proxy will use the Bearer token from the incoming request as the Anthropic key.
-# For a public tunnel, I recommend leaving this false.
-ALLOW_KEY_PASSTHROUGH = os.getenv("ALLOW_KEY_PASSTHROUGH", "false").lower() == "true"
+        self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+        self.proxy_key         = os.getenv("PROXY_KEY", "").strip()
 
-DEBUG_LOG = os.getenv("DEBUG_LOG", "true").lower() == "true"
-AUTO_TRIM = os.getenv("AUTO_TRIM", "true").lower() == "true"
+        # Safer default for a public Cloudflare Tunnel:
+        # JanitorAI sends proxy_key, while your real Anthropic key stays local in .env.
+        self.require_proxy_key = getenv_bool("REQUIRE_PROXY_KEY", True)
 
-# Leave empty by default. The original notebook used a strong assistant prefill.
-# For safety and reliability, keep this blank unless you have a benign reason to use it.
-ASSISTANT_PREFILL = os.getenv("ASSISTANT_PREFILL", "")
+        # Compatibility fallback: if true and anthropic_api_key is not set,
+        # the proxy will use the Bearer token from the incoming request as the Anthropic key.
+        # For a public tunnel, I recommend leaving this false.
+        self.allow_key_passthrough = getenv_bool("ALLOW_KEY_PASSTHROUGH", False)
 
-# assistant   : sends ASSISTANT_PREFILL as an assistant message/prefill.
-# instruction : appends an OOC instruction containing ASSISTANT_PREFILL to the last user message.
-# PREFILL_MODE is accepted as a shorter backwards-compatible alias.
-ASSISTANT_PREFILL_MODE = os.getenv("ASSISTANT_PREFILL_MODE", os.getenv("PREFILL_MODE", "assistant")).strip().lower()
+        self.debug_log = getenv_bool("DEBUG_LOG", True)
+        self.auto_trim = getenv_bool("AUTO_TRIM", True)
 
-VALID_ASSISTANT_PREFILL_MODES = {"assistant", "instruction"}
-if ASSISTANT_PREFILL_MODE not in VALID_ASSISTANT_PREFILL_MODES:
-    print("WARNING: ASSISTANT_PREFILL_MODE must be 'assistant' or 'instruction'. Defaulting to 'assistant'.")
-    ASSISTANT_PREFILL_MODE = "assistant"
+        # Leave empty by default. The original notebook used a strong assistant prefill.
+        # For safety and reliability, keep this blank unless you have a benign reason to use it.
+        self.assistant_prefill = os.getenv("ASSISTANT_PREFILL", "")
 
-# Generation defaults
-TEMPERATURE_OVERRIDE = float(os.getenv("TEMPERATURE_OVERRIDE", "-1"))
-DEFAULT_TEMPERATURE  = float(os.getenv("DEFAULT_TEMPERATURE", "0.9"))
-SEND_TOP_P           = os.getenv("SEND_TOP_P", "false").lower() == "true"
-TOP_P                = float(os.getenv("TOP_P", "0.9"))
-TOP_K                = int(os.getenv("TOP_K", "75"))
-DEFAULT_MAX_TOKENS   = int(os.getenv("DEFAULT_MAX_TOKENS", "1000"))
+        # assistant   : sends assistant_prefill as an assistant message/prefill.
+        # instruction : appends an OOC instruction containing assistant_prefill to the last user message.
+        # PREFILL_MODE is accepted as a shorter backwards-compatible alias.
+        self.assistant_prefill_mode = os.getenv("ASSISTANT_PREFILL_MODE", os.getenv("PREFILL_MODE", "assistant")).strip().lower()
 
-# Cost tracking.
-# Values are USD per 1 million tokens. Defaults are Anthropic's Claude Sonnet 4.5 API prices.
-INPUT_TOKEN_COST_USD    = getenv_float("INPUT_TOKEN_COST_USD"   ,  3.00)
-OUTPUT_TOKEN_COST_USD   = getenv_float("OUTPUT_TOKEN_COST_USD"  , 15.00)
-CACHE_WRITE_5M_COST_USD = getenv_float("CACHE_WRITE_5M_COST_USD",  3.75)
-CACHE_WRITE_1H_COST_USD = getenv_float("CACHE_WRITE_1H_COST_USD",  6.00)
-CACHE_READ_COST_USD     = getenv_float("CACHE_READ_COST_USD"    ,  0.30)
+        if self.assistant_prefill_mode not in {"assistant", "instruction"}:
+            print("WARNING: ASSISTANT_PREFILL_MODE must be 'assistant' or 'instruction'. Defaulting to 'assistant'.")
+            self.assistant_prefill_mode = "assistant"
 
-# Prompt caching.
-# Anthropic supports automatic top-level caching and explicit block-level caching.
-# This script uses explicit block-level caching because assistant prefill can otherwise
-# become the final cacheable block. Up to four explicit markers are used:
-#   1-2  system / lorebook blocks (when SPLIT_LOREBOOK=true)
-#    3   manual first-N-message breakpoint
-#    4   automatic end-relative breakpoint before optional prefill
-USE_CACHE        = getenv_bool("USE_CACHE", getenv_bool("PROMPT_CACHE", True))
-CACHE_SYSTEM     = getenv_bool("CACHE_SYSTEM", getenv_bool("CACHE_SYSTEM_PROMPT", True))
-CACHE_SYSTEM_TTL = getenv_cache_ttl("CACHE_SYSTEM_TTL")
-SPLIT_LOREBOOK   = getenv_bool("SPLIT_LOREBOOK", True)
-CACHE_MANUAL_TTL = getenv_cache_ttl("CACHE_MANUAL_TTL")
-CACHE_MANUAL_MSG = max(0, getenv_int("CACHE_MANUAL_MSG", getenv_int("CACHE_FIRST_MESSAGES", 0)))
-CACHE_AUTO_TTL   = getenv_cache_ttl("CACHE_AUTO_TTL")
-CACHE_AUTO_MSG   = max(0, getenv_int("CACHE_AUTO_MSG", 0))
+        # Generation defaults
+        self.temperature_override = getenv_float("TEMPERATURE_OVERRIDE", -1.0)
+        self.default_temperature  = getenv_float("DEFAULT_TEMPERATURE", 0.9)
+        self.send_top_p           = getenv_bool("SEND_TOP_P", False)
+        self.top_p                = getenv_float("TOP_P", 0.9)
+        self.top_k                = getenv_int("TOP_K", 75)
+        self.default_max_tokens   = getenv_int("DEFAULT_MAX_TOKENS", 8192)
+
+        # Thinking
+        self.thinking_enabled = getenv_bool("THINKING_ENABLED", False)
+        self.thinking_budget  = getenv_int("THINKING_BUDGET", 2048)
+        self.thinking_effort  = os.getenv("THINKING_EFFORT", "medium").lower()
+
+        # Cost tracking.
+        # Values are USD per 1 million tokens. Defaults are Anthropic's Claude Sonnet 4.5 API prices.
+        self.input_token_cost_usd    = getenv_float("INPUT_TOKEN_COST_USD"   ,  3.00)
+        self.output_token_cost_usd   = getenv_float("OUTPUT_TOKEN_COST_USD"  , 15.00)
+        self.cache_write_5m_cost_usd = getenv_float("CACHE_WRITE_5M_COST_USD",  3.75)
+        self.cache_write_1h_cost_usd = getenv_float("CACHE_WRITE_1H_COST_USD",  6.00)
+        self.cache_read_cost_usd     = getenv_float("CACHE_READ_COST_USD"    ,  0.30)
+
+        # Prompt caching.
+        # Anthropic supports automatic top-level caching and explicit block-level caching.
+        # This script uses explicit block-level caching because assistant prefill can otherwise
+        # become the final cacheable block. Up to four explicit markers are used:
+        #   1-2  system / lorebook blocks (when split_lorebook=true)
+        #    3   manual first-N-message breakpoint
+        #    4   automatic end-relative breakpoint before optional prefill
+        self.use_cache        = getenv_bool("USE_CACHE", getenv_bool("PROMPT_CACHE", True))
+        self.cache_system     = getenv_bool("CACHE_SYSTEM", getenv_bool("CACHE_SYSTEM_PROMPT", True))
+        self.cache_system_ttl = getenv_cache_ttl("CACHE_SYSTEM_TTL")
+        self.split_lorebook   = getenv_bool("SPLIT_LOREBOOK", True)
+        self.cache_manual_ttl = getenv_cache_ttl("CACHE_MANUAL_TTL")
+        self.cache_manual_msg = max(0, getenv_int("CACHE_MANUAL_MSG", getenv_int("CACHE_FIRST_MESSAGES", 0)))
+        self.cache_auto_ttl   = getenv_cache_ttl("CACHE_AUTO_TTL")
+        self.cache_auto_msg   = max(0, getenv_int("CACHE_AUTO_MSG", 0))
+
+        self.error_log_path = os.getenv("ERROR_LOG_PATH", "claude_error_log.txt")
+        self.model_list_timeout_seconds = getenv_float("MODEL_LIST_TIMEOUT_SECONDS", 10.0)
+        self.allow_client_model = getenv_bool("ALLOW_CLIENT_MODEL", False)
+
+    def print_status(self) -> None:
+        print()
+        print("=== Runtime config start ===")
+        print(f"host                   = {self.host} (restart required to change)")
+        print(f"port                   = {self.port} (restart required to change)")
+        print(f"default_model          = {self.default_model}")
+        print(f"haiku_model            = {self.haiku_model}")
+        print(f"sonnet_model           = {self.sonnet_model}")
+        print(f"sonnet35_model         = {self.sonnet35_model}")
+        print(f"opus_model             = {self.opus_model}")
+        print(f"selected_model_id      = {get_selected_model_id()}")
+        print(f"require_proxy_key      = {self.require_proxy_key}")
+        print(f"allow_key_passthrough  = {self.allow_key_passthrough}")
+        print(f"allow_client_model     = {self.allow_client_model}")
+        print(f"debug_log              = {self.debug_log}")
+        print(f"auto_trim              = {self.auto_trim}")
+        print(f"assistant_prefill      = {'set' if self.assistant_prefill.strip() else 'empty'}")
+        print(f"assistant_prefill_mode = {self.assistant_prefill_mode}")
+        print(f"temperature_override   = {self.temperature_override}")
+        print(f"default_temperature    = {self.default_temperature}")
+        print(f"send_top_p             = {self.send_top_p}")
+        print(f"top_p                  = {self.top_p}")
+        print(f"top_k                  = {self.top_k}")
+        print(f"default_max_tokens     = {self.default_max_tokens}")
+        print(f"use_cache              = {self.use_cache}")
+        print(f"cache_system           = {self.cache_system}")
+        print(f"cache_system_ttl       = {self.cache_system_ttl}")
+        print(f"split_lorebook         = {self.split_lorebook}")
+        print(f"cache_manual_ttl       = {self.cache_manual_ttl}")
+        print(f"cache_manual_msg       = {self.cache_manual_msg}")
+        print(f"cache_auto_ttl         = {self.cache_auto_ttl}")
+        print(f"cache_auto_msg         = {self.cache_auto_msg}")
+        print(f"error_log_path         = {self.error_log_path}")
+        print(f"model_list_timeout_sec = {self.model_list_timeout_seconds}")
+        print("=== Runtime config end ===")
+        print()
+
+cfg      : RuntimeConfig
+cfg_init : RuntimeConfig
 
 # Session cost tracking variables
 SESSION_TTL_SPENT_USD       = 0.0
@@ -135,12 +185,9 @@ SESSION_TTL_OUTPUT_TOK      = 0
 SESSION_CACHE_NET_COST_USD  = 0.0
 SESSION_COST_LOCK           = threading.Lock()
 
-ERROR_LOG_PATH = os.getenv("ERROR_LOG_PATH", "claude_error_log.txt")
-
-MODEL_LIST_TIMEOUT_SECONDS                   = getenv_float("MODEL_LIST_TIMEOUT_SECONDS", 10.0)
 ANTHROPIC_TIMEOUT_ERROR                      = getattr(anthropic, "APITimeoutError", TimeoutError)
 ANTHROPIC_MODELS      : List[Dict[str, Any]] = []
-SELECTED_MODEL_ID     : Optional[str]        = DEFAULT_MODEL
+SELECTED_MODEL_ID     : Optional[str]        = None
 MODEL_LIST_LAST_ERROR : Optional[str]        = None
 MODEL_LIST_LAST_TIMEOUT                      = False
 MODEL_LOCK                                   = threading.Lock()
@@ -154,56 +201,17 @@ def reload_runtime_env() -> None:
     """
     Reloads runtime configuration from .env.
 
-    HOST and PORT are intentionally not reloaded because Waitress is already bound to them.
+    cfg.host and cfg.port are intentionally not reloaded because Waitress is already bound to them.
     """
-    global DEFAULT_MODEL, HAIKU_MODEL, SONNET_MODEL, SONNET35_MODEL, OPUS_MODEL, ANTHROPIC_API_KEY, PROXY_KEY
-    global REQUIRE_PROXY_KEY, ALLOW_KEY_PASSTHROUGH, DEBUG_LOG, AUTO_TRIM, ASSISTANT_PREFILL, ASSISTANT_PREFILL_MODE
-    global TEMPERATURE_OVERRIDE, DEFAULT_TEMPERATURE, SEND_TOP_P, TOP_P, TOP_K, DEFAULT_MAX_TOKENS
-    global INPUT_TOKEN_COST_USD, OUTPUT_TOKEN_COST_USD, CACHE_WRITE_5M_COST_USD, CACHE_WRITE_1H_COST_USD, CACHE_READ_COST_USD
-    global USE_CACHE, CACHE_SYSTEM, CACHE_SYSTEM_TTL, SPLIT_LOREBOOK, CACHE_MANUAL_TTL, CACHE_MANUAL_MSG, CACHE_AUTO_TTL, CACHE_AUTO_MSG, ERROR_LOG_PATH
-
     load_dotenv(override=True)
 
-    DEFAULT_MODEL          = os.getenv("DEFAULT_MODEL", "claude-sonnet-4-5-20250929")
-    HAIKU_MODEL            = os.getenv("HAIKU_MODEL", DEFAULT_MODEL)
-    SONNET_MODEL           = os.getenv("SONNET_MODEL", DEFAULT_MODEL)
-    SONNET35_MODEL         = os.getenv("SONNET35_MODEL", DEFAULT_MODEL)
-    OPUS_MODEL             = os.getenv("OPUS_MODEL", DEFAULT_MODEL)
-    ANTHROPIC_API_KEY      = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    PROXY_KEY              = os.getenv("PROXY_KEY", "").strip()
-    REQUIRE_PROXY_KEY      = getenv_bool("REQUIRE_PROXY_KEY", True)
-    ALLOW_KEY_PASSTHROUGH  = getenv_bool("ALLOW_KEY_PASSTHROUGH", False)
-    DEBUG_LOG              = getenv_bool("DEBUG_LOG", True)
-    AUTO_TRIM              = getenv_bool("AUTO_TRIM", True)
-    ASSISTANT_PREFILL      = os.getenv("ASSISTANT_PREFILL", "")
-    ASSISTANT_PREFILL_MODE = os.getenv("ASSISTANT_PREFILL_MODE", os.getenv("PREFILL_MODE", "assistant")).strip().lower()
-    if ASSISTANT_PREFILL_MODE not in VALID_ASSISTANT_PREFILL_MODES:
-        print("WARNING: ASSISTANT_PREFILL_MODE must be 'assistant' or 'instruction'. Defaulting to 'assistant'.")
-        ASSISTANT_PREFILL_MODE = "assistant"
+    bound_host = cfg.host
+    bound_port = cfg.port
 
-    TEMPERATURE_OVERRIDE = getenv_float("TEMPERATURE_OVERRIDE", -1.0)
-    DEFAULT_TEMPERATURE  = getenv_float("DEFAULT_TEMPERATURE", 0.9)
-    SEND_TOP_P           = getenv_bool("SEND_TOP_P", False)
-    TOP_P                = getenv_float("TOP_P", 0.9)
-    TOP_K                = getenv_int("TOP_K", 75)
-    DEFAULT_MAX_TOKENS   = getenv_int("DEFAULT_MAX_TOKENS", 1000)
+    cfg.reload_from_env()
 
-    INPUT_TOKEN_COST_USD    = getenv_float("INPUT_TOKEN_COST_USD"   ,  3.00)
-    OUTPUT_TOKEN_COST_USD   = getenv_float("OUTPUT_TOKEN_COST_USD"  , 15.00)
-    CACHE_WRITE_5M_COST_USD = getenv_float("CACHE_WRITE_5M_COST_USD",  3.75)
-    CACHE_WRITE_1H_COST_USD = getenv_float("CACHE_WRITE_1H_COST_USD",  6.00)
-    CACHE_READ_COST_USD     = getenv_float("CACHE_READ_COST_USD"    ,  0.30)
-
-    USE_CACHE        = getenv_bool("USE_CACHE", getenv_bool("PROMPT_CACHE", True))
-    CACHE_SYSTEM     = getenv_bool("CACHE_SYSTEM", getenv_bool("CACHE_SYSTEM_PROMPT", True))
-    CACHE_SYSTEM_TTL = getenv_cache_ttl("CACHE_SYSTEM_TTL")
-    SPLIT_LOREBOOK   = getenv_bool("SPLIT_LOREBOOK", True)
-    CACHE_MANUAL_TTL = getenv_cache_ttl("CACHE_MANUAL_TTL")
-    CACHE_MANUAL_MSG = max(0, getenv_int("CACHE_MANUAL_MSG", getenv_int("CACHE_FIRST_MESSAGES", 0)))
-    CACHE_AUTO_TTL   = getenv_cache_ttl("CACHE_AUTO_TTL")
-    CACHE_AUTO_MSG   = max(0, getenv_int("CACHE_AUTO_MSG", 0))
-
-    ERROR_LOG_PATH = os.getenv("ERROR_LOG_PATH", "claude_error_log.txt")
+    cfg.host = bound_host
+    cfg.port = bound_port
 
     refresh_anthropic_models()
 
@@ -212,53 +220,15 @@ def reload_runtime_env() -> None:
 
 
 def set_cache_manual_msg(value: int) -> None:
-    global CACHE_MANUAL_MSG
     if value < 0 : raise ValueError("CACHE_MANUAL_MSG must be >= 0.")
-    CACHE_MANUAL_MSG = value
-    print(f"Manual cache marker now targets {CACHE_MANUAL_MSG} message(s) from the start.")
+    cfg.cache_manual_msg = value
+    print(f"Manual cache marker now targets {cfg.cache_manual_msg} message(s) from the start.")
 
 
 def set_cache_auto_msg(value: int) -> None:
-    global CACHE_AUTO_MSG
     if value < 0 : raise ValueError("CACHE_AUTO_MSG must be >= 0.")
-    CACHE_AUTO_MSG = value
-    print(f"Auto cache marker now targets {CACHE_AUTO_MSG} message(s) from the end.")
-
-
-def print_runtime_status() -> None:
-    print()
-    print("=== Runtime config start ===")
-    print(f"HOST                   = {HOST} (restart required to change)")
-    print(f"PORT                   = {PORT} (restart required to change)")
-    print(f"DEFAULT_MODEL          = {DEFAULT_MODEL}")
-    print(f"HAIKU_MODEL            = {HAIKU_MODEL}")
-    print(f"SONNET_MODEL           = {SONNET_MODEL}")
-    print(f"SONNET35_MODEL         = {SONNET35_MODEL}")
-    print(f"OPUS_MODEL             = {OPUS_MODEL}")
-    print(f"SELECTED_MODEL_ID      = {get_selected_model_id()}")
-    print(f"REQUIRE_PROXY_KEY      = {REQUIRE_PROXY_KEY}")
-    print(f"ALLOW_KEY_PASSTHROUGH  = {ALLOW_KEY_PASSTHROUGH}")
-    print(f"DEBUG_LOG              = {DEBUG_LOG}")
-    print(f"AUTO_TRIM              = {AUTO_TRIM}")
-    print(f"ASSISTANT_PREFILL      = {'set' if ASSISTANT_PREFILL.strip() else 'empty'}")
-    print(f"ASSISTANT_PREFILL_MODE = {ASSISTANT_PREFILL_MODE}")
-    print(f"TEMPERATURE_OVERRIDE   = {TEMPERATURE_OVERRIDE}")
-    print(f"DEFAULT_TEMPERATURE    = {DEFAULT_TEMPERATURE}")
-    print(f"SEND_TOP_P             = {SEND_TOP_P}")
-    print(f"TOP_P                  = {TOP_P}")
-    print(f"TOP_K                  = {TOP_K}")
-    print(f"DEFAULT_MAX_TOKENS     = {DEFAULT_MAX_TOKENS}")
-    print(f"USE_CACHE              = {USE_CACHE}")
-    print(f"CACHE_SYSTEM           = {CACHE_SYSTEM}")
-    print(f"CACHE_SYSTEM_TTL       = {CACHE_SYSTEM_TTL}")
-    print(f"SPLIT_LOREBOOK         = {SPLIT_LOREBOOK}")
-    print(f"CACHE_MANUAL_TTL       = {CACHE_MANUAL_TTL}")
-    print(f"CACHE_MANUAL_MSG       = {CACHE_MANUAL_MSG}")
-    print(f"CACHE_AUTO_TTL         = {CACHE_AUTO_TTL}")
-    print(f"CACHE_AUTO_MSG         = {CACHE_AUTO_MSG}")
-    print(f"ERROR_LOG_PATH         = {ERROR_LOG_PATH}")
-    print("=== Runtime config end ===")
-    print()
+    cfg.cache_auto_msg = value
+    print(f"Auto cache marker now targets {cfg.cache_auto_msg} message(s) from the end.")
 
 
 def anthropic_object_to_dict(obj: Any) -> Dict[str, Any]:
@@ -305,10 +275,10 @@ def refresh_anthropic_models() -> bool:
     global ANTHROPIC_MODELS, MODEL_LIST_LAST_ERROR, MODEL_LIST_LAST_TIMEOUT
 
     try:
-        if not ANTHROPIC_API_KEY: raise RuntimeError("ANTHROPIC_API_KEY is not configured; model list cannot be retrieved at startup.")
+        if not cfg.anthropic_api_key: raise RuntimeError("ANTHROPIC_API_KEY is not configured; model list cannot be retrieved at startup.")
 
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        page   = client.models.list(limit=100, timeout=MODEL_LIST_TIMEOUT_SECONDS)
+        client = anthropic.Anthropic(api_key=cfg.anthropic_api_key)
+        page   = client.models.list(limit=100, timeout=cfg.model_list_timeout_seconds)
 
         raw_models = getattr(page, "data", None)
         if raw_models is None:
@@ -322,7 +292,7 @@ def refresh_anthropic_models() -> bool:
             MODEL_LIST_LAST_TIMEOUT = False
 
         if models : print(f"Retrieved {len(models)} Anthropic model(s).")
-        else      : print("Anthropic returned an empty model list. Using default model: {DEFAULT_MODEL}")
+        else      : print(f"Anthropic returned an empty model list. Using default model: {cfg.default_model}")
 
         return True
 
@@ -350,7 +320,7 @@ def get_selected_model_id() -> Optional[str]:
 
 def print_no_model_list_available() -> None:
     print("No Anthropic model list is available.")
-    print(f"Requests will continue using the configured model: {get_selected_model_id() or DEFAULT_MODEL}")
+    print(f"Requests will continue using the configured model: {get_selected_model_id() or cfg.default_model}")
 
     with MODEL_LOCK:
         last_timeout = MODEL_LIST_LAST_TIMEOUT
@@ -425,10 +395,6 @@ def admin_cli_loop() -> None:
     """
     Tiny local CLI for changing runtime-only settings.
     """
-    global USE_CACHE, CACHE_MANUAL_TTL, CACHE_AUTO_TTL, CACHE_SYSTEM, CACHE_SYSTEM_TTL
-
-    DISABLE_VALUES = {"disable", "0", "false", "off"}
-    ENABLE_VALUES  = {"enable" , "1", "true" , "on" }
 
     print("Runtime CLI ready. Type 'help' for commands.")
     print()
@@ -460,32 +426,32 @@ def admin_cli_loop() -> None:
             if command == "cache":
                 if len(parts) != 2 : print("Usage : cache <sub_cmd>"); continue
                 arg1 = parts[1].lower()
-                if arg1 in DISABLE_VALUES : USE_CACHE = 0; continue
-                if arg1 in ENABLE_VALUES  : USE_CACHE = 1; continue
+                if arg1 in DISABLE_VALUES : cfg.use_cache = False; continue
+                if arg1 in ENABLE_VALUES  : cfg.use_cache = True; continue
                 if len(parts) != 3 : print("Usage : cache <sub_cmd> <number>"); continue
                 arg2 = parts[2].lower()
-                if (arg1 in {"manual" "man" "m"}) :
-                    if (arg2 == "1h") : CACHE_MANUAL_TTL = "1h"; continue
-                    if (arg2 == "5m") : CACHE_MANUAL_TTL = "5m"; continue
+                if arg1 in {"manual", "man", "m"} :
+                    if (arg2 == "1h") : cfg.cache_manual_ttl = "1h"; continue
+                    if (arg2 == "5m") : cfg.cache_manual_ttl = "5m"; continue
                     if (arg2 in DISABLE_VALUES) : set_cache_manual_msg(0); continue
                     set_cache_manual_msg(int(arg2)); continue
-                if (arg1 == {"auto" "a"}) :
-                    if (arg2 == "1h") : CACHE_AUTO_TTL = "1h"; continue
-                    if (arg2 == "5m") : CACHE_AUTO_TTL = "5m"; continue
+                if arg1 in {"auto", "a"} :
+                    if (arg2 == "1h") : cfg.cache_auto_ttl = "1h"; continue
+                    if (arg2 == "5m") : cfg.cache_auto_ttl = "5m"; continue
                     if (arg2 in DISABLE_VALUES) : set_cache_auto_msg(0); continue
                     set_cache_auto_msg(int(arg2)); continue
-                if (arg1 == {"system" "sys" "s"}) :
-                    if (arg2 in DISABLE_VALUES) : CACHE_SYSTEM = False
-                    if (arg2 in ENABLE_VALUES ) : CACHE_SYSTEM = True;
-                    if (arg2 == "1h") : CACHE_SYSTEM_TTL = "1h"; continue
-                    if (arg2 == "5m") : CACHE_SYSTEM_TTL = "5m"; continue
+                if arg1 in {"system", "sys", "s"} :
+                    if (arg2 in DISABLE_VALUES) : cfg.cache_system = False
+                    if (arg2 in ENABLE_VALUES ) : cfg.cache_system = True;
+                    if (arg2 == "1h") : cfg.cache_system_ttl = "1h"; continue
+                    if (arg2 == "5m") : cfg.cache_system_ttl = "5m"; continue
 
             if command in {"reload_env", "reload", "env"}:
                 if len(parts) != 1:
                     print("Usage: reload_env")
                     continue
                 reload_runtime_env()
-                print_runtime_status()
+                cfg.print_status()
                 continue
 
             if command in {"model", "models"}:
@@ -507,7 +473,7 @@ def admin_cli_loop() -> None:
                 continue
 
             if command in {"show", "status"}:
-                print_runtime_status()
+                cfg.print_status()
                 continue
 
             if command == "help":
@@ -546,7 +512,7 @@ def admin_cli_loop() -> None:
 
 def write_error_log(body: Any) -> None:
     try:
-        with open(ERROR_LOG_PATH, "a", encoding="utf-8") as f:
+        with open(cfg.error_log_path, "a", encoding="utf-8") as f:
             f.write(str(body) + "\n\n")
     except Exception:
         print("Failed to write error log:")
@@ -570,12 +536,12 @@ def get_anthropic_client() -> anthropic.Anthropic:
     """
     provided_key = get_bearer_token()
 
-    if ANTHROPIC_API_KEY:
-        if REQUIRE_PROXY_KEY:
-            if not PROXY_KEY             : abort(500, description=("Server is configured with REQUIRE_PROXY_KEY=true, but PROXY_KEY is missing from .env."))
-            if provided_key != PROXY_KEY : abort(401, description="Invalid proxy key.")
-        return anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    if ALLOW_KEY_PASSTHROUGH:
+    if cfg.anthropic_api_key:
+        if cfg.require_proxy_key:
+            if not cfg.proxy_key             : abort(500, description=("Server is configured with REQUIRE_PROXY_KEY=true, but PROXY_KEY is missing from .env."))
+            if provided_key != cfg.proxy_key : abort(401, description="Invalid proxy key.")
+        return anthropic.Anthropic(api_key=cfg.anthropic_api_key)
+    if cfg.allow_key_passthrough:
         if not provided_key : abort(401, description="Missing Authorization bearer token.")
         return anthropic.Anthropic(api_key=provided_key)
     abort(500, description=("ANTHROPIC_API_KEY is not configured. Either set ANTHROPIC_API_KEY and PROXY_KEY in .env, or set ALLOW_KEY_PASSTHROUGH=true."))
@@ -601,7 +567,7 @@ def add_cache_control_to_content(content: Any, ttl: str) -> Any:
     request level or on content blocks. This script uses explicit block-level
     caching to avoid caching the assistant prefill as the final block.
     """
-    if not USE_CACHE:
+    if not cfg.use_cache:
         return content
 
     cache_control = make_cache_control(ttl)
@@ -657,11 +623,16 @@ def make_prefill_instruction(prefix_text: str) -> str:
     This avoids Anthropic assistant prefill by telling Claude, inside the
     last user message, to continue as though the prefix was already present.
     """
+    # return (
+    #     "\n<OOC>\n"
+    #     "The assistant will begin its reply with the following prefix:\n"
+    #     f"<prefix>{prefix_text}</prefix>\n"
+    #     "Continue immediately after that prefix. Do not display the prefix in your answer.\n"
+    #     "</OOC>"
+    # )
     return (
         "\n<OOC>\n"
-        "The assistant will begin its reply with the following prefix:\n"
-        f"<prefix>{prefix_text}</prefix>\n"
-        "Continue immediately after that prefix. Do not display the prefix in your answer.\n"
+        f"{prefix_text}\n"
         "</OOC>"
     )
 
@@ -719,7 +690,7 @@ def split_system_prompt_into_text_blocks(system_prompt: str) -> List[Dict[str, s
     Split priority:
         1. After </example_dialogs>.
         1. After </Scenario>.
-        2. Otherwise after the last </* Persona> marker.
+        2. After the last </* Persona> marker.
         3. Otherwise keep the whole system prompt as one block.
 
     Anything after it becomes the second block, usually lorebook / long term memory.
@@ -768,7 +739,7 @@ def format_system_for_claude(system_prompt: Optional[str]) -> Optional[Any]:
     if system_prompt is None:
         return None
 
-    if SPLIT_LOREBOOK:
+    if cfg.split_lorebook:
         blocks = split_system_prompt_into_text_blocks(system_prompt)
     else:
         stripped = system_prompt.strip()
@@ -781,8 +752,8 @@ def format_system_for_claude(system_prompt: Optional[str]) -> Optional[Any]:
 
     for block in blocks:
         new_block: Dict[str, Any] = dict(block)
-        if (USE_CACHE and CACHE_SYSTEM and new_block.get("type") == "text" and new_block.get("text", "").strip()):
-            new_block["cache_control"] = make_cache_control(CACHE_SYSTEM_TTL)
+        if (cfg.use_cache and cfg.cache_system and new_block.get("type") == "text" and new_block.get("text", "").strip()):
+            new_block["cache_control"] = make_cache_control(cfg.cache_system_ttl)
         formatted_system.append(new_block)
 
     return formatted_system
@@ -801,12 +772,12 @@ def format_to_claude_messages(mlist: List[Dict[str, str]]) -> List[Dict[str, Any
     """
 
     manual_cache_target_index = 0
-    if USE_CACHE and CACHE_MANUAL_MSG > 0 and mlist:
-        manual_cache_target_index = min(CACHE_MANUAL_MSG, len(mlist))
+    if cfg.use_cache and cfg.cache_manual_msg > 0 and mlist:
+        manual_cache_target_index = min(cfg.cache_manual_msg, len(mlist))
 
     auto_cache_target_index = 0
-    if USE_CACHE and CACHE_AUTO_MSG > 0 and mlist:
-        auto_cache_target_index = max(1, len(mlist) - CACHE_AUTO_MSG + 1)
+    if cfg.use_cache and cfg.cache_auto_msg > 0 and mlist:
+        auto_cache_target_index = max(1, len(mlist) - cfg.cache_auto_msg + 1)
 
     formatted = [{"role": "user", "content": "<OOC>\nBegin the scenario.\n</OOC>"}]
     old_role  = "user"
@@ -826,21 +797,21 @@ def format_to_claude_messages(mlist: List[Dict[str, str]]) -> List[Dict[str, Any
 
         # Manual marker: cache the first N incoming chat messages, preserving the old behavior.
         if idx == manual_cache_target_index:
-            formatted[-1]["content"] = add_cache_control_to_content(formatted[-1]["content"], CACHE_MANUAL_TTL)
+            formatted[-1]["content"] = add_cache_control_to_content(formatted[-1]["content"], cfg.cache_manual_ttl)
 
         # Auto marker: count backwards from the final incoming chat message, before optional prefill is added.
         if idx == auto_cache_target_index:
-            formatted[-1]["content"] = add_cache_control_to_content(formatted[-1]["content"], CACHE_AUTO_TTL)
+            formatted[-1]["content"] = add_cache_control_to_content(formatted[-1]["content"], cfg.cache_auto_ttl)
 
     # Optional Claude prefill.
     # assistant mode preserves the original assistant-message/prefill behavior.
     # instruction mode avoids assistant prefill and appends an OOC instruction to the last user message instead.
-    if ASSISTANT_PREFILL.strip():
-        if ASSISTANT_PREFILL_MODE == "instruction":
-            append_prefill_instruction_to_last_user_message(formatted, ASSISTANT_PREFILL)
+    if cfg.assistant_prefill.strip():
+        if cfg.assistant_prefill_mode == "instruction":
+            append_prefill_instruction_to_last_user_message(formatted, cfg.assistant_prefill)
         else:
-            if formatted[-1]["role"] == "user" : formatted.append({"role" : "assistant", "content" : ASSISTANT_PREFILL})
-            else                               : formatted[-1]["content"] = append_text_to_content(formatted[-1]["content"], ASSISTANT_PREFILL)
+            if formatted[-1]["role"] == "user" : formatted.append({"role" : "assistant", "content" : cfg.assistant_prefill})
+            else                               : formatted[-1]["content"] = append_text_to_content(formatted[-1]["content"], cfg.assistant_prefill)
 
     return formatted
 
@@ -887,17 +858,14 @@ def average_cost_per_token_usd(total_cost_usd: float, total_tokens: int) -> floa
 def fallback_cache_write_ttl() -> str:
     """
     Older SDK usage payloads may not split cache creation by 5m/1h.
-    If any active marker is configured for 1h, assume 1h for unknown write tokens to avoid undercounting cost.
+    If any active marker is configured for 1h, assume 1h for unknown write tokens to avoid under-counting cost.
     """
-    if not USE_CACHE:
+    if not cfg.use_cache:
         return "5m"
     active_ttl: List[str] = []
-    if CACHE_SYSTEM:
-        active_ttl.append(CACHE_SYSTEM_TTL)
-    if CACHE_MANUAL_MSG > 0:
-        active_ttl.append(CACHE_MANUAL_TTL)
-    if CACHE_AUTO_MSG > 0:
-        active_ttl.append(CACHE_AUTO_TTL)
+    if cfg.cache_system         : active_ttl.append(cfg.cache_system_ttl)
+    if cfg.cache_manual_msg > 0 : active_ttl.append(cfg.cache_manual_ttl)
+    if cfg.cache_auto_msg   > 0 : active_ttl.append(cfg.cache_auto_ttl)
     return "1h" if "1h" in active_ttl else "5m"
 
 
@@ -934,22 +902,22 @@ def print_usage(usage: Any) -> None:
     cache_creation_input = ephemeral_1h + ephemeral_5m
     ttl_tokens           = input_tok + cache_read + cache_creation_input
 
-    input_cost          = tok_usd(input_tok, INPUT_TOKEN_COST_USD)
-    cache_read_cost     = tok_usd(cache_read, CACHE_READ_COST_USD)
-    cache_write_1h_cost = tok_usd(ephemeral_1h, CACHE_WRITE_1H_COST_USD)
-    cache_write_5m_cost = tok_usd(ephemeral_5m, CACHE_WRITE_5M_COST_USD)
+    input_cost          = tok_usd(input_tok, cfg.input_token_cost_usd)
+    cache_read_cost     = tok_usd(cache_read, cfg.cache_read_cost_usd)
+    cache_write_1h_cost = tok_usd(ephemeral_1h, cfg.cache_write_1h_cost_usd)
+    cache_write_5m_cost = tok_usd(ephemeral_5m, cfg.cache_write_5m_cost_usd)
     cache_write_cost    = cache_write_1h_cost + cache_write_5m_cost
     total_input_cost    = input_cost + cache_read_cost + cache_write_cost
 
-    output_cost        = tok_usd(output_tok, OUTPUT_TOKEN_COST_USD)
+    output_cost        = tok_usd(output_tok, cfg.output_token_cost_usd)
     request_total_cost = total_input_cost + output_cost
 
     cache_write_extra_cost = (
-        tok_usd(ephemeral_1h, CACHE_WRITE_1H_COST_USD - INPUT_TOKEN_COST_USD)
+        tok_usd(ephemeral_1h, cfg.cache_write_1h_cost_usd - cfg.input_token_cost_usd)
         +
-        tok_usd(ephemeral_5m, CACHE_WRITE_5M_COST_USD - INPUT_TOKEN_COST_USD)
+        tok_usd(ephemeral_5m, cfg.cache_write_5m_cost_usd - cfg.input_token_cost_usd)
     )
-    cache_read_saved_cost  = tok_usd(cache_read, INPUT_TOKEN_COST_USD - CACHE_READ_COST_USD)
+    cache_read_saved_cost  = tok_usd(cache_read, cfg.input_token_cost_usd - cfg.cache_read_cost_usd)
     request_cache_net_cost = cache_write_extra_cost - cache_read_saved_cost
 
     with SESSION_COST_LOCK:
@@ -967,7 +935,7 @@ def print_usage(usage: Any) -> None:
         session_cache_net_cost       = SESSION_CACHE_NET_COST_USD
         session_average_input_cost   = average_cost_per_token_usd(session_total_input_cost, session_total_input_tok)
 
-    if not DEBUG_LOG:
+    if not cfg.debug_log:
         return
 
     print("=== Claude usage start ===")
@@ -1021,9 +989,9 @@ def usage_to_openai_dict(usage: Any) -> Dict[str, int]:
 
 
 def get_temperature(payload: Dict[str, Any]) -> float:
-    if TEMPERATURE_OVERRIDE != -1:
-        return TEMPERATURE_OVERRIDE
-    return float(payload.get("temperature", DEFAULT_TEMPERATURE))
+    if cfg.temperature_override != -1:
+        return cfg.temperature_override
+    return float(payload.get("temperature", cfg.default_temperature))
 
 
 def split_system_and_messages(raw_messages: Any) -> Tuple[Optional[str], List[Dict[str, str]]]:
@@ -1078,18 +1046,22 @@ def build_claude_kwargs(payload: Dict[str, Any], route_model: str) -> Dict[str, 
     # CLI-selected model wins over route aliases.
     # If you want JanitorAI/client to choose model from JSON, set ALLOW_CLIENT_MODEL=true.
     effective_route_model = get_selected_model_id() or route_model
-    allow_client_model    = os.getenv("ALLOW_CLIENT_MODEL", "false").lower() == "true"
-    selected_model        = payload.get("model") if allow_client_model else effective_route_model
+    selected_model        = payload.get("model") if cfg.allow_client_model else effective_route_model
     selected_model        = selected_model or effective_route_model
 
     kwargs: Dict[str, Any] = {
         "model"       : selected_model,
-        "max_tokens"  : int(payload.get("max_tokens", DEFAULT_MAX_TOKENS)),
+        "max_tokens"  : int(payload.get("max_tokens", cfg.default_max_tokens)),
         "temperature" : get_temperature(payload),
-        "top_k"       : TOP_K,
+        "top_k"       : cfg.top_k,
     }
-    if SEND_TOP_P:
-        kwargs["top_p"] = TOP_P
+    if cfg.send_top_p:
+        kwargs["top_p"] = cfg.top_p
+
+    # kwargs["thinking"] = {
+    #     "type"          : "enabled",
+    #     "budget_tokens" : 2048
+    # }
 
     formatted_system = format_system_for_claude(system_prompt)
     if formatted_system is not None:
@@ -1099,30 +1071,38 @@ def build_claude_kwargs(payload: Dict[str, Any], route_model: str) -> Dict[str, 
     return kwargs
 
 
+def anthropic_blocks_to_dicts(message: Any) -> List[Dict[str, Any]]:
+    blocks = []
+    for block in getattr(message, "content", []) or []:
+        if hasattr(block, "model_dump") : blocks.append(block.model_dump(mode="json"))
+        elif isinstance(block, dict)    : blocks.append(block)
+        else                            : blocks.append({"type": getattr(block, "type", "unknown"), "value": str(block)})
+    return blocks
+
+
 def make_openai_non_stream_response(message: Any, model: str) -> Dict[str, Any]:
     output_text = extract_text_from_anthropic_message(message)
 
-    if AUTO_TRIM:
+    if cfg.auto_trim:
         output_text = trim_to_end_sentence(output_text)
 
-    usage = getattr(message, "usage", None)
-
     return {
-        "id"      : getattr(message, "id", "claude"),
-        "object"  : "chat.completion",
-        "created" : int(time.time()),
-        "model"   : f"anthropic/{model}",
-        "choices" : [
+        "id": getattr(message, "id", "claude"),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": f"anthropic/{model}",
+        "choices": [
             {
-                "index"         : 0,
-                "finish_reason" : getattr(message, "stop_reason", "stop"),
-                "message"       : {
-                    "role"    : "assistant",
-                    "content" : output_text,
+                "index": 0,
+                "finish_reason": getattr(message, "stop_reason", "stop"),
+                "message": {
+                    "role": "assistant",
+                    "content": output_text,
+                    "anthropic_content": anthropic_blocks_to_dicts(message),
                 },
             }
         ],
-        "usage": usage,
+        "usage": usage_to_openai_dict(getattr(message, "usage", None)),
     }
 
 
@@ -1158,9 +1138,9 @@ def make_error_response(exc: Exception, payload: Optional[Dict[str, Any]] = None
 # Generation
 # =============================================================================
 def print_payload(kwargs: Dict[str, Any]) -> None:
-    if not DEBUG_LOG:
+    if not cfg.debug_log:
         return
-    print("")
+    print()
     print("=== Claude payload start ===")
     print(json.dumps(kwargs, indent=2, ensure_ascii=False))
     print("=== Claude payload end ===")
@@ -1190,25 +1170,38 @@ def generate_stream(payload: Dict[str, Any], route_model: str):
     model_used = kwargs.get("model", route_model)
 
     with client.messages.stream(**kwargs) as stream:
-        for text in stream.text_stream:
-            event = {
-                "id"      : "claude",
-                "object"  : "chat.completion.chunk",
-                "created" : int(time.time()),
-                "model"   : f"anthropic/{model_used}",
-                "choices" : [
-                    {
-                        "index"         : 0,
-                        "finish_reason" : None,
-                        "delta"         : {
-                            "role"    : "assistant",
-                            "content" : text,
-                        },
-                    }
-                ],
-            }
-
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        for event in stream:
+            if event.type == "content_block_delta":
+                if event.delta.type == "thinking_delta":
+                    yield f"data: {json.dumps({
+                        'id': 'claude',
+                        'object': 'chat.completion.chunk',
+                        'created': int(time.time()),
+                        'model': f'anthropic/{model_used}',
+                        'choices': [{
+                            'index': 0,
+                            'finish_reason': None,
+                            'delta': {
+                                'role': 'assistant',
+                                'reasoning_content': event.delta.thinking,
+                            },
+                        }],
+                    }, ensure_ascii=False)}\n\n"
+                elif event.delta.type == "text_delta":
+                    yield f"data: {json.dumps({
+                        'id': 'claude',
+                        'object': 'chat.completion.chunk',
+                        'created': int(time.time()),
+                        'model': f'anthropic/{model_used}',
+                        'choices': [{
+                            'index': 0,
+                            'finish_reason': None,
+                            'delta': {
+                                'role': 'assistant',
+                                'content': event.delta.text,
+                            },
+                        }],
+                    }, ensure_ascii=False)}\n\n"
             time.sleep(0.01)
 
         final_message = stream.get_final_message()
@@ -1282,24 +1275,24 @@ def running():
     return jsonify(
         {
             "status"        : "ok",
-            "default_model" : DEFAULT_MODEL,
-            "prompt_cache"  : USE_CACHE,
+            "default_model" : cfg.default_model,
+            "prompt_cache"  : cfg.use_cache,
             "cache"         : {
-                "use_cache"        : USE_CACHE,
-                "cache_system"     : CACHE_SYSTEM,
-                "cache_system_ttl" : CACHE_SYSTEM_TTL,
-                "split_lorebook"   : SPLIT_LOREBOOK,
-                "cache_manual_ttl" : CACHE_MANUAL_TTL,
-                "cache_manual_msg" : CACHE_MANUAL_MSG,
-                "cache_auto_ttl"   : CACHE_AUTO_TTL,
-                "cache_auto_msg"   : CACHE_AUTO_MSG,
+                "use_cache"        : cfg.use_cache,
+                "cache_system"     : cfg.cache_system,
+                "cache_system_ttl" : cfg.cache_system_ttl,
+                "split_lorebook"   : cfg.split_lorebook,
+                "cache_manual_ttl" : cfg.cache_manual_ttl,
+                "cache_manual_msg" : cfg.cache_manual_msg,
+                "cache_auto_ttl"   : cfg.cache_auto_ttl,
+                "cache_auto_msg"   : cfg.cache_auto_msg,
             },
             "cost_tracking" : {
-                "input_token_cost_usd"                             : INPUT_TOKEN_COST_USD,
-                "output_token_cost_usd"                            : OUTPUT_TOKEN_COST_USD,
-                "cache_write_5m_cost_usd"                          : CACHE_WRITE_5M_COST_USD,
-                "cache_write_1h_cost_usd"                          : CACHE_WRITE_1H_COST_USD,
-                "cache_read_cost_usd"                              : CACHE_READ_COST_USD,
+                "input_token_cost_usd"                             : cfg.input_token_cost_usd,
+                "output_token_cost_usd"                            : cfg.output_token_cost_usd,
+                "cache_write_5m_cost_usd"                          : cfg.cache_write_5m_cost_usd,
+                "cache_write_1h_cost_usd"                          : cfg.cache_write_1h_cost_usd,
+                "cache_read_cost_usd"                              : cfg.cache_read_cost_usd,
                 "session_total_spent_usd"                          : session_total_spent,
                 "session_total_input_token_cost_usd"               : session_total_input_cost,
                 "session_total_output_token_cost_usd"              : session_total_output_cost,
@@ -1322,63 +1315,70 @@ def running():
 
 @app.route("/", methods=["POST"])
 def short_baseurl():
-    return handle_chat_completion(DEFAULT_MODEL)
+    return handle_chat_completion(cfg.default_model)
 
 
 @app.route("/chat/completions", methods=["POST"])
 def baseurl():
-    return handle_chat_completion(DEFAULT_MODEL)
+    return handle_chat_completion(cfg.default_model)
 
 
 @app.route("/v1/chat/completions", methods=["POST"])
 def v1_baseurl():
-    return handle_chat_completion(DEFAULT_MODEL)
+    return handle_chat_completion(cfg.default_model)
 
 
 @app.route("/haiku", methods=["POST"])
 @app.route("/haiku/chat/completions", methods=["POST"])
 def haiku():
-    return handle_chat_completion(HAIKU_MODEL)
+    return handle_chat_completion(cfg.haiku_model)
 
 
 @app.route("/haiku35", methods=["POST"])
 @app.route("/haiku35/chat/completions", methods=["POST"])
 def haiku35():
-    return handle_chat_completion(HAIKU_MODEL)
+    return handle_chat_completion(cfg.haiku_model)
 
 
 @app.route("/sonnet", methods=["POST"])
 @app.route("/sonnet/chat/completions", methods=["POST"])
 def sonnet():
-    return handle_chat_completion(SONNET_MODEL)
+    return handle_chat_completion(cfg.sonnet_model)
 
 
 @app.route("/sonnet35", methods=["POST"])
 @app.route("/sonnet35/chat/completions", methods=["POST"])
 def sonnet35():
-    return handle_chat_completion(SONNET35_MODEL)
+    return handle_chat_completion(cfg.sonnet35_model)
 
 
 @app.route("/opus", methods=["POST"])
 @app.route("/opus/chat/completions", methods=["POST"])
 def opus():
-    return handle_chat_completion(OPUS_MODEL)
+    return handle_chat_completion(cfg.opus_model)
 
 
 if __name__ == "__main__":
+    load_dotenv()
+    cfg      = RuntimeConfig()
+    cfg_init = RuntimeConfig()
+    cfg.reload_from_env()
+    cfg_init.reload_from_env()
+    SELECTED_MODEL_ID = cfg.default_model
+
     print("Starting Claude reverse proxy")
-    print(f"Local URL: http://{HOST}:{PORT}")
-    print(f"Chat completions: http://{HOST}:{PORT}/chat/completions")
+    print(f"Local URL: http://{cfg.host}:{cfg.port}")
+    print(f"Chat completions: http://{cfg.host}:{cfg.port}/chat/completions")
     print("Cloudflare Tunnel service URL should point to this local address:")
-    print(f"  http://{HOST}:{PORT}")
+    print(f"  http://{cfg.host}:{cfg.port}")
     print()
 
-    if REQUIRE_PROXY_KEY and not PROXY_KEY:
+    if cfg.require_proxy_key and not cfg.proxy_key:
         print("WARNING: REQUIRE_PROXY_KEY=true but PROXY_KEY is missing.")
         print("Set PROXY_KEY in .env before exposing this through Cloudflare Tunnel.")
         print()
 
-    if not ANTHROPIC_API_KEY and not ALLOW_KEY_PASSTHROUGH:
+    if not cfg.anthropic_api_key and not cfg.allow_key_passthrough:
         print("WARNING: ANTHROPIC_API_KEY is missing and ALLOW_KEY_PASSTHROUGH=false.")
         print("Requests will fail until you configure one of these modes.")
         print()
@@ -1386,4 +1386,4 @@ if __name__ == "__main__":
     refresh_anthropic_models()
     thread = threading.Thread(target=admin_cli_loop, daemon=True)
     thread.start()
-    serve(app, host=HOST, port=PORT)
+    serve(app, host=cfg.host, port=cfg.port)
