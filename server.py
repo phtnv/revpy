@@ -41,6 +41,19 @@ def getenv_int(name: str, default: int) -> int:
         print(f"WARNING: {name} must be an integer. Defaulting to {default}.")
         return default
 
+def getenv_cache_ttl(name: str, default: str = "5m") -> str:
+    normalized_default = str(default).strip().lower()
+    if normalized_default not in {"5m", "1h"}:
+        normalized_default = "5m"
+
+    raw = os.getenv(name, normalized_default)
+    value = str(raw).strip().lower()
+    if value in {"5m", "1h"}:
+        return value
+
+    print(f"WARNING: {name} must be '5m' or '1h'. Defaulting to {normalized_default}.")
+    return normalized_default
+
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "5001"))
 
@@ -99,12 +112,19 @@ CACHE_READ_COST_USD     = getenv_float("CACHE_READ_COST_USD"    ,  0.30)
 
 # Prompt caching.
 # Anthropic supports automatic top-level caching and explicit block-level caching.
-# This script uses explicit block-level caching by default because assistant prefill
-# can otherwise become the final cacheable block.
-PROMPT_CACHE         = os.getenv("PROMPT_CACHE", "true").lower() == "true"
-CACHE_TTL            = os.getenv("CACHE_TTL", "5m").strip() # "5m" or "1h"
-CACHE_SYSTEM_PROMPT  = os.getenv("CACHE_SYSTEM_PROMPT", "true").lower() == "true"
-CACHE_FIRST_MESSAGES = max(0, int(os.getenv("CACHE_FIRST_MESSAGES", "0")))
+# This script uses explicit block-level caching because assistant prefill can otherwise
+# become the final cacheable block. Up to four explicit markers are used:
+#   1-2  system / lorebook blocks (when SPLIT_LOREBOOK=true)
+#    3   manual first-N-message breakpoint
+#    4   automatic end-relative breakpoint before optional prefill
+USE_CACHE        = getenv_bool("USE_CACHE", getenv_bool("PROMPT_CACHE", True))
+CACHE_SYSTEM     = getenv_bool("CACHE_SYSTEM", getenv_bool("CACHE_SYSTEM_PROMPT", True))
+CACHE_SYSTEM_TTL = getenv_cache_ttl("CACHE_SYSTEM_TTL")
+SPLIT_LOREBOOK   = getenv_bool("SPLIT_LOREBOOK", True)
+CACHE_MANUAL_TTL = getenv_cache_ttl("CACHE_MANUAL_TTL")
+CACHE_MANUAL_MSG = max(0, getenv_int("CACHE_MANUAL_MSG", getenv_int("CACHE_FIRST_MESSAGES", 0)))
+CACHE_AUTO_TTL   = getenv_cache_ttl("CACHE_AUTO_TTL")
+CACHE_AUTO_MSG   = max(0, getenv_int("CACHE_AUTO_MSG", 0))
 
 # Session cost tracking variables
 SESSION_TTL_SPENT_USD       = 0.0
@@ -140,7 +160,7 @@ def reload_runtime_env() -> None:
     global REQUIRE_PROXY_KEY, ALLOW_KEY_PASSTHROUGH, DEBUG_LOG, AUTO_TRIM, ASSISTANT_PREFILL, ASSISTANT_PREFILL_MODE
     global TEMPERATURE_OVERRIDE, DEFAULT_TEMPERATURE, SEND_TOP_P, TOP_P, TOP_K, DEFAULT_MAX_TOKENS
     global INPUT_TOKEN_COST_USD, OUTPUT_TOKEN_COST_USD, CACHE_WRITE_5M_COST_USD, CACHE_WRITE_1H_COST_USD, CACHE_READ_COST_USD
-    global PROMPT_CACHE, CACHE_TTL, CACHE_SYSTEM_PROMPT, CACHE_FIRST_MESSAGES, ERROR_LOG_PATH
+    global USE_CACHE, CACHE_SYSTEM, CACHE_SYSTEM_TTL, SPLIT_LOREBOOK, CACHE_MANUAL_TTL, CACHE_MANUAL_MSG, CACHE_AUTO_TTL, CACHE_AUTO_MSG, ERROR_LOG_PATH
 
     load_dotenv(override=True)
 
@@ -174,10 +194,14 @@ def reload_runtime_env() -> None:
     CACHE_WRITE_1H_COST_USD = getenv_float("CACHE_WRITE_1H_COST_USD",  6.00)
     CACHE_READ_COST_USD     = getenv_float("CACHE_READ_COST_USD"    ,  0.30)
 
-    PROMPT_CACHE         = getenv_bool("PROMPT_CACHE", True)
-    CACHE_TTL            = os.getenv("CACHE_TTL", "5m").strip()
-    CACHE_SYSTEM_PROMPT  = getenv_bool("CACHE_SYSTEM_PROMPT", True)
-    CACHE_FIRST_MESSAGES = max(0, getenv_int("CACHE_FIRST_MESSAGES", 0))
+    USE_CACHE        = getenv_bool("USE_CACHE", getenv_bool("PROMPT_CACHE", True))
+    CACHE_SYSTEM     = getenv_bool("CACHE_SYSTEM", getenv_bool("CACHE_SYSTEM_PROMPT", True))
+    CACHE_SYSTEM_TTL = getenv_cache_ttl("CACHE_SYSTEM_TTL")
+    SPLIT_LOREBOOK   = getenv_bool("SPLIT_LOREBOOK", True)
+    CACHE_MANUAL_TTL = getenv_cache_ttl("CACHE_MANUAL_TTL")
+    CACHE_MANUAL_MSG = max(0, getenv_int("CACHE_MANUAL_MSG", getenv_int("CACHE_FIRST_MESSAGES", 0)))
+    CACHE_AUTO_TTL   = getenv_cache_ttl("CACHE_AUTO_TTL")
+    CACHE_AUTO_MSG   = max(0, getenv_int("CACHE_AUTO_MSG", 0))
 
     ERROR_LOG_PATH = os.getenv("ERROR_LOG_PATH", "claude_error_log.txt")
 
@@ -187,14 +211,18 @@ def reload_runtime_env() -> None:
     print("HOST and PORT were not changed; restart the process to change bind address.")
 
 
-def get_cache_first_messages() -> int:
-    return CACHE_FIRST_MESSAGES
-def set_cache_first_messages(value: int) -> int:
-    global CACHE_FIRST_MESSAGES
-    if value < 0:
-        raise ValueError("CACHE_FIRST_MESSAGES must be >= 0.")
-    CACHE_FIRST_MESSAGES = value
-    return CACHE_FIRST_MESSAGES
+def set_cache_manual_msg(value: int) -> None:
+    global CACHE_MANUAL_MSG
+    if value < 0 : raise ValueError("CACHE_MANUAL_MSG must be >= 0.")
+    CACHE_MANUAL_MSG = value
+    print(f"Manual cache marker now targets {CACHE_MANUAL_MSG} message(s) from the start.")
+
+
+def set_cache_auto_msg(value: int) -> None:
+    global CACHE_AUTO_MSG
+    if value < 0 : raise ValueError("CACHE_AUTO_MSG must be >= 0.")
+    CACHE_AUTO_MSG = value
+    print(f"Auto cache marker now targets {CACHE_AUTO_MSG} message(s) from the end.")
 
 
 def print_runtime_status() -> None:
@@ -220,10 +248,14 @@ def print_runtime_status() -> None:
     print(f"TOP_P                  = {TOP_P}")
     print(f"TOP_K                  = {TOP_K}")
     print(f"DEFAULT_MAX_TOKENS     = {DEFAULT_MAX_TOKENS}")
-    print(f"PROMPT_CACHE           = {PROMPT_CACHE}")
-    print(f"CACHE_TTL              = {CACHE_TTL}")
-    print(f"CACHE_SYSTEM_PROMPT    = {CACHE_SYSTEM_PROMPT}")
-    print(f"CACHE_FIRST_MESSAGES   = {get_cache_first_messages()}")
+    print(f"USE_CACHE              = {USE_CACHE}")
+    print(f"CACHE_SYSTEM           = {CACHE_SYSTEM}")
+    print(f"CACHE_SYSTEM_TTL       = {CACHE_SYSTEM_TTL}")
+    print(f"SPLIT_LOREBOOK         = {SPLIT_LOREBOOK}")
+    print(f"CACHE_MANUAL_TTL       = {CACHE_MANUAL_TTL}")
+    print(f"CACHE_MANUAL_MSG       = {CACHE_MANUAL_MSG}")
+    print(f"CACHE_AUTO_TTL         = {CACHE_AUTO_TTL}")
+    print(f"CACHE_AUTO_MSG         = {CACHE_AUTO_MSG}")
     print(f"ERROR_LOG_PATH         = {ERROR_LOG_PATH}")
     print("=== Runtime config end ===")
     print()
@@ -393,6 +425,11 @@ def admin_cli_loop() -> None:
     """
     Tiny local CLI for changing runtime-only settings.
     """
+    global USE_CACHE, CACHE_MANUAL_TTL, CACHE_AUTO_TTL, CACHE_SYSTEM, CACHE_SYSTEM_TTL
+
+    DISABLE_VALUES = {"disable", "0", "false", "off"}
+    ENABLE_VALUES  = {"enable" , "1", "true" , "on" }
+
     print("Runtime CLI ready. Type 'help' for commands.")
     print()
 
@@ -412,15 +449,36 @@ def admin_cli_loop() -> None:
         command = parts[0].lower()
 
         try:
-            if command in {"cache_first_messages", "cfm"}:
-                if len(parts) != 2:
-                    print("Usage: cache_first_messages <number>")
-                    continue
+            if command == "cmm":
+                if len(parts) != 2 : print("Usage: cache_manual_msg <number>"); continue
+                set_cache_manual_msg(int(parts[1]))
 
-                value = int(parts[1])
-                updated = set_cache_first_messages(value)
-                print(f"Now caching {updated} messages.")
-                continue
+            if command == "cam":
+                if len(parts) != 2 : print("Usage: cache_manual_msg <number>"); continue
+                set_cache_auto_msg(int(parts[1]))
+
+            if command == "cache":
+                if len(parts) != 2 : print("Usage : cache <sub_cmd>"); continue
+                arg1 = parts[1].lower()
+                if arg1 in DISABLE_VALUES : USE_CACHE = 0; continue
+                if arg1 in ENABLE_VALUES  : USE_CACHE = 1; continue
+                if len(parts) != 3 : print("Usage : cache <sub_cmd> <number>"); continue
+                arg2 = parts[2].lower()
+                if (arg1 in {"manual" "man" "m"}) :
+                    if (arg2 == "1h") : CACHE_MANUAL_TTL = "1h"; continue
+                    if (arg2 == "5m") : CACHE_MANUAL_TTL = "5m"; continue
+                    if (arg2 in DISABLE_VALUES) : set_cache_manual_msg(0); continue
+                    set_cache_manual_msg(int(arg2)); continue
+                if (arg1 == {"auto" "a"}) :
+                    if (arg2 == "1h") : CACHE_AUTO_TTL = "1h"; continue
+                    if (arg2 == "5m") : CACHE_AUTO_TTL = "5m"; continue
+                    if (arg2 in DISABLE_VALUES) : set_cache_auto_msg(0); continue
+                    set_cache_auto_msg(int(arg2)); continue
+                if (arg1 == {"system" "sys" "s"}) :
+                    if (arg2 in DISABLE_VALUES) : CACHE_SYSTEM = False
+                    if (arg2 in ENABLE_VALUES ) : CACHE_SYSTEM = True;
+                    if (arg2 == "1h") : CACHE_SYSTEM_TTL = "1h"; continue
+                    if (arg2 == "5m") : CACHE_SYSTEM_TTL = "5m"; continue
 
             if command in {"reload_env", "reload", "env"}:
                 if len(parts) != 1:
@@ -455,8 +513,11 @@ def admin_cli_loop() -> None:
             if command == "help":
                 print()
                 print("Commands:")
-                print("  cache_first_messages <number>  Set cached message count")
-                print("    cfm <number>")
+                print("  cache_manual_msg <number>      Set manual first-N cache marker")
+                print("    cmm <number>")
+                print("    cache_first_messages / cfm   Backwards-compatible aliases")
+                print("  cache_auto_msg <number>        Set automatic end-relative cache marker")
+                print("    cam <number>")
                 print("  model list                     List available Anthropic models")
                 print("  model select <number>          Select model by list number")
                 print("  model info   <number>          Show all stored info for a model")
@@ -511,31 +572,28 @@ def get_anthropic_client() -> anthropic.Anthropic:
 
     if ANTHROPIC_API_KEY:
         if REQUIRE_PROXY_KEY:
-            if not PROXY_KEY:
-                abort(500, description=("Server is configured with REQUIRE_PROXY_KEY=true, but PROXY_KEY is missing from .env."))
-            if provided_key != PROXY_KEY:
-                abort(401, description="Invalid proxy key.")
+            if not PROXY_KEY             : abort(500, description=("Server is configured with REQUIRE_PROXY_KEY=true, but PROXY_KEY is missing from .env."))
+            if provided_key != PROXY_KEY : abort(401, description="Invalid proxy key.")
         return anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
     if ALLOW_KEY_PASSTHROUGH:
-        if not provided_key:
-            abort(401, description="Missing Authorization bearer token.")
+        if not provided_key : abort(401, description="Missing Authorization bearer token.")
         return anthropic.Anthropic(api_key=provided_key)
-
     abort(500, description=("ANTHROPIC_API_KEY is not configured. Either set ANTHROPIC_API_KEY and PROXY_KEY in .env, or set ALLOW_KEY_PASSTHROUGH=true."))
 
 
-def make_cache_control() -> Dict[str, str]:
+def make_cache_control(ttl: str) -> Dict[str, str]:
     """
-    5-minute cache is default. 1-hour cache is more expensive but useful for longer pauses.
+    Builds Anthropic cache_control metadata for a specific marker TTL.
+
+    5-minute cache is the API default. 1-hour cache is more expensive but useful for longer pauses.
     """
     cache_control = {"type": "ephemeral"}
-    if CACHE_TTL == "1h":
+    if ttl == "1h":
         cache_control["ttl"] = "1h"
     return cache_control
 
 
-def add_cache_control_to_content(content: Any) -> Any:
+def add_cache_control_to_content(content: Any, ttl: str) -> Any:
     """
     Adds explicit Anthropic cache_control to the last non-empty text block.
 
@@ -543,10 +601,10 @@ def add_cache_control_to_content(content: Any) -> Any:
     request level or on content blocks. This script uses explicit block-level
     caching to avoid caching the assistant prefill as the final block.
     """
-    if not PROMPT_CACHE:
+    if not USE_CACHE:
         return content
 
-    cache_control = make_cache_control()
+    cache_control = make_cache_control(ttl)
 
     if isinstance(content, str):
         if not content.strip():
@@ -664,9 +722,9 @@ def split_system_prompt_into_text_blocks(system_prompt: str) -> List[Dict[str, s
         2. Otherwise after the last </* Persona> marker.
         3. Otherwise keep the whole system prompt as one block.
 
-    Anything after it becomes the second block, usually lorebook / extra context. Should the split be performed incorrectly
-    (due to user scripts doing something 'interesting'), the definition will still be sent correctly. Just the caching
-    efficiency will degrade.
+    Anything after it becomes the second block, usually lorebook / long term memory.
+    Should the split be performed incorrectly (due to user scripts doing something 'interesting'),
+    the definition will still be sent correctly. Just the caching efficiency will degrade.
     """
     if not system_prompt or not system_prompt.strip():
         return []
@@ -704,12 +762,18 @@ def format_system_for_claude(system_prompt: Optional[str]) -> Optional[Any]:
     """
     Optionally cache the system prompt separately.
 
-    This helps when JanitorAI sends large character cards, scenario text, behavior rules, or examples as system content.
+    When SPLIT_LOREBOOK=true, the system prompt is split into core definition and lorebook/suffix blocks.
+    Each non-empty system block receives its own system cache marker when CACHE_SYSTEM=true.
     """
     if system_prompt is None:
         return None
 
-    blocks = split_system_prompt_into_text_blocks(system_prompt)
+    if SPLIT_LOREBOOK:
+        blocks = split_system_prompt_into_text_blocks(system_prompt)
+    else:
+        stripped = system_prompt.strip()
+        blocks = [{"type": "text", "text": stripped}] if stripped else []
+
     if not blocks:
         return None
 
@@ -717,8 +781,8 @@ def format_system_for_claude(system_prompt: Optional[str]) -> Optional[Any]:
 
     for block in blocks:
         new_block: Dict[str, Any] = dict(block)
-        if (PROMPT_CACHE and CACHE_SYSTEM_PROMPT and new_block.get("type") == "text" and new_block.get("text", "").strip()):
-            new_block["cache_control"] = make_cache_control()
+        if (USE_CACHE and CACHE_SYSTEM and new_block.get("type") == "text" and new_block.get("text", "").strip()):
+            new_block["cache_control"] = make_cache_control(CACHE_SYSTEM_TTL)
         formatted_system.append(new_block)
 
     return formatted_system
@@ -731,16 +795,18 @@ def format_to_claude_messages(mlist: List[Dict[str, str]]) -> List[Dict[str, Any
     Consecutive same-role messages are merged because Anthropic expects
     alternating user/assistant turns.
 
-    The cache breakpoint is placed on the last real conversation block before
-    ASSISTANT_PREFILL is applied. In assistant mode, the prefill is sent as an
-    assistant message. In instruction mode, the prefill instruction is appended
-    to the last user message instead.
+    Manual caching marks the configured first-N-message prefix. Automatic caching marks
+    an end-relative conversation point before ASSISTANT_PREFILL is applied, so the prefill
+    is never accidentally included in that breakpoint.
     """
 
-    cache_first_messages = get_cache_first_messages()
-    cache_target_index   = 0
-    if PROMPT_CACHE and CACHE_FIRST_MESSAGES > 0 and mlist:
-        cache_target_index = min(cache_first_messages, len(mlist))
+    manual_cache_target_index = 0
+    if USE_CACHE and CACHE_MANUAL_MSG > 0 and mlist:
+        manual_cache_target_index = min(CACHE_MANUAL_MSG, len(mlist))
+
+    auto_cache_target_index = 0
+    if USE_CACHE and CACHE_AUTO_MSG > 0 and mlist:
+        auto_cache_target_index = max(1, len(mlist) - CACHE_AUTO_MSG + 1)
 
     formatted = [{"role": "user", "content": "<OOC>\nBegin the scenario.\n</OOC>"}]
     old_role  = "user"
@@ -758,10 +824,13 @@ def format_to_claude_messages(mlist: List[Dict[str, str]]) -> List[Dict[str, Any
 
         old_role = claude_role
 
-        # Mark only the configured first-N-message prefix.
-        # Later messages are still sent to Claude, but are not part of the explicit conversation cache breakpoint.
-        if idx == cache_target_index:
-            formatted[-1]["content"] = add_cache_control_to_content(formatted[-1]["content"])
+        # Manual marker: cache the first N incoming chat messages, preserving the old behavior.
+        if idx == manual_cache_target_index:
+            formatted[-1]["content"] = add_cache_control_to_content(formatted[-1]["content"], CACHE_MANUAL_TTL)
+
+        # Auto marker: count backwards from the final incoming chat message, before optional prefill is added.
+        if idx == auto_cache_target_index:
+            formatted[-1]["content"] = add_cache_control_to_content(formatted[-1]["content"], CACHE_AUTO_TTL)
 
     # Optional Claude prefill.
     # assistant mode preserves the original assistant-message/prefill behavior.
@@ -815,6 +884,23 @@ def average_cost_per_token_usd(total_cost_usd: float, total_tokens: int) -> floa
     return total_cost_usd/total_tokens
 
 
+def fallback_cache_write_ttl() -> str:
+    """
+    Older SDK usage payloads may not split cache creation by 5m/1h.
+    If any active marker is configured for 1h, assume 1h for unknown write tokens to avoid undercounting cost.
+    """
+    if not USE_CACHE:
+        return "5m"
+    active_ttl: List[str] = []
+    if CACHE_SYSTEM:
+        active_ttl.append(CACHE_SYSTEM_TTL)
+    if CACHE_MANUAL_MSG > 0:
+        active_ttl.append(CACHE_MANUAL_TTL)
+    if CACHE_AUTO_MSG > 0:
+        active_ttl.append(CACHE_AUTO_TTL)
+    return "1h" if "1h" in active_ttl else "5m"
+
+
 def print_usage(usage: Any) -> None:
     global SESSION_TTL_SPENT_USD, SESSION_CACHE_NET_COST_USD, SESSION_TTL_INPUT_COST_USD, SESSION_TTL_OUTPUT_COST_USD, SESSION_TTL_INPUT_TOK, SESSION_TTL_OUTPUT_TOK
 
@@ -838,12 +924,12 @@ def print_usage(usage: Any) -> None:
     ttl_tokens = input_tok + cache_read + cache_creation_input;
 
     # Older SDK responses may expose only cache_creation_input_tokens without the 5m/1h split.
-    # Assume it's the cached defined in our environment then.
+    # Mixed-TTL requests cannot be reconstructed from that legacy shape, so use a conservative fallback.
     known_cache_write = ephemeral_1h + ephemeral_5m
     if cache_creation_input > known_cache_write:
         unknown_cache_write = cache_creation_input - known_cache_write
-        if CACHE_TTL == "1h" : ephemeral_1h += unknown_cache_write
-        else                 : ephemeral_5m += unknown_cache_write
+        if fallback_cache_write_ttl() == "1h" : ephemeral_1h += unknown_cache_write
+        else                                  : ephemeral_5m += unknown_cache_write
 
     cache_creation_input = ephemeral_1h + ephemeral_5m
     ttl_tokens           = input_tok + cache_read + cache_creation_input
@@ -1197,8 +1283,17 @@ def running():
         {
             "status"        : "ok",
             "default_model" : DEFAULT_MODEL,
-            "prompt_cache"  : PROMPT_CACHE,
-            "cache_ttl"     : CACHE_TTL,
+            "prompt_cache"  : USE_CACHE,
+            "cache"         : {
+                "use_cache"        : USE_CACHE,
+                "cache_system"     : CACHE_SYSTEM,
+                "cache_system_ttl" : CACHE_SYSTEM_TTL,
+                "split_lorebook"   : SPLIT_LOREBOOK,
+                "cache_manual_ttl" : CACHE_MANUAL_TTL,
+                "cache_manual_msg" : CACHE_MANUAL_MSG,
+                "cache_auto_ttl"   : CACHE_AUTO_TTL,
+                "cache_auto_msg"   : CACHE_AUTO_MSG,
+            },
             "cost_tracking" : {
                 "input_token_cost_usd"                             : INPUT_TOKEN_COST_USD,
                 "output_token_cost_usd"                            : OUTPUT_TOKEN_COST_USD,
