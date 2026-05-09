@@ -52,6 +52,30 @@ def getenv_cache_ttl(name: str, default: str = "5m") -> str:
     print(f"WARNING: {name} must be '5m' or '1h'. Defaulting to {normalized_default}.")
     return normalized_default
 
+_MISSING = object()
+def deep_get(obj: Any, path: str, default: Any = None) -> Any:
+    """
+    Safe lookup for nested dict/list JSON.
+    Example:
+        deep_get(model_info, "thinking.supported", False)
+        deep_get(model_info, "thinking.types.adaptive.supported", False)
+    """
+    cur = obj
+
+    for part in path.split("."):
+        if isinstance(cur, dict):
+            cur = cur.get(part, _MISSING)
+        elif isinstance(cur, list) and part.isdigit():
+            idx = int(part)
+            cur = cur[idx] if 0 <= idx < len(cur) else _MISSING
+        else:
+            cur = _MISSING
+
+        if cur is _MISSING:
+            return default
+
+    return cur
+
 
 class RuntimeConfig:
 
@@ -59,13 +83,7 @@ class RuntimeConfig:
         self.host = os.getenv("HOST", "127.0.0.1")
         self.port = getenv_int("PORT", 5001)
 
-        self.default_model = os.getenv("DEFAULT_MODEL", "claude-sonnet-4-5-20250929")
-
-        # Route-specific model aliases. If unset, they fall back to default_model.
-        self.haiku_model    = os.getenv("HAIKU_MODEL", self.default_model)
-        self.sonnet_model   = os.getenv("SONNET_MODEL", self.default_model)
-        self.sonnet35_model = os.getenv("SONNET35_MODEL", self.default_model)
-        self.opus_model     = os.getenv("OPUS_MODEL", self.default_model)
+        self.model = os.getenv("MODEL", "claude-sonnet-4-5-20250929")
 
         self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
         self.proxy_key         = os.getenv("PROXY_KEY", "").strip()
@@ -98,13 +116,16 @@ class RuntimeConfig:
         # Generation defaults
         self.temperature_override = getenv_float("TEMPERATURE_OVERRIDE", -1.0)
         self.default_temperature  = getenv_float("DEFAULT_TEMPERATURE", 0.9)
+        self.send_temperature     = True
         self.send_top_p           = getenv_bool("SEND_TOP_P", False)
         self.top_p                = getenv_float("TOP_P", 0.9)
+        self.send_top_k           = True
         self.top_k                = getenv_int("TOP_K", 75)
         self.default_max_tokens   = getenv_int("DEFAULT_MAX_TOKENS", 8192)
 
         # Thinking
         self.thinking_enabled = getenv_bool("THINKING_ENABLED", False)
+        self.use_adaptive     = False
         self.thinking_budget  = getenv_int("THINKING_BUDGET", 2048)
         self.thinking_effort  = os.getenv("THINKING_EFFORT", "medium").lower()
 
@@ -136,17 +157,69 @@ class RuntimeConfig:
         self.model_list_timeout_seconds = getenv_float("MODEL_LIST_TIMEOUT_SECONDS", 10.0)
         self.allow_client_model = getenv_bool("ALLOW_CLIENT_MODEL", False)
 
+    def resolve_thinking(self, info: Dict[str, Any]) -> None:
+        if not self.thinking_enabled:
+            return
+        name = deep_get(info, "id")
+        print(f"Name is {name}")
+
+        if not deep_get(info, "capabilities.thinking.supported"):
+            print(f"Model {name} does not support thinking. Disabling.")
+            self.thinking_enabled = False;
+            return
+        if deep_get(info, "capabilities.thinking.types.adaptive.supported"):
+            print(f"Models supports adaptive thinking. Using with effort '{self.thinking_effort}'.")
+            self.use_adaptive = True
+        elif deep_get(info, "capabilities.thinking.types.enabled.supported"):
+            print(f"Using thinking with a budget of {self.thinking_budget} tokens")
+            self.use_adaptive = False
+        else:
+            print("Neither adaptive nor budget thinking are supported. Disabling.")
+            self.thinking_enabled = False
+            return
+
+        if (self.assistant_prefill_mode == "assistant") and (self.assistant_prefill != ""):
+            print("When thinking is enabled, only instruction mode prefill is supported. Switching.")
+            self.assistant_prefill_mode = "instruction"
+        if self.send_temperature:
+            print("Temperature is not compatible with thinking. Disabling.")
+            self.send_temperature = False
+        if self.send_top_k:
+            print("top_k is not compatible with thinking. Disabling.")
+            self.send_top_k = False
+        if self.send_top_p:
+            if   self.top_p < 0.95 : self.top_p = 0.95
+            elif self.top_p > 1.00 : self.top_p = 1.00
+            if (self.top_p < 0.95) or (self.top_p > 1.00) :
+                print("Thinking supports top_p in the range [0.95:1]. Clamping.")
+
+
+    def apply_model(self, info: Dict[str, Any]) -> None:
+        self.model = deep_get(info, "id")
+        print(f"=== Switching to {self.model} ===")
+        self.resolve_thinking(info)
+        print(f"=== Switching to {self.model} complete ===")
+
+    def find_cfg(self, models: List[Dict[str, Any]]) -> str:
+        for model in models:
+            model_id = deep_get(model, "id")
+            if model_id != self.model:
+                continue
+            self.apply_model(model)
+            return model_id
+        print(f"Requested model {self.model} not found in model list from Anthropic.")
+        print("Unless you know what you're doing, it is recommended to do 'model list' followed by 'models select <number>'.")
+        print("Otherwise payload correctness cannot be guaranteed.")
+        return ""
+
+
     def print_status(self) -> None:
         print()
         print("=== Runtime config start ===")
         print(f"host                   = {self.host} (restart required to change)")
         print(f"port                   = {self.port} (restart required to change)")
-        print(f"default_model          = {self.default_model}")
-        print(f"haiku_model            = {self.haiku_model}")
-        print(f"sonnet_model           = {self.sonnet_model}")
-        print(f"sonnet35_model         = {self.sonnet35_model}")
-        print(f"opus_model             = {self.opus_model}")
-        print(f"selected_model_id      = {get_selected_model_id()}")
+        print(f"default_model          = {self.model}")
+        print(f"selected_model_id      = {self.model}")
         print(f"require_proxy_key      = {self.require_proxy_key}")
         print(f"allow_key_passthrough  = {self.allow_key_passthrough}")
         print(f"allow_client_model     = {self.allow_client_model}")
@@ -187,7 +260,6 @@ SESSION_COST_LOCK           = threading.Lock()
 
 ANTHROPIC_TIMEOUT_ERROR                      = getattr(anthropic, "APITimeoutError", TimeoutError)
 ANTHROPIC_MODELS      : List[Dict[str, Any]] = []
-SELECTED_MODEL_ID     : Optional[str]        = None
 MODEL_LIST_LAST_ERROR : Optional[str]        = None
 MODEL_LIST_LAST_TIMEOUT                      = False
 MODEL_LOCK                                   = threading.Lock()
@@ -213,7 +285,7 @@ def reload_runtime_env() -> None:
     cfg.host = bound_host
     cfg.port = bound_port
 
-    refresh_anthropic_models()
+    refresh_anthropic_models(cfg.anthropic_api_key, cfg.model_list_timeout_seconds)
 
     print("Reloaded runtime configuration from .env.")
     print("HOST and PORT were not changed; restart the process to change bind address.")
@@ -268,17 +340,17 @@ def anthropic_exception_message(exc: Exception) -> str:
     return str(exc) or exc.__class__.__name__
 
 
-def refresh_anthropic_models() -> bool:
+def refresh_anthropic_models(key: str, timeout_s: float) -> bool:
     """
     Fetches the available Anthropic models and stores them for CLI use.
     """
     global ANTHROPIC_MODELS, MODEL_LIST_LAST_ERROR, MODEL_LIST_LAST_TIMEOUT
 
     try:
-        if not cfg.anthropic_api_key: raise RuntimeError("ANTHROPIC_API_KEY is not configured; model list cannot be retrieved at startup.")
+        if not key: raise RuntimeError("ANTHROPIC_API_KEY is not configured; model list cannot be retrieved at startup.")
 
-        client = anthropic.Anthropic(api_key=cfg.anthropic_api_key)
-        page   = client.models.list(limit=100, timeout=cfg.model_list_timeout_seconds)
+        client = anthropic.Anthropic(api_key=key)
+        page   = client.models.list(limit=100, timeout=timeout_s)
 
         raw_models = getattr(page, "data", None)
         if raw_models is None:
@@ -292,7 +364,7 @@ def refresh_anthropic_models() -> bool:
             MODEL_LIST_LAST_TIMEOUT = False
 
         if models : print(f"Retrieved {len(models)} Anthropic model(s).")
-        else      : print(f"Anthropic returned an empty model list. Using default model: {cfg.default_model}")
+        else      : print(f"Anthropic returned an empty model list.")
 
         return True
 
@@ -312,19 +384,12 @@ def refresh_anthropic_models() -> bool:
         print(f"WARNING: Could not retrieve a model list from Anthropic. {anthropic_exception_message(exc)}.")
         return False
 
-
-def get_selected_model_id() -> Optional[str]:
-    with MODEL_LOCK:
-        return SELECTED_MODEL_ID
-
-
 def print_no_model_list_available() -> None:
     print("No Anthropic model list is available.")
-    print(f"Requests will continue using the configured model: {get_selected_model_id() or cfg.default_model}")
 
     with MODEL_LOCK:
         last_timeout = MODEL_LIST_LAST_TIMEOUT
-        last_error = MODEL_LIST_LAST_ERROR
+        last_error   = MODEL_LIST_LAST_ERROR
 
     if   last_timeout : print("Last retrieval failed: timeout")
     elif last_error   : print(f"Last retrieval failed: error: {last_error}")
@@ -333,7 +398,7 @@ def print_no_model_list_available() -> None:
 def print_model_list() -> None:
     with MODEL_LOCK:
         models            = list(ANTHROPIC_MODELS)
-        selected_model_id = SELECTED_MODEL_ID
+        selected_model_id = cfg.model
     if not models:
         print_no_model_list_available()
         return
@@ -359,8 +424,6 @@ def print_model_list() -> None:
 
 
 def select_model_by_number(index: int) -> None:
-    global SELECTED_MODEL_ID
-
     with MODEL_LOCK:
         if not ANTHROPIC_MODELS:
             print_no_model_list_available()
@@ -373,9 +436,8 @@ def select_model_by_number(index: int) -> None:
         if not model_id:
             print(f"Model {index} does not have an id and cannot be selected.")
             return
-        SELECTED_MODEL_ID = model_id
-
-    print(f"Selected model {index}: {model_id}")
+        cfg.reload_from_env()
+        cfg.apply_model(model_info)
 
 
 def print_model_info(index: int) -> None:
@@ -630,11 +692,22 @@ def make_prefill_instruction(prefix_text: str) -> str:
     #     "Continue immediately after that prefix. Do not display the prefix in your answer.\n"
     #     "</OOC>"
     # )
+
     return (
         "\n<OOC>\n"
-        f"{prefix_text}\n"
+        f"{prefix_text}"
         "</OOC>"
     )
+
+    # return (
+        # "\n<OOC>\n"
+        # "The assistant has began its response with:\n"
+        # "<prefix>\n"
+        # f"{prefix_text}\n"
+        # "</prefix>\n"
+        # "You are generating only the continuation after that already-rendered text.\n"
+        # "</OOC>"
+    # )
 
 
 def append_prefill_instruction_to_last_user_message(formatted: List[Dict[str, Any]], prefix_text: str) -> None:
@@ -1034,7 +1107,8 @@ def split_system_and_messages(raw_messages: Any) -> Tuple[Optional[str], List[Di
     system_prompt = "\n\n".join(system_parts) if system_parts else None
     return system_prompt, chat_messages
 
-def build_claude_kwargs(payload: Dict[str, Any], route_model: str) -> Dict[str, Any]:
+
+def build_claude_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     system_prompt, chat_messages = split_system_and_messages(payload.get("messages"))
 
@@ -1043,25 +1117,19 @@ def build_claude_kwargs(payload: Dict[str, Any], route_model: str) -> Dict[str, 
 
     formatted_messages = format_to_claude_messages(chat_messages)
 
-    # CLI-selected model wins over route aliases.
-    # If you want JanitorAI/client to choose model from JSON, set ALLOW_CLIENT_MODEL=true.
-    effective_route_model = get_selected_model_id() or route_model
-    selected_model        = payload.get("model") if cfg.allow_client_model else effective_route_model
-    selected_model        = selected_model or effective_route_model
-
     kwargs: Dict[str, Any] = {
-        "model"       : selected_model,
-        "max_tokens"  : int(payload.get("max_tokens", cfg.default_max_tokens)),
-        "temperature" : get_temperature(payload),
-        "top_k"       : cfg.top_k,
+        "model"      : cfg.model,
+        "max_tokens" : int(payload.get("max_tokens", cfg.default_max_tokens)),
     }
-    if cfg.send_top_p:
-        kwargs["top_p"] = cfg.top_p
-
-    # kwargs["thinking"] = {
-    #     "type"          : "enabled",
-    #     "budget_tokens" : 2048
-    # }
+    if cfg.send_temperature : kwargs["temperature"] = get_temperature(payload)
+    if cfg.send_top_k       : kwargs["top_k"] = cfg.top_k
+    if cfg.send_top_p       : kwargs["top_p"] = cfg.top_p
+    if cfg.thinking_enabled:
+        if   cfg.use_adaptive:
+            kwargs["thinking"]      = { "type": "adaptive", "display": "summarized" };
+            kwargs["output_config"] = { "effort": cfg.thinking_effort }
+        else:
+            kwargs["thinking"] = { "type": "enabled", "budget_tokens": cfg.thinking_budget }
 
     formatted_system = format_system_for_claude(system_prompt)
     if formatted_system is not None:
@@ -1148,7 +1216,7 @@ def print_payload(kwargs: Dict[str, Any]) -> None:
 
 def generate_non_stream(payload: Dict[str, Any], route_model: str) -> Dict[str, Any]:
     client = get_anthropic_client()
-    kwargs = build_claude_kwargs(payload, route_model)
+    kwargs = build_claude_kwargs(payload)
 
     print_payload(kwargs)
 
@@ -1163,7 +1231,7 @@ def generate_non_stream(payload: Dict[str, Any], route_model: str) -> Dict[str, 
 
 def generate_stream(payload: Dict[str, Any], route_model: str):
     client = get_anthropic_client()
-    kwargs = build_claude_kwargs(payload, route_model)
+    kwargs = build_claude_kwargs(payload)
 
     print_payload(kwargs)
 
@@ -1229,7 +1297,7 @@ def generate_stream(payload: Dict[str, Any], route_model: str):
     yield "data: [DONE]\n\n"
 
 
-def handle_chat_completion(route_model: str):
+def handle_chat_completion():
     payload = request.get_json(silent=True)
 
     if not isinstance(payload, dict):
@@ -1240,24 +1308,20 @@ def handle_chat_completion(route_model: str):
 
         if stream:
             return Response(
-                stream_with_context(generate_stream(payload, route_model)),
+                stream_with_context(generate_stream(payload, cfg.model)),
                 content_type="text/event-stream",
                 headers={
-                    "Cache-Control": "no-cache",
-                    "X-Accel-Buffering": "no",
+                    "Cache-Control"     : "no-cache",
+                    "X-Accel-Buffering" : "no",
                 },
             )
 
-        response = generate_non_stream(payload, route_model)
+        response = generate_non_stream(payload, cfg.model)
         return jsonify(response)
 
     except Exception as exc:
         return make_error_response(exc, payload)
 
-
-# =============================================================================
-# Routes
-# =============================================================================
 
 @app.route("/", methods=["GET"])
 def running():
@@ -1275,7 +1339,7 @@ def running():
     return jsonify(
         {
             "status"        : "ok",
-            "default_model" : cfg.default_model,
+            "model"         : cfg.model,
             "prompt_cache"  : cfg.use_cache,
             "cache"         : {
                 "use_cache"        : cfg.use_cache,
@@ -1300,71 +1364,28 @@ def running():
                 "session_total_output_tokens"                      : session_total_output_tokens,
                 "session_average_input_token_cost_usd_per_million" : session_average_input_cost*1_000_000,
                 "session_cache_net_cost_usd"                       : session_cache_net_cost,
-            },
-            "routes": {
-                "chat_completions" : base_url + "/chat/completions",
-                "short_post"       : base_url + "/",
-                "haiku"            : base_url + "/haiku",
-                "sonnet"           : base_url + "/sonnet",
-                "sonnet35"         : base_url + "/sonnet35",
-                "opus"             : base_url + "/opus",
-            },
+            }
         }
     )
 
 
-@app.route("/", methods=["POST"])
-def short_baseurl():
-    return handle_chat_completion(cfg.default_model)
-
-
-@app.route("/chat/completions", methods=["POST"])
-def baseurl():
-    return handle_chat_completion(cfg.default_model)
-
-
+@app.route("/"                   , methods=["POST"])
+@app.route("/chat/completions"   , methods=["POST"])
 @app.route("/v1/chat/completions", methods=["POST"])
-def v1_baseurl():
-    return handle_chat_completion(cfg.default_model)
-
-
-@app.route("/haiku", methods=["POST"])
-@app.route("/haiku/chat/completions", methods=["POST"])
-def haiku():
-    return handle_chat_completion(cfg.haiku_model)
-
-
-@app.route("/haiku35", methods=["POST"])
-@app.route("/haiku35/chat/completions", methods=["POST"])
-def haiku35():
-    return handle_chat_completion(cfg.haiku_model)
-
-
-@app.route("/sonnet", methods=["POST"])
-@app.route("/sonnet/chat/completions", methods=["POST"])
-def sonnet():
-    return handle_chat_completion(cfg.sonnet_model)
-
-
-@app.route("/sonnet35", methods=["POST"])
-@app.route("/sonnet35/chat/completions", methods=["POST"])
-def sonnet35():
-    return handle_chat_completion(cfg.sonnet35_model)
-
-
-@app.route("/opus", methods=["POST"])
-@app.route("/opus/chat/completions", methods=["POST"])
-def opus():
-    return handle_chat_completion(cfg.opus_model)
+def short_baseurl() : return handle_chat_completion()
+def baseurl()       : return handle_chat_completion()
+def v1_baseurl()    : return handle_chat_completion()
 
 
 if __name__ == "__main__":
     load_dotenv()
-    cfg      = RuntimeConfig()
     cfg_init = RuntimeConfig()
-    cfg.reload_from_env()
     cfg_init.reload_from_env()
-    SELECTED_MODEL_ID = cfg.default_model
+    refresh_anthropic_models(cfg_init.anthropic_api_key, cfg_init.model_list_timeout_seconds)
+
+    cfg = RuntimeConfig()
+    cfg.reload_from_env()
+    cfg.find_cfg(ANTHROPIC_MODELS)
 
     print("Starting Claude reverse proxy")
     print(f"Local URL: http://{cfg.host}:{cfg.port}")
@@ -1383,7 +1404,6 @@ if __name__ == "__main__":
         print("Requests will fail until you configure one of these modes.")
         print()
 
-    refresh_anthropic_models()
     thread = threading.Thread(target=admin_cli_loop, daemon=True)
     thread.start()
     serve(app, host=cfg.host, port=cfg.port)
