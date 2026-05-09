@@ -6,14 +6,16 @@ import time
 import traceback
 import threading
 
-from dotenv     import load_dotenv
-from flask      import Flask, Response, abort, jsonify, request, stream_with_context
-from flask_cors import CORS
-from typing     import Any, Dict, List, Optional, Tuple
-from waitress   import serve
+from dotenv            import load_dotenv
+from flask             import Flask, Response, abort, jsonify, request, stream_with_context
+from flask_cors        import CORS
+from packaging.version import Version
+from typing            import Any, Dict, List, Optional, Tuple
+from waitress          import serve
 
 ENABLE_VALUES  = {"true" , "1", "yes", "y", "enable" , "on" }
 DISABLE_VALUES = {"false", "0", "no" , "n", "disable", "off"}
+THINK_EFFORTS  = {"low", "medium", "high", "xhigh", "max"}
 
 def getenv_float(name: str, default: float) -> float:
     raw = os.getenv(name, str(default)).strip()
@@ -76,7 +78,7 @@ def deep_get(obj: Any, path: str, default: Any = None) -> Any:
 
     return cur
 
-
+PREFILL_MODES = {"none", "assistant", "instruction"}
 class RuntimeConfig:
 
     def reload_from_env(self) -> None:
@@ -109,9 +111,9 @@ class RuntimeConfig:
         # PREFILL_MODE is accepted as a shorter backwards-compatible alias.
         self.assistant_prefill_mode = os.getenv("ASSISTANT_PREFILL_MODE", os.getenv("PREFILL_MODE", "assistant")).strip().lower()
 
-        if self.assistant_prefill_mode not in {"assistant", "instruction"}:
-            print("WARNING: ASSISTANT_PREFILL_MODE must be 'assistant' or 'instruction'. Defaulting to 'assistant'.")
-            self.assistant_prefill_mode = "assistant"
+        if self.assistant_prefill_mode not in PREFILL_MODES:
+            print(f"WARNING: ASSISTANT_PREFILL_MODE must be in {PREFILL_MODES}. Defaulting to 'none'.")
+            self.assistant_prefill_mode = "none"
 
         # Generation defaults
         self.temperature_override = getenv_float("TEMPERATURE_OVERRIDE", -1.0)
@@ -155,22 +157,40 @@ class RuntimeConfig:
 
         self.error_log_path = os.getenv("ERROR_LOG_PATH", "claude_error_log.txt")
         self.model_list_timeout_seconds = getenv_float("MODEL_LIST_TIMEOUT_SECONDS", 10.0)
-        self.allow_client_model = getenv_bool("ALLOW_CLIENT_MODEL", False)
 
-    def resolve_thinking(self, info: Dict[str, Any]) -> None:
+
+    def set_prefill_mode(self, mode: str) -> None:
+        if not mode in PREFILL_MODES : print(f"WARNING: ASSISTANT_PREFILL_MODE must be in {PREFILL_MODES}. Defaulting to 'none'."); return
+        if mode == "assistant" :
+            if self.thinking_enabled          : print("While thinking is enabled, prefill mode cannot be assistant."); return
+            if self.version >= Version("4.6") : print("Mythos class models do not support assistant prefill."); return
+        self.assistant_prefill_mode = mode
+
+    def set_prefill(self, prefill: str) -> None:
+        self.assistant_prefill = prefill
+
+    def enable_thinking(self, en: bool):
+        self.thinking_enabled = en
+        self.resolve_thinking()
+
+    def set_think_effort(self, effort: str) -> None:
+        if not effort in THINK_EFFORTS : print(f"Allowed thinking efforts: {THINK_EFFORTS}."); return
+        self.thinking_effort = effort
+
+    def resolve_thinking(self) -> None:
         if not self.thinking_enabled:
             return
-        name = deep_get(info, "id")
+        name = deep_get(self.info, "id")
         print(f"Name is {name}")
 
-        if not deep_get(info, "capabilities.thinking.supported"):
+        if not deep_get(self.info, "capabilities.thinking.supported"):
             print(f"Model {name} does not support thinking. Disabling.")
             self.thinking_enabled = False;
             return
-        if deep_get(info, "capabilities.thinking.types.adaptive.supported"):
+        if deep_get(self.info, "capabilities.thinking.types.adaptive.supported"):
             print(f"Models supports adaptive thinking. Using with effort '{self.thinking_effort}'.")
             self.use_adaptive = True
-        elif deep_get(info, "capabilities.thinking.types.enabled.supported"):
+        elif deep_get(self.info, "capabilities.thinking.types.enabled.supported"):
             print(f"Using thinking with a budget of {self.thinking_budget} tokens")
             self.use_adaptive = False
         else:
@@ -194,10 +214,17 @@ class RuntimeConfig:
                 print("Thinking supports top_p in the range [0.95:1]. Clamping.")
 
 
-    def apply_model(self, info: Dict[str, Any]) -> None:
-        self.model = deep_get(info, "id")
+    def apply_model(self, i_info: Dict[str, Any]) -> None:
+        self.info  = i_info
+        self.model = deep_get(self.info, "id")
         print(f"=== Switching to {self.model} ===")
-        self.resolve_thinking(info)
+        self.model_info  = self.info
+        display_name_str = deep_get(self.info, "display_name")
+        version_str      = re.search(r'\d+(?:\.\d+)+', display_name_str)
+        if version_str is not None : self.version = Version(version_str.group())
+        else                       : self.version = Version("0.0")
+        self.set_prefill(self.assistant_prefill_mode)
+        self.resolve_thinking()
         print(f"=== Switching to {self.model} complete ===")
 
     def find_cfg(self, models: List[Dict[str, Any]]) -> str:
@@ -218,18 +245,15 @@ class RuntimeConfig:
         print("=== Runtime config start ===")
         print(f"host                   = {self.host} (restart required to change)")
         print(f"port                   = {self.port} (restart required to change)")
-        print(f"default_model          = {self.model}")
-        print(f"selected_model_id      = {self.model}")
+        print(f"model                  = {self.model}")
         print(f"require_proxy_key      = {self.require_proxy_key}")
         print(f"allow_key_passthrough  = {self.allow_key_passthrough}")
-        print(f"allow_client_model     = {self.allow_client_model}")
         print(f"debug_log              = {self.debug_log}")
         print(f"auto_trim              = {self.auto_trim}")
         print(f"assistant_prefill      = {'set' if self.assistant_prefill.strip() else 'empty'}")
         print(f"assistant_prefill_mode = {self.assistant_prefill_mode}")
         print(f"temperature_override   = {self.temperature_override}")
         print(f"default_temperature    = {self.default_temperature}")
-        print(f"send_top_p             = {self.send_top_p}")
         print(f"top_p                  = {self.top_p}")
         print(f"top_k                  = {self.top_k}")
         print(f"default_max_tokens     = {self.default_max_tokens}")
@@ -241,6 +265,10 @@ class RuntimeConfig:
         print(f"cache_manual_msg       = {self.cache_manual_msg}")
         print(f"cache_auto_ttl         = {self.cache_auto_ttl}")
         print(f"cache_auto_msg         = {self.cache_auto_msg}")
+        print(f"thinking               = {self.thinking_enabled}")
+        print(f"adaptive_thinking      = {self.use_adaptive}")
+        print(f"thinking_budget        = {self.thinking_budget}")
+        print(f"thinking_effort        = {self.thinking_effort}")
         print(f"error_log_path         = {self.error_log_path}")
         print(f"model_list_timeout_sec = {self.model_list_timeout_seconds}")
         print("=== Runtime config end ===")
@@ -501,12 +529,33 @@ def admin_cli_loop() -> None:
                     if (arg2 == "1h") : cfg.cache_auto_ttl = "1h"; continue
                     if (arg2 == "5m") : cfg.cache_auto_ttl = "5m"; continue
                     if (arg2 in DISABLE_VALUES) : set_cache_auto_msg(0); continue
-                    set_cache_auto_msg(int(arg2)); continue
+                    set_cache_auto_msg(int(arg2));  continue
                 if arg1 in {"system", "sys", "s"} :
-                    if (arg2 in DISABLE_VALUES) : cfg.cache_system = False
-                    if (arg2 in ENABLE_VALUES ) : cfg.cache_system = True;
+                    if (arg2 in DISABLE_VALUES) : cfg.cache_system = False; continue
+                    if (arg2 in ENABLE_VALUES ) : cfg.cache_system = True; continue
                     if (arg2 == "1h") : cfg.cache_system_ttl = "1h"; continue
                     if (arg2 == "5m") : cfg.cache_system_ttl = "5m"; continue
+                print(f"Unknown arg1 {arg1}.")
+                continue
+
+            if command == "prefill":
+                if len(parts) != 2 : print("Not enough arguments"); continue
+                arg1 = parts[1].lower()
+                if arg1 in PREFILL_MODES : cfg.set_prefill_mode(arg1); continue
+                if arg1 != "set"         : print("Invalid argument"); continue
+                if len(parts) != 3       : print("Not enough arguments"); continue
+                cfg.set_prefill(parts[3])
+                continue
+
+            if command in {"think", "thinking"}:
+                if len(parts) != 2 : print("Usage : think <sub_cmd>"); continue
+                arg1 = parts[1].lower()
+                if arg1 in DISABLE_VALUES : cfg.enable_thinking(False); continue
+                if arg1 in ENABLE_VALUES  : cfg.enable_thinking(True); continue
+                if len(parts) != 3 : print("Usage : think <sub_cmd>"); continue
+                arg2 = parts[2].lower()
+                if arg1 == "effort": cfg.set_think_effort(arg2); continue
+                continue
 
             if command in {"reload_env", "reload", "env"}:
                 if len(parts) != 1:
