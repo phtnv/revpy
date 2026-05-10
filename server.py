@@ -1,4 +1,5 @@
 import anthropic
+import base64
 import json
 import os
 import re
@@ -40,6 +41,30 @@ def getenv_int(name: str, default: int) -> int:
     except ValueError:
         print(f"WARNING: {name} must be an integer. Defaulting to {default}.")
         return default
+
+def getenv_preserve_thinking_blocks(name: str, default: str = "0") -> Optional[int]:
+    """
+    Parses PRESERVE_THINKING_BLOCKS.
+
+    Returns:
+        0    : disabled
+        N    : preserve the last N assistant messages with hidden signed thinking blocks
+        None : preserve all assistant messages with hidden signed thinking blocks (inf/all)
+    """
+    raw = os.getenv(name, default)
+    value = str(raw).strip().lower()
+
+    if value in {"inf", "infinite", "infinity", "all", "*"}:
+        return None
+
+    try:
+        return max(0, int(value))
+    except ValueError:
+        print(f"WARNING: {name} must be 0, a positive integer, or inf. Defaulting to {default}.")
+        try:
+            return max(0, int(default))
+        except ValueError:
+            return 0
 
 def getenv_cache_ttl(name: str, default: str = "5m") -> str:
     normalized_default = str(default).strip().lower()
@@ -130,6 +155,10 @@ class RuntimeConfig:
         self.use_adaptive     = False
         self.thinking_budget  = getenv_int("THINKING_BUDGET", 2048)
         self.thinking_effort  = os.getenv("THINKING_EFFORT", "medium").lower()
+
+        # Round-trip Anthropic signed thinking blocks through clients that only preserve message.content.
+        # 0 disables preservation, N preserves the last N assistant messages, and inf/all preserves every assistant message.
+        self.preserve_thinking_blocks = getenv_preserve_thinking_blocks("PRESERVE_THINKING_BLOCKS", "0")
 
         # Cost tracking.
         # Values are USD per 1 million tokens. Defaults are Anthropic's Claude Sonnet 4.5 API prices.
@@ -223,7 +252,10 @@ class RuntimeConfig:
         version_str      = re.search(r'\d+(?:\.\d+)+', display_name_str)
         if version_str is not None : self.version = Version(version_str.group())
         else                       : self.version = Version("0.0")
-        self.set_prefill(self.assistant_prefill_mode)
+        # Validate the configured prefill mode against the selected model.
+        # Do not call set_prefill() here: that would overwrite ASSISTANT_PREFILL
+        # with the mode string (for example "none", "assistant", or "instruction").
+        self.set_prefill_mode(self.assistant_prefill_mode)
         self.resolve_thinking()
         print(f"=== Switching to {self.model} complete ===")
 
@@ -269,6 +301,8 @@ class RuntimeConfig:
         print(f"adaptive_thinking      = {self.use_adaptive}")
         print(f"thinking_budget        = {self.thinking_budget}")
         print(f"thinking_effort        = {self.thinking_effort}")
+        preserve_str = "inf" if self.preserve_thinking_blocks is None else str(self.preserve_thinking_blocks)
+        print(f"preserve_thinking      = {preserve_str}")
         print(f"error_log_path         = {self.error_log_path}")
         print(f"model_list_timeout_sec = {self.model_list_timeout_seconds}")
         print("=== Runtime config end ===")
@@ -514,7 +548,7 @@ def admin_cli_loop() -> None:
                 set_cache_auto_msg(int(parts[1]))
 
             if command == "cache":
-                if len(parts) != 2 : print("Usage : cache <sub_cmd>"); continue
+                if len(parts) < 2 : print("Usage : cache <sub_cmd>"); continue
                 arg1 = parts[1].lower()
                 if arg1 in DISABLE_VALUES : cfg.use_cache = False; continue
                 if arg1 in ENABLE_VALUES  : cfg.use_cache = True; continue
@@ -539,22 +573,50 @@ def admin_cli_loop() -> None:
                 continue
 
             if command == "prefill":
-                if len(parts) != 2 : print("Not enough arguments"); continue
+                if len(parts) < 2:
+                    print("Usage:")
+                    print("  prefill <none|assistant|instruction>")
+                    print("  prefill set <text>")
+                    continue
+
                 arg1 = parts[1].lower()
-                if arg1 in PREFILL_MODES : cfg.set_prefill_mode(arg1); continue
-                if arg1 != "set"         : print("Invalid argument"); continue
-                if len(parts) != 3       : print("Not enough arguments"); continue
-                cfg.set_prefill(parts[3])
+                if arg1 in PREFILL_MODES:
+                    cfg.set_prefill_mode(arg1)
+                    continue
+
+                if arg1 != "set":
+                    print("Invalid argument. Use: prefill <none|assistant|instruction> or prefill set <text>")
+                    continue
+
+                split_line = line.split(maxsplit=2)
+                if len(split_line) < 3:
+                    print("Usage: prefill set <text>")
+                    continue
+
+                cfg.set_prefill(split_line[2])
                 continue
 
             if command in {"think", "thinking"}:
-                if len(parts) != 2 : print("Usage : think <sub_cmd>"); continue
+                if len(parts) < 2:
+                    print("Usage: think <on|off|effort> [effort]")
+                    continue
+
                 arg1 = parts[1].lower()
-                if arg1 in DISABLE_VALUES : cfg.enable_thinking(False); continue
-                if arg1 in ENABLE_VALUES  : cfg.enable_thinking(True); continue
-                if len(parts) != 3 : print("Usage : think <sub_cmd>"); continue
-                arg2 = parts[2].lower()
-                if arg1 == "effort": cfg.set_think_effort(arg2); continue
+                if arg1 in DISABLE_VALUES:
+                    cfg.enable_thinking(False)
+                    continue
+                if arg1 in ENABLE_VALUES:
+                    cfg.enable_thinking(True)
+                    continue
+
+                if arg1 == "effort":
+                    if len(parts) != 3:
+                        print("Usage: think effort <low|medium|high|xhigh|max>")
+                        continue
+                    cfg.set_think_effort(parts[2].lower())
+                    continue
+
+                print("Usage: think <on|off|effort> [effort]")
                 continue
 
             if command in {"reload_env", "reload", "env"}:
@@ -801,6 +863,110 @@ def content_to_plain_text(content: Any) -> str:
     return str(content)
 
 
+# =============================================================================
+# Anthropic thinking block round-tripping
+# =============================================================================
+# Plain-text envelope lets Janitor carry signed Anthropic thinking blocks across turns.
+THINKING_ENVELOPE_TAG   = "thinking_preservation_block_v1"
+THINKING_ENVELOPE_START = f"~~~<{THINKING_ENVELOPE_TAG}>"
+THINKING_ENVELOPE_END   = f"~~~</{THINKING_ENVELOPE_TAG}>"
+
+# Accept the old marker for existing chats, but emit only the proxy-owned marker going forward.
+THINKING_ENVELOPE_TAG_RE = r"(?:thinking_preservation_block_v1|anthropic_thinking_v1)"
+THINKING_ENVELOPE_RE    = re.compile(
+    rf"(?:^|\n)~~~<(?P<tag>{THINKING_ENVELOPE_TAG_RE})>\s*\n(?P<body>.*?)(?:\n)?~~~</(?P=tag)>\s*",
+    re.DOTALL,
+)
+VISIBLE_THINK_RE = re.compile(r"\s*<think\b[^>]*>.*?</think>\s*", re.IGNORECASE | re.DOTALL)
+
+
+def thinking_preservation_enabled() -> bool:
+    return (cfg.preserve_thinking_blocks is None) or (cfg.preserve_thinking_blocks > 0)
+
+
+def extract_preservable_thinking_blocks(blocks: Any) -> List[Dict[str, Any]]:
+    if not isinstance(blocks, list):
+        return []
+
+    preserved: List[Dict[str, Any]] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+
+        block_type = block.get("type")
+        if block_type == "thinking" and isinstance(block.get("thinking"), str) and isinstance(block.get("signature"), str):
+            # Keep only Anthropic-signed thinking blocks; never reconstruct them from <think> text.
+            preserved.append(dict(block))
+        elif block_type == "redacted_thinking" and isinstance(block.get("data"), str):
+            # Redacted thinking is opaque; pass it back exactly as received.
+            preserved.append(dict(block))
+
+    return preserved
+
+
+def make_hidden_thinking_envelope(blocks: List[Dict[str, Any]]) -> str:
+    if not blocks:
+        return ""
+
+    payload = {
+        "version": 1,
+        "kind": "anthropic_thinking_blocks",
+        "blocks": blocks,
+    }
+
+    # Keep the envelope ASCII-safe and line-wrapped for text-only clients.
+    raw = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    encoded = base64.b64encode(raw).decode("ascii")
+    wrapped = [encoded[i:i + 120] for i in range(0, len(encoded), 120)]
+    body = "\n".join(f"~~~{line}" for line in wrapped)
+
+    return f"\n{THINKING_ENVELOPE_START}\n{body}\n{THINKING_ENVELOPE_END}"
+
+
+def extract_hidden_thinking_envelopes(text: str) -> Tuple[str, List[Dict[str, Any]]]:
+    all_blocks: List[Dict[str, Any]] = []
+
+    def replace(match: re.Match) -> str:
+        try:
+            # Decode only the matched preservation envelope, not arbitrary ~~~ lines.
+            encoded = "".join(
+                line[3:].strip()
+                for line in match.group("body").splitlines()
+                if line.startswith("~~~")
+            )
+            if encoded:
+                decoded = base64.b64decode(encoded.encode("ascii"), validate=True)
+                payload = json.loads(decoded.decode("utf-8"))
+                if isinstance(payload, dict) and payload.get("version") == 1:
+                    all_blocks.extend(extract_preservable_thinking_blocks(payload.get("blocks", [])))
+        except Exception as exc:
+            if cfg.debug_log:
+                print(f"WARNING: Failed to decode hidden Anthropic thinking envelope: {exc}")
+
+        # Always strip matched envelopes so malformed metadata does not leak into Claude.
+        return ""
+
+    cleaned = THINKING_ENVELOPE_RE.sub(replace, text or "")
+    return cleaned.rstrip(), all_blocks
+
+
+def openai_stream_chunk(model_used: str, delta: Dict[str, Any], finish_reason: Optional[str] = None, usage: Optional[Dict[str, int]] = None, message_id: str = "claude") -> str:
+    chunk: Dict[str, Any] = {
+        "id": message_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": f"anthropic/{model_used}",
+        "choices": [{
+            "index": 0,
+            "finish_reason": finish_reason,
+            "delta": delta,
+        }],
+    }
+    if usage is not None:
+        chunk["usage"] = usage
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+
 PERSONA_END_RE = re.compile(r"</[^<>]*\bPersona>", re.IGNORECASE)
 
 def split_system_prompt_into_text_blocks(system_prompt: str) -> List[Dict[str, str]]:
@@ -881,7 +1047,7 @@ def format_system_for_claude(system_prompt: Optional[str]) -> Optional[Any]:
     return formatted_system
 
 
-def format_to_claude_messages(mlist: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+def format_to_claude_messages(mlist: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Converts OpenAI-style chat messages to Anthropic Messages format.
 
@@ -901,17 +1067,39 @@ def format_to_claude_messages(mlist: List[Dict[str, str]]) -> List[Dict[str, Any
     if cfg.use_cache and cfg.cache_auto_msg > 0 and mlist:
         auto_cache_target_index = max(1, len(mlist) - cfg.cache_auto_msg + 1)
 
-    formatted = [{"role": "user", "content": "<OOC>\nBegin the scenario.\n</OOC>"}]
+    formatted: List[Dict[str, Any]] = [{"role": "user", "content": "<OOC>\nBegin the scenario.\n</OOC>"}]
     old_role  = "user"
 
     for idx, msg in enumerate(mlist, start=1):
         incoming_role = msg.get("role", "user")
         content       = msg.get("content", "")
 
+        if msg.get("role") == "assistant" and msg.get("send_anthropic_thinking_blocks"):
+            thinking_blocks = extract_preservable_thinking_blocks(msg.get("anthropic_thinking_blocks") or [])
+            if thinking_blocks:
+                # Remove the display-only <think> copy before sending signed blocks back to Claude.
+                visible_text = VISIBLE_THINK_RE.sub("", content or "").strip()
+                content = list(thinking_blocks)
+                if visible_text:
+                    content.append({"type": "text", "text": visible_text})
+
         claude_role = "assistant" if incoming_role == "assistant" else "user"
 
         if claude_role == old_role:
-            formatted[-1]["content"] = append_text_to_content(formatted[-1]["content"], content)
+            if isinstance(content, list):
+                # Preserve block form when a same-role assistant turn carries thinking blocks.
+                merged_blocks: List[Dict[str, Any]] = []
+                existing = formatted[-1].get("content", "")
+                if isinstance(existing, list):
+                    merged_blocks.extend(dict(block) if isinstance(block, dict) else {"type": "text", "text": str(block)} for block in existing)
+                elif isinstance(existing, str) and existing:
+                    merged_blocks.append({"type": "text", "text": existing})
+                elif existing not in (None, ""):
+                    merged_blocks.append({"type": "text", "text": str(existing)})
+                merged_blocks.extend(dict(block) if isinstance(block, dict) else {"type": "text", "text": str(block)} for block in content)
+                formatted[-1]["content"] = merged_blocks
+            else:
+                formatted[-1]["content"] = append_text_to_content(formatted[-1]["content"], str(content))
         else:
             formatted.append({"role" : claude_role, "content" : content})
 
@@ -928,10 +1116,10 @@ def format_to_claude_messages(mlist: List[Dict[str, str]]) -> List[Dict[str, Any
     # Optional Claude prefill.
     # assistant mode preserves the original assistant-message/prefill behavior.
     # instruction mode avoids assistant prefill and appends an OOC instruction to the last user message instead.
-    if cfg.assistant_prefill.strip():
+    if cfg.assistant_prefill.strip() and cfg.assistant_prefill_mode != "none":
         if cfg.assistant_prefill_mode == "instruction":
             append_prefill_instruction_to_last_user_message(formatted, cfg.assistant_prefill)
-        else:
+        elif cfg.assistant_prefill_mode == "assistant":
             if formatted[-1]["role"] == "user" : formatted.append({"role" : "assistant", "content" : cfg.assistant_prefill})
             else                               : formatted[-1]["content"] = append_text_to_content(formatted[-1]["content"], cfg.assistant_prefill)
 
@@ -1116,14 +1304,14 @@ def get_temperature(payload: Dict[str, Any]) -> float:
     return float(payload.get("temperature", cfg.default_temperature))
 
 
-def split_system_and_messages(raw_messages: Any) -> Tuple[Optional[str], List[Dict[str, str]]]:
+def split_system_and_messages(raw_messages: Any) -> Tuple[Optional[str], List[Dict[str, Any]]]:
     """
     Validates and normalizes OpenAI-style chat messages.
 
     Accepts untrusted request payload data.
     Returns:
         - system_prompt: joined system messages, or None
-        - chat_messages: list of normalized {"role": str, "content": str} dicts
+        - chat_messages: list of normalized message dicts
 
     Invalid message lists abort with 400 and do not return.
     """
@@ -1132,7 +1320,7 @@ def split_system_and_messages(raw_messages: Any) -> Tuple[Optional[str], List[Di
         raise RuntimeError("unreachable")
 
     system_parts  : List[str]            = []
-    chat_messages : List[Dict[str, str]] = []
+    chat_messages : List[Dict[str, Any]] = []
 
     for idx, msg in enumerate(raw_messages):
         if not isinstance(msg, dict):
@@ -1151,7 +1339,30 @@ def split_system_and_messages(raw_messages: Any) -> Tuple[Optional[str], List[Di
         if role not in ("user", "assistant"):
             role = "user"
 
-        chat_messages.append({"role": role, "content": content})
+        # Strip every preservation envelope, but keep assistant envelopes only when preservation is enabled.
+        content, thinking_blocks = extract_hidden_thinking_envelopes(content)
+
+        msg_obj: Dict[str, Any] = {"role": role, "content": content}
+        if role == "assistant" and thinking_preservation_enabled() and thinking_blocks:
+            msg_obj["anthropic_thinking_blocks"] = thinking_blocks
+        chat_messages.append(msg_obj)
+
+    if thinking_preservation_enabled():
+        # Mark only the last N assistant messages for signed-block rehydration.
+        remaining = cfg.preserve_thinking_blocks
+        for i in range(len(chat_messages) - 1, -1, -1):
+            msg = chat_messages[i]
+            if msg.get("role") != "assistant":
+                continue
+            if not msg.get("anthropic_thinking_blocks"):
+                continue
+            if remaining is None:
+                msg["send_anthropic_thinking_blocks"] = True
+                continue
+            if remaining <= 0:
+                break
+            msg["send_anthropic_thinking_blocks"] = True
+            remaining -= 1
 
     system_prompt = "\n\n".join(system_parts) if system_parts else None
     return system_prompt, chat_messages
@@ -1203,6 +1414,22 @@ def make_openai_non_stream_response(message: Any, model: str) -> Dict[str, Any]:
     if cfg.auto_trim:
         output_text = trim_to_end_sentence(output_text)
 
+    anthropic_content = anthropic_blocks_to_dicts(message)
+    thinking_blocks   = extract_preservable_thinking_blocks(anthropic_content)
+
+    # Keep ordinary <think> output for Janitor/client compatibility.
+    thinking_text = "\n".join(
+        block.get("thinking", "")
+        for block in thinking_blocks
+        if block.get("type") == "thinking" and block.get("thinking", "")
+    ).strip()
+    if thinking_text:
+        output_text = f"<think>\n{thinking_text}\n</think>\n\n" + output_text
+
+    # Add a second, hidden-ish signed-block envelope only when preservation is enabled.
+    if thinking_preservation_enabled() and thinking_blocks:
+        output_text += make_hidden_thinking_envelope(thinking_blocks)
+
     return {
         "id": getattr(message, "id", "claude"),
         "object": "chat.completion",
@@ -1215,7 +1442,8 @@ def make_openai_non_stream_response(message: Any, model: str) -> Dict[str, Any]:
                 "message": {
                     "role": "assistant",
                     "content": output_text,
-                    "anthropic_content": anthropic_blocks_to_dicts(message),
+                    "anthropic_content": anthropic_content,
+                    "anthropic_thinking_preserved": bool(thinking_preservation_enabled() and thinking_blocks),
                 },
             }
         ],
@@ -1290,61 +1518,42 @@ def generate_stream(payload: Dict[str, Any], route_model: str):
         for event in stream:
             if event.type == "content_block_delta":
                 if event.delta.type == "thinking_delta":
-                    yield f"data: {json.dumps({
-                        'id': 'claude',
-                        'object': 'chat.completion.chunk',
-                        'created': int(time.time()),
-                        'model': f'anthropic/{model_used}',
-                        'choices': [{
-                            'index': 0,
-                            'finish_reason': None,
-                            'delta': {
-                                'role': 'assistant',
-                                'reasoning_content': event.delta.thinking,
-                            },
-                        }],
-                    }, ensure_ascii=False)}\n\n"
+                    # Stream reasoning_content only; Janitor already renders it as <think> text.
+                    yield openai_stream_chunk(model_used, {
+                        "role": "assistant",
+                        "reasoning_content": event.delta.thinking,
+                    })
+
                 elif event.delta.type == "text_delta":
-                    yield f"data: {json.dumps({
-                        'id': 'claude',
-                        'object': 'chat.completion.chunk',
-                        'created': int(time.time()),
-                        'model': f'anthropic/{model_used}',
-                        'choices': [{
-                            'index': 0,
-                            'finish_reason': None,
-                            'delta': {
-                                'role': 'assistant',
-                                'content': event.delta.text,
-                            },
-                        }],
-                    }, ensure_ascii=False)}\n\n"
+                    yield openai_stream_chunk(model_used, {
+                        "role": "assistant",
+                        "content": event.delta.text,
+                    })
             time.sleep(0.01)
 
         final_message = stream.get_final_message()
 
+        # The visible <think> text has already gone through reasoning_content above.
+        thinking_blocks = extract_preservable_thinking_blocks(anthropic_blocks_to_dicts(final_message))
+        if thinking_preservation_enabled() and thinking_blocks:
+            # Send only the hidden signed-block envelope for next-turn rehydration.
+            yield openai_stream_chunk(model_used, {
+                "role": "assistant",
+                "content": make_hidden_thinking_envelope(thinking_blocks),
+            })
+
         usage = getattr(final_message, "usage", None)
         print_usage(usage)
 
-        final_event = {
-            "id"      : getattr(final_message, "id", "claude"),
-            "object"  : "chat.completion.chunk",
-            "created" : int(time.time()),
-            "model"   : f"anthropic/{model_used}",
-            "choices" : [
-                {
-                    "index"         : 0,
-                    "finish_reason" : getattr(final_message, "stop_reason", "stop"),
-                    "delta"         : {},
-                }
-            ],
-            "usage" : usage_to_openai_dict(getattr(final_message, "usage", None)),
-        }
-
-        yield f"data: {json.dumps(final_event, ensure_ascii=False)}\n\n"
+        yield openai_stream_chunk(
+            model_used,
+            {},
+            finish_reason=getattr(final_message, "stop_reason", "stop"),
+            usage=usage_to_openai_dict(getattr(final_message, "usage", None)),
+            message_id=getattr(final_message, "id", "claude"),
+        )
 
     yield "data: [DONE]\n\n"
-
 
 def handle_chat_completion():
     payload = request.get_json(silent=True)
@@ -1413,6 +1622,13 @@ def running():
                 "session_total_output_tokens"                      : session_total_output_tokens,
                 "session_average_input_token_cost_usd_per_million" : session_average_input_cost*1_000_000,
                 "session_cache_net_cost_usd"                       : session_cache_net_cost,
+            },
+            "thinking" : {
+                "thinking_enabled"          : cfg.thinking_enabled,
+                "adaptive_thinking"         : cfg.use_adaptive,
+                "thinking_budget"           : cfg.thinking_budget,
+                "thinking_effort"           : cfg.thinking_effort,
+                "preserve_thinking_blocks"  : "inf" if cfg.preserve_thinking_blocks is None else str(cfg.preserve_thinking_blocks),
             }
         }
     )

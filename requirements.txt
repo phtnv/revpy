@@ -1,6 +1,7 @@
+anthropic
 flask
 flask-cors
-anthropic
+packaging
 requests
 waitress
 python-dotenv
