@@ -14,8 +14,8 @@ from packaging.version import Version
 from typing            import Any, Dict, List, Optional, Tuple
 from waitress          import serve
 
-ENABLE_VALUES  = {"true" , "1", "yes", "y", "enable" , "on" }
-DISABLE_VALUES = {"false", "0", "no" , "n", "disable", "off"}
+ENABLE_VALUES  = {"1", "y", "true" , "yes", "enable" , "on" }
+DISABLE_VALUES = {"0", "n", "false", "no" , "disable", "off"}
 THINK_EFFORTS  = {"low", "medium", "high", "xhigh", "max"}
 
 def getenv_float(name: str, default: float) -> float:
@@ -148,7 +148,7 @@ class RuntimeConfig:
         self.top_p                = getenv_float("TOP_P", 0.9)
         self.send_top_k           = True
         self.top_k                = getenv_int("TOP_K", 75)
-        self.default_max_tokens   = getenv_int("DEFAULT_MAX_TOKENS", 8192)
+        self.max_tokens           = getenv_int("MAX_TOKENS", 8192)
 
         # Thinking
         self.thinking_enabled = getenv_bool("THINKING_ENABLED", False)
@@ -191,8 +191,8 @@ class RuntimeConfig:
     def set_prefill_mode(self, mode: str) -> None:
         if not mode in PREFILL_MODES : print(f"WARNING: ASSISTANT_PREFILL_MODE must be in {PREFILL_MODES}. Defaulting to 'none'."); return
         if mode == "assistant" :
+            if self.version >= Version("4.6") : print("Mythos class models (>= 4.6) do not support assistant prefill."); return
             if self.thinking_enabled          : print("While thinking is enabled, prefill mode cannot be assistant."); return
-            if self.version >= Version("4.6") : print("Mythos class models do not support assistant prefill."); return
         self.assistant_prefill_mode = mode
 
     def set_prefill(self, prefill: str) -> None:
@@ -202,9 +202,26 @@ class RuntimeConfig:
         self.thinking_enabled = en
         self.resolve_thinking()
 
-    def set_think_effort(self, effort: str) -> None:
-        if not effort in THINK_EFFORTS : print(f"Allowed thinking efforts: {THINK_EFFORTS}."); return
+    def set_think_effort(self, effort: str) -> bool:
+        if not effort in THINK_EFFORTS:
+            print(f"Allowed thinking efforts: {THINK_EFFORTS}.")
+            return False
         self.thinking_effort = effort
+        return True
+
+    def set_think_budget(self, budget: int) -> bool:
+        if budget < 0 or budget > self.max_tokens:
+            print(f"Thinking budget {budget} must be in range (0:max_tokens] - (0:{self.max_tokens}].")
+            return False
+        self.thinking_budget = budget
+        return True
+
+    def set_think_blocks_to_preserve(self, block_num: int) -> bool:
+        if block_num < 0:
+            print("Number of blocks to preserve must be a natural numbers.")
+            return False
+        self.preserve_thinking_blocks = block_num
+        return True
 
     def resolve_thinking(self) -> None:
         if not self.thinking_enabled:
@@ -259,6 +276,25 @@ class RuntimeConfig:
         self.resolve_thinking()
         print(f"=== Switching to {self.model} complete ===")
 
+
+    def set_cache_manual_msg(self, value: int) -> bool:
+        if value < 0:
+            print("cache_manual_msg must be a natural number.")
+            return False
+        cfg.cache_manual_msg = value
+        print(f"Manual cache marker now targets {cfg.cache_manual_msg} message(s) from the start.")
+        return True
+
+
+    def set_cache_auto_msg(self, value: int) -> bool:
+        if value < 0:
+            print("cache_auto_msg must be a natural number.")
+            return False
+        cfg.cache_auto_msg = value
+        print(f"Auto cache marker now targets {cfg.cache_auto_msg} message(s) from the end.")
+        return True
+
+
     def find_cfg(self, models: List[Dict[str, Any]]) -> str:
         for model in models:
             model_id = deep_get(model, "id")
@@ -288,7 +324,7 @@ class RuntimeConfig:
         print(f"default_temperature    = {self.default_temperature}")
         print(f"top_p                  = {self.top_p}")
         print(f"top_k                  = {self.top_k}")
-        print(f"default_max_tokens     = {self.default_max_tokens}")
+        print(f"max_tokens             = {self.max_tokens}")
         print(f"use_cache              = {self.use_cache}")
         print(f"cache_system           = {self.cache_system}")
         print(f"cache_system_ttl       = {self.cache_system_ttl}")
@@ -351,18 +387,6 @@ def reload_runtime_env() -> None:
 
     print("Reloaded runtime configuration from .env.")
     print("HOST and PORT were not changed; restart the process to change bind address.")
-
-
-def set_cache_manual_msg(value: int) -> None:
-    if value < 0 : raise ValueError("CACHE_MANUAL_MSG must be >= 0.")
-    cfg.cache_manual_msg = value
-    print(f"Manual cache marker now targets {cfg.cache_manual_msg} message(s) from the start.")
-
-
-def set_cache_auto_msg(value: int) -> None:
-    if value < 0 : raise ValueError("CACHE_AUTO_MSG must be >= 0.")
-    cfg.cache_auto_msg = value
-    print(f"Auto cache marker now targets {cfg.cache_auto_msg} message(s) from the end.")
 
 
 def anthropic_object_to_dict(obj: Any) -> Dict[str, Any]:
@@ -446,6 +470,7 @@ def refresh_anthropic_models(key: str, timeout_s: float) -> bool:
         print(f"WARNING: Could not retrieve a model list from Anthropic. {anthropic_exception_message(exc)}.")
         return False
 
+
 def print_no_model_list_available() -> None:
     print("No Anthropic model list is available.")
 
@@ -514,6 +539,48 @@ def print_model_info(index: int) -> None:
 
     print(json.dumps(model_info, indent=2, ensure_ascii=False, default=str))
 
+CLI_CMD_MODEL_INFO = """\
+  model command. Alias: models, m.
+    model              List all available models.
+    model <uint>       Select a model from list.
+    model info         Display information on the currently selected model.
+    model info <uint>  Display information on the specified model.
+      Alias: i
+    model refresh      Request the available model list again.
+      Alias: r
+"""
+
+CLI_CMD_CACHE_INFO = """\
+  cache command. Alias: c.
+    cache <bool>          Toggle all caching on / off.
+    cache system <bool>   Toggle caching of system messages.
+    cache system <5m|1h>  Set cache duration for the system messages.
+      Alias: sys, s
+    cache manual <uint>   Number of messages from start at which to place the manual cache marker. 0 to disable.
+    cache manual <5m|1h>  Cache duration for the manual marker.
+      Alias: man, m
+    cache auto   <uint>   Message number from end at which to place the auto marker. 0 to disable.
+    cache auto   <5m|1h>  Cache duration for the auto marker.
+      Alias: a
+"""
+
+CLI_CMD_PREFILL_INFO = """\
+  prefill command. Alias: p.
+    prefill <none|assistant|instruction>  Select prefill mode.
+    prefill set <string>                  Set prefill to <string>.
+      Alias: s
+"""
+
+CLI_CMD_THINK_INFO = """\
+  think command. Alias: t, thinking.
+    think <bool>                              Turn thinking on / off.
+    think effort <low|medium|high|xhigh|max>  Set thinking effort for models with adaptive thinking.
+      Alias: e
+    think budget <uint>                       Set thinking budget to <uint> for older models.
+      Alias: b
+    think preserve <uint>                     Set number of thinking blocks to preserve. 0 to disable.
+      Alias: p
+"""
 
 def admin_cli_loop() -> None:
     """
@@ -536,47 +603,55 @@ def admin_cli_loop() -> None:
             continue
 
         parts   = line.split()
-        command = parts[0].lower()
+        parts_l = len(parts)
+        cmd     = parts[0].lower()
 
         try:
-            if command == "cmm":
-                if len(parts) != 2 : print("Usage: cache_manual_msg <number>"); continue
-                set_cache_manual_msg(int(parts[1]))
-
-            if command == "cam":
-                if len(parts) != 2 : print("Usage: cache_manual_msg <number>"); continue
-                set_cache_auto_msg(int(parts[1]))
-
-            if command == "cache":
-                if len(parts) < 2 : print("Usage : cache <sub_cmd>"); continue
+            if cmd in {"c", "cache"}:
+                if parts_l < 2:
+                    print(CLI_CMD_CACHE_INFO)
+                    continue
                 arg1 = parts[1].lower()
                 if arg1 in DISABLE_VALUES : cfg.use_cache = False; continue
-                if arg1 in ENABLE_VALUES  : cfg.use_cache = True; continue
-                if len(parts) != 3 : print("Usage : cache <sub_cmd> <number>"); continue
+                if arg1 in ENABLE_VALUES  : cfg.use_cache = True ; continue
+
+                if parts_l < 3:
+                    print(CLI_CMD_CACHE_INFO)
+                    continue
                 arg2 = parts[2].lower()
-                if arg1 in {"manual", "man", "m"} :
-                    if (arg2 == "1h") : cfg.cache_manual_ttl = "1h"; continue
-                    if (arg2 == "5m") : cfg.cache_manual_ttl = "5m"; continue
-                    if (arg2 in DISABLE_VALUES) : set_cache_manual_msg(0); continue
-                    set_cache_manual_msg(int(arg2)); continue
-                if arg1 in {"auto", "a"} :
-                    if (arg2 == "1h") : cfg.cache_auto_ttl = "1h"; continue
-                    if (arg2 == "5m") : cfg.cache_auto_ttl = "5m"; continue
-                    if (arg2 in DISABLE_VALUES) : set_cache_auto_msg(0); continue
-                    set_cache_auto_msg(int(arg2));  continue
-                if arg1 in {"system", "sys", "s"} :
-                    if (arg2 in DISABLE_VALUES) : cfg.cache_system = False; continue
-                    if (arg2 in ENABLE_VALUES ) : cfg.cache_system = True; continue
-                    if (arg2 == "1h") : cfg.cache_system_ttl = "1h"; continue
-                    if (arg2 == "5m") : cfg.cache_system_ttl = "5m"; continue
-                print(f"Unknown arg1 {arg1}.")
+                if arg1 in {"m", "man", "manual"}:
+                    if (arg2 == "1h"          ) : cfg.cache_manual_ttl = "1h"; continue
+                    if (arg2 == "5m"          ) : cfg.cache_manual_ttl = "5m"; continue
+                    if (arg2 in DISABLE_VALUES) : cfg.set_cache_manual_msg(0); continue
+                    try: msg_id = int(arg2)
+                    except Exception: pass
+                    else:
+                        cfg.set_cache_manual_msg(msg_id);
+                        continue
+                    print(CLI_CMD_CACHE_INFO)
+                    continue
+                if arg1 in {"a", "auto"}:
+                    if (arg2 == "1h"          ) : cfg.cache_auto_ttl = "1h"; continue
+                    if (arg2 == "5m"          ) : cfg.cache_auto_ttl = "5m"; continue
+                    if (arg2 in DISABLE_VALUES) : cfg.set_cache_auto_msg(0); continue
+                    try: msg_id = int(arg2)
+                    except Exception: pass
+                    else:
+                        cfg.set_cache_auto_msg(msg_id);
+                        continue
+                    print(CLI_CMD_CACHE_INFO)
+                    continue
+                if arg1 in {"s", "sys", "system"} :
+                    if (arg2 in DISABLE_VALUES) : cfg.cache_system     = False; continue
+                    if (arg2 in ENABLE_VALUES ) : cfg.cache_system     = True ; continue
+                    if (arg2 == "1h"          ) : cfg.cache_system_ttl = "1h" ; continue
+                    if (arg2 == "5m"          ) : cfg.cache_system_ttl = "5m" ; continue
+                print(CLI_CMD_CACHE_INFO)
                 continue
 
-            if command == "prefill":
-                if len(parts) < 2:
-                    print("Usage:")
-                    print("  prefill <none|assistant|instruction>")
-                    print("  prefill set <text>")
+            if cmd == "prefill":
+                if parts_l < 2:
+                    print(CLI_CMD_PREFILL_INFO)
                     continue
 
                 arg1 = parts[1].lower()
@@ -585,96 +660,111 @@ def admin_cli_loop() -> None:
                     continue
 
                 if arg1 != "set":
-                    print("Invalid argument. Use: prefill <none|assistant|instruction> or prefill set <text>")
+                    print(CLI_CMD_PREFILL_INFO)
                     continue
 
                 split_line = line.split(maxsplit=2)
                 if len(split_line) < 3:
-                    print("Usage: prefill set <text>")
+                    print(CLI_CMD_PREFILL_INFO)
                     continue
 
                 cfg.set_prefill(split_line[2])
                 continue
 
-            if command in {"think", "thinking"}:
-                if len(parts) < 2:
-                    print("Usage: think <on|off|effort> [effort]")
+            if cmd in {"t", "think", "thinking"}:
+                if parts_l < 2:
+                    print(CLI_CMD_THINK_INFO)
                     continue
 
                 arg1 = parts[1].lower()
-                if arg1 in DISABLE_VALUES:
-                    cfg.enable_thinking(False)
-                    continue
-                if arg1 in ENABLE_VALUES:
-                    cfg.enable_thinking(True)
-                    continue
+                if arg1 in DISABLE_VALUES : cfg.enable_thinking(False); continue
+                if arg1 in ENABLE_VALUES  : cfg.enable_thinking(True) ; continue
 
-                if arg1 == "effort":
-                    if len(parts) != 3:
-                        print("Usage: think effort <low|medium|high|xhigh|max>")
-                        continue
-                    cfg.set_think_effort(parts[2].lower())
+                if parts_l < 3:
+                    print(CLI_CMD_THINK_INFO)
                     continue
-
-                print("Usage: think <on|off|effort> [effort]")
+                arg2 = parts[2].lower()
+                if arg1 == {"e", "effort"}:
+                    cfg.set_think_effort(arg2)
+                    continue
+                if arg1 == {"b", "budget"}:
+                    try: budget = int(arg2)
+                    except Exception: pass
+                    else:
+                        cfg.set_think_budget(budget)
+                if arg1 == {"p", "preserve"}:
+                    try: preserve_blocks = int(arg2)
+                    except Exception: pass
+                    else:
+                        cfg.set_think_blocks_to_preserve(preserve_blocks)
+                print(CLI_CMD_THINK_INFO)
                 continue
 
-            if command in {"reload_env", "reload", "env"}:
-                if len(parts) != 1:
-                    print("Usage: reload_env")
-                    continue
+            if cmd in {"reload"}:
                 reload_runtime_env()
                 cfg.print_status()
                 continue
 
-            if command in {"model", "models"}:
-                if len(parts) == 2 and parts[1].lower() == "list":
+            if cmd in {"m", "model", "models"}:
+                if parts_l < 2:
                     print_model_list()
                     continue
-                if len(parts) == 3 and parts[1].lower() == "select":
-                    value = int(parts[2])
-                    select_model_by_number(value)
+
+                arg1 = parts[1].lower()
+                if parts_l == 2:
+                    try: model_id = int(arg1)
+                    except Exception: pass
+                    else:
+                        select_model_by_number(model_id)
+                        continue
+                    if arg1 in {"i", "info"}:
+                        print(json.dumps(cfg.model_info, indent=2, ensure_ascii=False, default=str))
+                        continue
+                    if arg1 == {"r", "refresh"}:
+                        refresh_anthropic_models(cfg.anthropic_api_key, cfg.model_list_timeout_seconds)
+                        cfg.find_cfg(ANTHROPIC_MODELS)
+                        continue
+                    print(CLI_CMD_MODEL_INFO)
                     continue
-                if len(parts) == 3 and parts[1].lower() == "info":
-                    value = int(parts[2])
-                    print_model_info(value)
+
+                if parts_l < 3:
+                    print(CLI_CMD_MODEL_INFO)
                     continue
-                print("Usage:")
-                print("  model list")
-                print("  model select <number>")
-                print("  model info   <number>")
+                arg2 = parts[2].lower()
+                if arg1 == {"i", "info"}:
+                    try: model_id = int(arg2)
+                    except Exception: pass
+                    else:
+                        print_model_info(model_id)
+                        continue
+                print(CLI_CMD_MODEL_INFO)
                 continue
 
-            if command in {"show", "status"}:
+            if cmd == "status":
                 cfg.print_status()
                 continue
 
-            if command == "help":
+            if cmd in {"help", "?"}:
                 print()
                 print("Commands:")
-                print("  cache_manual_msg <number>      Set manual first-N cache marker")
-                print("    cmm <number>")
-                print("    cache_first_messages / cfm   Backwards-compatible aliases")
-                print("  cache_auto_msg <number>        Set automatic end-relative cache marker")
-                print("    cam <number>")
-                print("  model list                     List available Anthropic models")
-                print("  model select <number>          Select model by list number")
-                print("  model info   <number>          Show all stored info for a model")
-                print("  reload_env                     Reload runtime settings from .env")
-                print("    reload")
-                print("    env")
-                print("  show                           Show runtime settings")
-                print("  help                           Show this help")
-                print("  quit                           Stop the process")
-                print("    exit")
+                print(CLI_CMD_CACHE_INFO)
+                print(CLI_CMD_MODEL_INFO)
+                print(CLI_CMD_PREFILL_INFO)
+                print(CLI_CMD_THINK_INFO)
+                print("  reload  Reload runtime settings from .env.")
+                print("  status  Show runtime settings.")
+                print("  help    Show this help.")
+                print("    Alias: ?")
+                print("  quit    Stop the process.")
+                print("    Alias: exit")
                 print()
                 continue
 
-            if command in {"quit", "exit"}:
+            if cmd in {"quit", "exit"}:
                 print("Stopping proxy.")
                 os._exit(0)
 
-            print(f"Unknown command: {command}")
+            print(f"Unknown command: {cmd}")
             print("Type 'help' for commands.")
 
         except ValueError as exc : print(f"Invalid value: {exc}")
@@ -1379,7 +1469,7 @@ def build_claude_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     kwargs: Dict[str, Any] = {
         "model"      : cfg.model,
-        "max_tokens" : int(payload.get("max_tokens", cfg.default_max_tokens)),
+        "max_tokens" : int(payload.get("max_tokens", cfg.max_tokens)),
     }
     if cfg.send_temperature : kwargs["temperature"] = get_temperature(payload)
     if cfg.send_top_k       : kwargs["top_k"] = cfg.top_k
