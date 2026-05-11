@@ -41,16 +41,7 @@ def getenv_int(name: str, default: int) -> int:
     except ValueError:
         print(f"WARNING: {name} must be an integer. Defaulting to {default}.")
         return default
-
 def getenv_preserve_thinking_blocks(name: str, default: str = "0") -> Optional[int]:
-    """
-    Parses PRESERVE_THINKING_BLOCKS.
-
-    Returns:
-        0    : disabled
-        N    : preserve the last N assistant messages with hidden signed thinking blocks
-        None : preserve all assistant messages with hidden signed thinking blocks (inf/all)
-    """
     raw = os.getenv(name, default)
     value = str(raw).strip().lower()
 
@@ -65,21 +56,16 @@ def getenv_preserve_thinking_blocks(name: str, default: str = "0") -> Optional[i
             return max(0, int(default))
         except ValueError:
             return 0
-
-def getenv_cache_ttl(name: str, default: str = "5m") -> str:
-    normalized_default = str(default).strip().lower()
-    if normalized_default not in {"5m", "1h"}:
-        normalized_default = "5m"
-
-    raw = os.getenv(name, normalized_default)
+def getenv_cache_ttl(name: str, default: str) -> str:
+    if default not in {"5m", "1h"}:
+        default = "1h"
+    raw = os.getenv(name, default)
     value = str(raw).strip().lower()
     if value in {"5m", "1h"}:
         return value
+    print(f"WARNING: {name} must be '5m' or '1h'. Defaulting to {default}.")
+    return default
 
-    print(f"WARNING: {name} must be '5m' or '1h'. Defaulting to {normalized_default}.")
-    return normalized_default
-
-_MISSING = object()
 def deep_get(obj: Any, path: str, default: Any = None) -> Any:
     """
     Safe lookup for nested dict/list JSON.
@@ -91,14 +77,14 @@ def deep_get(obj: Any, path: str, default: Any = None) -> Any:
 
     for part in path.split("."):
         if isinstance(cur, dict):
-            cur = cur.get(part, _MISSING)
+            cur = cur.get(part, object())
         elif isinstance(cur, list) and part.isdigit():
             idx = int(part)
-            cur = cur[idx] if 0 <= idx < len(cur) else _MISSING
+            cur = cur[idx] if 0 <= idx < len(cur) else object()
         else:
-            cur = _MISSING
+            cur = object()
 
-        if cur is _MISSING:
+        if cur is object():
             return default
 
     return cur
@@ -112,16 +98,9 @@ class RuntimeConfig:
 
         self.model = os.getenv("MODEL", "claude-sonnet-4-5-20250929")
 
-        self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-        self.proxy_key         = os.getenv("PROXY_KEY", "").strip()
-
-        # Safer default for a public Cloudflare Tunnel:
-        # JanitorAI sends proxy_key, while your real Anthropic key stays local in .env.
-        self.require_proxy_key = getenv_bool("REQUIRE_PROXY_KEY", True)
-
-        # Compatibility fallback: if true and anthropic_api_key is not set,
-        # the proxy will use the Bearer token from the incoming request as the Anthropic key.
-        # For a public tunnel, I recommend leaving this false.
+        self.anthropic_api_key     = os.getenv("ANTHROPIC_API_KEY", "").strip()
+        self.proxy_key             = os.getenv("PROXY_KEY", "").strip()
+        self.require_proxy_key     = getenv_bool("REQUIRE_PROXY_KEY", True)
         self.allow_key_passthrough = getenv_bool("ALLOW_KEY_PASSTHROUGH", False)
 
         self.debug_log = getenv_bool("DEBUG_LOG", True)
@@ -175,14 +154,16 @@ class RuntimeConfig:
         #   1-2  system / lorebook blocks (when split_lorebook=true)
         #    3   manual first-N-message breakpoint
         #    4   automatic end-relative breakpoint before optional prefill
-        self.use_cache        = getenv_bool("USE_CACHE", getenv_bool("PROMPT_CACHE", True))
-        self.cache_system     = getenv_bool("CACHE_SYSTEM", getenv_bool("CACHE_SYSTEM_PROMPT", True))
-        self.cache_system_ttl = getenv_cache_ttl("CACHE_SYSTEM_TTL")
-        self.split_lorebook   = getenv_bool("SPLIT_LOREBOOK", True)
-        self.cache_manual_ttl = getenv_cache_ttl("CACHE_MANUAL_TTL")
-        self.cache_manual_msg = max(0, getenv_int("CACHE_MANUAL_MSG", getenv_int("CACHE_FIRST_MESSAGES", 0)))
-        self.cache_auto_ttl   = getenv_cache_ttl("CACHE_AUTO_TTL")
-        self.cache_auto_msg   = max(0, getenv_int("CACHE_AUTO_MSG", 0))
+        self.cache_en             = getenv_bool("CACHE_EN", False)
+        self.cache_system         = getenv_bool("CACHE_SYSTEM", True)
+        self.cache_system_ttl     = getenv_cache_ttl("CACHE_SYSTEM_TTL", "1h")
+        self.split_lorebook       = getenv_bool("SPLIT_LOREBOOK", True)
+        self.cache_manual_ttl     = getenv_cache_ttl("CACHE_MANUAL_TTL", "1h")
+        self.cache_manual_msg     = max(0, getenv_int("CACHE_MANUAL_MSG", 0))
+        self.cache_auto_ttl       = getenv_cache_ttl("CACHE_AUTO_TTL", "1h")
+        self.cache_auto_msg       = max(0, getenv_int("CACHE_AUTO_MSG", 0))
+        self.cache_anthropic_auto = getenv_bool("CACHE_ANTHROPIC_AUTO", False)
+        self.cache_anthropic_ttl  = getenv_cache_ttl("CACHE_ANTHROPIC_TTL", "1h")
 
         self.error_log_path = os.getenv("ERROR_LOG_PATH", "claude_error_log.txt")
         self.model_list_timeout_seconds = getenv_float("MODEL_LIST_TIMEOUT_SECONDS", 10.0)
@@ -282,7 +263,10 @@ class RuntimeConfig:
             print("cache_manual_msg must be a natural number.")
             return False
         cfg.cache_manual_msg = value
-        print(f"Manual cache marker now targets {cfg.cache_manual_msg} message(s) from the start.")
+        if cfg.cache_manual_msg == 0:
+            print("Manual cache marker disabled.")
+        else:
+            print(f"Manual cache marker targets {cfg.cache_manual_msg} message(s) from the start.")
         return True
 
 
@@ -291,7 +275,10 @@ class RuntimeConfig:
             print("cache_auto_msg must be a natural number.")
             return False
         cfg.cache_auto_msg = value
-        print(f"Auto cache marker now targets {cfg.cache_auto_msg} message(s) from the end.")
+        if cfg.cache_auto_msg == 0:
+            print("Auto cache marker disabled.")
+        else:
+            print(f"Auto cache marker targets {cfg.cache_auto_msg} message(s) from the end.")
         return True
 
 
@@ -325,7 +312,7 @@ class RuntimeConfig:
         print(f"top_p                  = {self.top_p}")
         print(f"top_k                  = {self.top_k}")
         print(f"max_tokens             = {self.max_tokens}")
-        print(f"use_cache              = {self.use_cache}")
+        print(f"cache_en              = {self.cache_en}")
         print(f"cache_system           = {self.cache_system}")
         print(f"cache_system_ttl       = {self.cache_system_ttl}")
         print(f"split_lorebook         = {self.split_lorebook}")
@@ -333,6 +320,8 @@ class RuntimeConfig:
         print(f"cache_manual_msg       = {self.cache_manual_msg}")
         print(f"cache_auto_ttl         = {self.cache_auto_ttl}")
         print(f"cache_auto_msg         = {self.cache_auto_msg}")
+        print(f"cache_anthropic_auto   = {self.cache_anthropic_auto}")
+        print(f"cache_anthropic_ttl    = {self.cache_anthropic_ttl}")
         print(f"thinking               = {self.thinking_enabled}")
         print(f"adaptive_thinking      = {self.use_adaptive}")
         print(f"thinking_budget        = {self.thinking_budget}")
@@ -612,8 +601,8 @@ def admin_cli_loop() -> None:
                     print(CLI_CMD_CACHE_INFO)
                     continue
                 arg1 = parts[1].lower()
-                if arg1 in DISABLE_VALUES : cfg.use_cache = False; continue
-                if arg1 in ENABLE_VALUES  : cfg.use_cache = True ; continue
+                if arg1 in DISABLE_VALUES : cfg.cache_en = False; continue
+                if arg1 in ENABLE_VALUES  : cfg.cache_en = True ; continue
 
                 if parts_l < 3:
                     print(CLI_CMD_CACHE_INFO)
@@ -830,7 +819,7 @@ def add_cache_control_to_content(content: Any, ttl: str) -> Any:
     request level or on content blocks. This script uses explicit block-level
     caching to avoid caching the assistant prefill as the final block.
     """
-    if not cfg.use_cache:
+    if not cfg.cache_en:
         return content
 
     cache_control = make_cache_control(ttl)
@@ -1130,7 +1119,7 @@ def format_system_for_claude(system_prompt: Optional[str]) -> Optional[Any]:
 
     for block in blocks:
         new_block: Dict[str, Any] = dict(block)
-        if (cfg.use_cache and cfg.cache_system and new_block.get("type") == "text" and new_block.get("text", "").strip()):
+        if (cfg.cache_en and cfg.cache_system and new_block.get("type") == "text" and new_block.get("text", "").strip()):
             new_block["cache_control"] = make_cache_control(cfg.cache_system_ttl)
         formatted_system.append(new_block)
 
@@ -1150,11 +1139,11 @@ def format_to_claude_messages(mlist: List[Dict[str, Any]]) -> List[Dict[str, Any
     """
 
     manual_cache_target_index = 0
-    if cfg.use_cache and cfg.cache_manual_msg > 0 and mlist:
+    if cfg.cache_en and cfg.cache_manual_msg > 0 and mlist:
         manual_cache_target_index = min(cfg.cache_manual_msg, len(mlist))
 
     auto_cache_target_index = 0
-    if cfg.use_cache and cfg.cache_auto_msg > 0 and mlist:
+    if cfg.cache_en and cfg.cache_auto_msg > 0 and mlist:
         auto_cache_target_index = max(1, len(mlist) - cfg.cache_auto_msg + 1)
 
     formatted: List[Dict[str, Any]] = [{"role": "user", "content": "<OOC>\nBegin the scenario.\n</OOC>"}]
@@ -1260,7 +1249,7 @@ def fallback_cache_write_ttl() -> str:
     Older SDK usage payloads may not split cache creation by 5m/1h.
     If any active marker is configured for 1h, assume 1h for unknown write tokens to avoid under-counting cost.
     """
-    if not cfg.use_cache:
+    if not cfg.cache_en:
         return "5m"
     active_ttl: List[str] = []
     if cfg.cache_system         : active_ttl.append(cfg.cache_system_ttl)
@@ -1471,6 +1460,12 @@ def build_claude_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
         "model"      : cfg.model,
         "max_tokens" : int(payload.get("max_tokens", cfg.max_tokens)),
     }
+
+    # Anthropic request-level automatic prompt caching.
+    # This is separate from the script's existing explicit block-level markers.
+    # Guard it with cfg.cache_en so USE_CACHE=false disables all cache behavior.
+    if cfg.cache_en and cfg.cache_anthropic_auto:
+        kwargs["cache_control"] = make_cache_control(cfg.cache_anthropic_ttl)
     if cfg.send_temperature : kwargs["temperature"] = get_temperature(payload)
     if cfg.send_top_k       : kwargs["top_k"] = cfg.top_k
     if cfg.send_top_p       : kwargs["top_p"] = cfg.top_p
@@ -1688,9 +1683,9 @@ def running():
         {
             "status"        : "ok",
             "model"         : cfg.model,
-            "prompt_cache"  : cfg.use_cache,
+            "prompt_cache"  : cfg.cache_en,
             "cache"         : {
-                "use_cache"        : cfg.use_cache,
+                "cache_en"        : cfg.cache_en,
                 "cache_system"     : cfg.cache_system,
                 "cache_system_ttl" : cfg.cache_system_ttl,
                 "split_lorebook"   : cfg.split_lorebook,
