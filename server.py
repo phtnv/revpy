@@ -312,7 +312,7 @@ class RuntimeConfig:
         print(f"top_p                  = {self.top_p}")
         print(f"top_k                  = {self.top_k}")
         print(f"max_tokens             = {self.max_tokens}")
-        print(f"cache_en              = {self.cache_en}")
+        print(f"cache_en               = {self.cache_en}")
         print(f"cache_system           = {self.cache_system}")
         print(f"cache_system_ttl       = {self.cache_system_ttl}")
         print(f"split_lorebook         = {self.split_lorebook}")
