@@ -20,9 +20,8 @@ THINK_EFFORTS  = {"low", "medium", "high", "xhigh", "max"}
 
 def getenv_float(name: str, default: float) -> float:
     raw = os.getenv(name, str(default)).strip()
-    try:
-        return float(raw)
-    except ValueError:
+    try: return float(raw)
+    except Exception:
         print(f"WARNING: {name} must be a number. Defaulting to {default}.")
         return default
 def getenv_bool(name: str, default: bool) -> bool:
@@ -36,25 +35,20 @@ def getenv_bool(name: str, default: bool) -> bool:
     return default
 def getenv_int(name: str, default: int) -> int:
     raw = os.getenv(name, str(default)).strip()
-    try:
-        return int(raw)
-    except ValueError:
+    try: return int(raw)
+    except Exception:
         print(f"WARNING: {name} must be an integer. Defaulting to {default}.")
         return default
 def getenv_preserve_thinking_blocks(name: str, default: str = "0") -> Optional[int]:
     raw = os.getenv(name, default)
     value = str(raw).strip().lower()
-
     if value in {"inf", "infinite", "infinity", "all", "*"}:
         return None
-
-    try:
-        return max(0, int(value))
-    except ValueError:
+    try: return max(0, int(value))
+    except Exception:
         print(f"WARNING: {name} must be 0, a positive integer, or inf. Defaulting to {default}.")
-        try:
-            return max(0, int(default))
-        except ValueError:
+        try: return max(0, int(default))
+        except Exception:
             return 0
 def getenv_cache_ttl(name: str, default: str) -> str:
     if default not in {"5m", "1h"}:
@@ -197,6 +191,85 @@ class RuntimeConfig:
         self.thinking_budget = budget
         return True
 
+    def print_cache_status(self):
+        if not self.cache_en:
+            print("All cache disabled.")
+            return
+
+        if not self.cache_system:
+            print("System cache disabled.")
+        else:
+            print(f"System cache enabled. Duration {self.cache_system_ttl}.", end='')
+            if self.split_lorebook:
+                print(" Lorebook split.")
+            else:
+                print()
+        if self.cache_manual_msg <= 0:
+            print("Manual cache disabled.")
+        else:
+            print(f"Manual cache marker at message {self.cache_manual_msg} from start (1 is the first). Duration {self.cache_manual_ttl}.")
+        if self.cache_manual_msg <= 0:
+            print("Auto cache disabled.")
+        else:
+            print(f"Auto cache marker at message {self.cache_auto_msg} from end (1 is the last user message). Duration {self.cache_auto_ttl}.")
+        if not self.cache_anthropic_auto:
+            print("Anthropic auto cache disabled.")
+        else:
+            print(f"Anthropic auto cache enabled. Duration {self.cache_anthropic_ttl}.")
+
+    def set_cache_msg_num(self, type: str, msg_num: int) -> bool:
+        if type in {"m", "man", "manual"}:
+            self.cache_manual_msg = msg_num
+            if msg_num == 0 : print("Manual cache marker disabled.")
+            else            : print(f"Manual cache marker targets {cfg.cache_manual_msg} message(s) from the start.")
+        elif type in {"a", "auto"}:
+            self.cache_auto_msg = msg_num
+            if msg_num == 0 : print("Auto cache marker disabled.")
+            else            : print(f"Auto cache marker targets {cfg.cache_manual_msg} message(s) from the start.")
+        elif type in {"s", "sys", "system"}:
+            self.cache_system = msg_num > 0
+            if msg_num <= 0 : print("System message caching disabled.")
+            else            : print("System message caching enabled.")
+        elif type in ("ant", "anthropic"):
+            self.cache_anthropic_auto = msg_num > 0
+            if msg_num <= 0 : print("Anthropic auto caching disabled.")
+            else            : print("Anthropic auto caching enabled.")
+        else:
+            print(f"Unknown cache type '{type}'")
+            return False
+        cache_blocks_active : int = 0
+        if self.cache_system:
+            if self.split_lorebook : cache_blocks_active += 2
+            else                   : cache_blocks_active += 1
+        if self.cache_auto_msg       : cache_blocks_active += 1
+        if self.cache_manual_msg     : cache_blocks_active += 1
+        if self.cache_anthropic_auto : cache_blocks_active += 1
+        if (cache_blocks_active > 4):
+            print("Not more than four cache blocks can be active at a time. Disabling auto cache block.")
+            self.cache_auto_msg = 0
+        return True
+
+    def set_cache_dur(self, type: str, dur: str) -> bool:
+        if not dur in {"5m", "1h"}:
+            print(f"Invalid duration type '{dur}'")
+            return False
+        if type in {"m", "man", "manual"}:
+            self.cache_manual_ttl= dur
+            print(f"Manual cache marker duration is now {dur}")
+        elif type in {"a", "auto"}:
+            self.cache_auto_ttl = dur
+            print(f"Auto cache marker duration is now {dur}")
+        elif type in {"s", "sys", "system"}:
+            self.cache_system_ttl = dur
+            print(f"System cache marker duration is now {dur}")
+        elif type in ("ant", "anthropic"):
+            self.cache_anthropic_ttl = dur
+            print(f"Anthropic cache marker duration is now {dur}")
+        else:
+            print(f"Unknown cache type '{type}'")
+            return False
+        return True
+
     def set_think_blocks_to_preserve(self, block_num: int) -> bool:
         if block_num < 0:
             print("Number of blocks to preserve must be a natural numbers.")
@@ -256,30 +329,6 @@ class RuntimeConfig:
         self.set_prefill_mode(self.assistant_prefill_mode)
         self.resolve_thinking()
         print(f"=== Switching to {self.model} complete ===")
-
-
-    def set_cache_manual_msg(self, value: int) -> bool:
-        if value < 0:
-            print("cache_manual_msg must be a natural number.")
-            return False
-        cfg.cache_manual_msg = value
-        if cfg.cache_manual_msg == 0:
-            print("Manual cache marker disabled.")
-        else:
-            print(f"Manual cache marker targets {cfg.cache_manual_msg} message(s) from the start.")
-        return True
-
-
-    def set_cache_auto_msg(self, value: int) -> bool:
-        if value < 0:
-            print("cache_auto_msg must be a natural number.")
-            return False
-        cfg.cache_auto_msg = value
-        if cfg.cache_auto_msg == 0:
-            print("Auto cache marker disabled.")
-        else:
-            print(f"Auto cache marker targets {cfg.cache_auto_msg} message(s) from the end.")
-        return True
 
 
     def find_cfg(self, models: List[Dict[str, Any]]) -> str:
@@ -598,7 +647,7 @@ def admin_cli_loop() -> None:
         try:
             if cmd in {"c", "cache"}:
                 if parts_l < 2:
-                    print(CLI_CMD_CACHE_INFO)
+                    cfg.print_cache_status()
                     continue
                 arg1 = parts[1].lower()
                 if arg1 in DISABLE_VALUES : cfg.cache_en = False; continue
@@ -608,33 +657,14 @@ def admin_cli_loop() -> None:
                     print(CLI_CMD_CACHE_INFO)
                     continue
                 arg2 = parts[2].lower()
-                if arg1 in {"m", "man", "manual"}:
-                    if (arg2 == "1h"          ) : cfg.cache_manual_ttl = "1h"; continue
-                    if (arg2 == "5m"          ) : cfg.cache_manual_ttl = "5m"; continue
-                    if (arg2 in DISABLE_VALUES) : cfg.set_cache_manual_msg(0); continue
-                    try: msg_id = int(arg2)
-                    except Exception: pass
-                    else:
-                        cfg.set_cache_manual_msg(msg_id);
-                        continue
-                    print(CLI_CMD_CACHE_INFO)
+                if arg2 in {"5m", "1h"}   : cfg.set_cache_dur(arg1, arg2); continue
+                if arg2 in DISABLE_VALUES : cfg.set_cache_msg_num(arg1, 0); continue
+                if arg2 in ENABLE_VALUES  : cfg.set_cache_msg_num(arg1, 1); continue
+                try: msg_num = int(arg2)
+                except Exception: pass
+                else:
+                    cfg.set_cache_msg_num(arg1, msg_num)
                     continue
-                if arg1 in {"a", "auto"}:
-                    if (arg2 == "1h"          ) : cfg.cache_auto_ttl = "1h"; continue
-                    if (arg2 == "5m"          ) : cfg.cache_auto_ttl = "5m"; continue
-                    if (arg2 in DISABLE_VALUES) : cfg.set_cache_auto_msg(0); continue
-                    try: msg_id = int(arg2)
-                    except Exception: pass
-                    else:
-                        cfg.set_cache_auto_msg(msg_id);
-                        continue
-                    print(CLI_CMD_CACHE_INFO)
-                    continue
-                if arg1 in {"s", "sys", "system"} :
-                    if (arg2 in DISABLE_VALUES) : cfg.cache_system     = False; continue
-                    if (arg2 in ENABLE_VALUES ) : cfg.cache_system     = True ; continue
-                    if (arg2 == "1h"          ) : cfg.cache_system_ttl = "1h" ; continue
-                    if (arg2 == "5m"          ) : cfg.cache_system_ttl = "5m" ; continue
                 print(CLI_CMD_CACHE_INFO)
                 continue
 
