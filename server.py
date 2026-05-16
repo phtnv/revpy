@@ -703,19 +703,21 @@ def admin_cli_loop() -> None:
                     print(CLI_CMD_THINK_INFO)
                     continue
                 arg2 = parts[2].lower()
-                if arg1 == {"e", "effort"}:
+                if arg1 in {"e", "effort"}:
                     cfg.set_think_effort(arg2)
                     continue
-                if arg1 == {"b", "budget"}:
+                if arg1 in {"b", "budget"}:
                     try: budget = int(arg2)
                     except Exception: pass
                     else:
                         cfg.set_think_budget(budget)
-                if arg1 == {"p", "preserve"}:
+                        continue
+                if arg1 in {"p", "preserve"}:
                     try: preserve_blocks = int(arg2)
                     except Exception: pass
                     else:
                         cfg.set_think_blocks_to_preserve(preserve_blocks)
+                        continue
                 print(CLI_CMD_THINK_INFO)
                 continue
 
