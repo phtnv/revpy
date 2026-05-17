@@ -225,7 +225,7 @@ class RuntimeConfig:
         elif type in {"a", "auto"}:
             self.cache_auto_msg = msg_num
             if msg_num == 0 : print("Auto cache marker disabled.")
-            else            : print(f"Auto cache marker targets {cfg.cache_manual_msg} message(s) from the start.")
+            else            : print(f"Auto cache marker targets {cfg.cache_auto_msg} message(s) from the start.")
         elif type in {"s", "sys", "system"}:
             self.cache_system = msg_num > 0
             if msg_num <= 0 : print("System message caching disabled.")
