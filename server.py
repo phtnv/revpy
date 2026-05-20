@@ -133,13 +133,31 @@ class RuntimeConfig:
         # 0 disables preservation, N preserves the last N assistant messages, and inf/all preserves every assistant message.
         self.preserve_thinking_blocks = getenv_preserve_thinking_blocks("PRESERVE_THINKING_BLOCKS", "0")
 
-        # Cost tracking.
-        # Values are USD per 1 million tokens. Defaults are Anthropic's Claude Sonnet 4.5 API prices.
-        self.input_token_cost_usd    = getenv_float("INPUT_TOKEN_COST_USD"   ,  3.00)
-        self.output_token_cost_usd   = getenv_float("OUTPUT_TOKEN_COST_USD"  , 15.00)
-        self.cache_write_5m_cost_usd = getenv_float("CACHE_WRITE_5M_COST_USD",  3.75)
-        self.cache_write_1h_cost_usd = getenv_float("CACHE_WRITE_1H_COST_USD",  6.00)
-        self.cache_read_cost_usd     = getenv_float("CACHE_READ_COST_USD"    ,  0.30)
+        # Cost tracking. Values are USD per 1 million tokens.
+        self.cost_table: Dict[str, Dict[str, float]] = {
+            "sonnet": {
+                "input"          : getenv_float("SONNET_INPUT_TOKEN_COST_USD"   ,  3.00),
+                "output"         : getenv_float("SONNET_OUTPUT_TOKEN_COST_USD"  , 15.00),
+                "cache_write_5m" : getenv_float("SONNET_CACHE_WRITE_5M_COST_USD",  3.75),
+                "cache_write_1h" : getenv_float("SONNET_CACHE_WRITE_1H_COST_USD",  6.00),
+                "cache_read"     : getenv_float("SONNET_CACHE_READ_COST_USD"    ,  0.30),
+            },
+            "haiku": {
+                "input"          : getenv_float("HAIKU_INPUT_TOKEN_COST_USD"   ,  1.00),
+                "output"         : getenv_float("HAIKU_OUTPUT_TOKEN_COST_USD"  ,  5.00),
+                "cache_write_5m" : getenv_float("HAIKU_CACHE_WRITE_5M_COST_USD",  1.25),
+                "cache_write_1h" : getenv_float("HAIKU_CACHE_WRITE_1H_COST_USD",  2.00),
+                "cache_read"     : getenv_float("HAIKU_CACHE_READ_COST_USD"    ,  0.10),
+            },
+            "opus": {
+                "input"          : getenv_float("OPUS_INPUT_TOKEN_COST_USD"   , 15.00),
+                "output"         : getenv_float("OPUS_OUTPUT_TOKEN_COST_USD"  , 75.00),
+                "cache_write_5m" : getenv_float("OPUS_CACHE_WRITE_5M_COST_USD", 18.75),
+                "cache_write_1h" : getenv_float("OPUS_CACHE_WRITE_1H_COST_USD", 30.00),
+                "cache_read"     : getenv_float("OPUS_CACHE_READ_COST_USD"    ,  1.50),
+            },
+        }
+        self.sync_active_costs()
 
         # Prompt caching.
         # Anthropic supports automatic top-level caching and explicit block-level caching.
@@ -161,6 +179,20 @@ class RuntimeConfig:
 
         self.error_log_path = os.getenv("ERROR_LOG_PATH", "claude_error_log.txt")
         self.model_list_timeout_seconds = getenv_float("MODEL_LIST_TIMEOUT_SECONDS", 10.0)
+
+
+    def sync_active_costs(self) -> None:
+        model_l = str(self.model or "").lower()
+        if   "haiku" in model_l : self.model_cost_family = "haiku"
+        elif "opus"  in model_l : self.model_cost_family = "opus"
+        else                    : self.model_cost_family = "sonnet"
+
+        costs = self.cost_table[self.model_cost_family]
+        self.input_token_cost_usd    = costs["input"]
+        self.output_token_cost_usd   = costs["output"]
+        self.cache_write_5m_cost_usd = costs["cache_write_5m"]
+        self.cache_write_1h_cost_usd = costs["cache_write_1h"]
+        self.cache_read_cost_usd     = costs["cache_read"]
 
 
     def set_prefill_mode(self, mode: str) -> None:
@@ -323,6 +355,7 @@ class RuntimeConfig:
         version_str      = re.search(r'\d+(?:\.\d+)+', display_name_str)
         if version_str is not None : self.version = Version(version_str.group())
         else                       : self.version = Version("0.0")
+        self.sync_active_costs()
         # Validate the configured prefill mode against the selected model.
         # Do not call set_prefill() here: that would overwrite ASSISTANT_PREFILL
         # with the mode string (for example "none", "assistant", or "instruction").
@@ -350,6 +383,12 @@ class RuntimeConfig:
         print(f"host                   = {self.host} (restart required to change)")
         print(f"port                   = {self.port} (restart required to change)")
         print(f"model                  = {self.model}")
+        print(f"model_cost_family      = {self.model_cost_family}")
+        print(f"  input_token_cost     = {self.input_token_cost_usd}")
+        print(f"  output_token_cost    = {self.output_token_cost_usd}")
+        print(f"  cache_write_5m_cost  = {self.cache_write_5m_cost_usd}")
+        print(f"  cache_write_1h_cost  = {self.cache_write_1h_cost_usd}")
+        print(f"  cache_read_cost      = {self.cache_read_cost_usd}")
         print(f"require_proxy_key      = {self.require_proxy_key}")
         print(f"allow_key_passthrough  = {self.allow_key_passthrough}")
         print(f"debug_log              = {self.debug_log}")
@@ -1727,6 +1766,7 @@ def running():
                 "cache_auto_msg"   : cfg.cache_auto_msg,
             },
             "cost_tracking" : {
+                "model_cost_family"                                : cfg.model_cost_family,
                 "input_token_cost_usd"                             : cfg.input_token_cost_usd,
                 "output_token_cost_usd"                            : cfg.output_token_cost_usd,
                 "cache_write_5m_cost_usd"                          : cfg.cache_write_5m_cost_usd,
