@@ -99,6 +99,7 @@ class RuntimeConfig:
 
         self.debug_log = getenv_bool("DEBUG_LOG", True)
         self.auto_trim = getenv_bool("AUTO_TRIM", True)
+        self.summary_blocks_enabled = getenv_bool("SUMMARY_BLOCKS_ENABLED", True)
 
         # Leave empty by default. The original notebook used a strong assistant prefill.
         # For safety and reliability, keep this blank unless you have a benign reason to use it.
@@ -393,6 +394,7 @@ class RuntimeConfig:
         print(f"allow_key_passthrough  = {self.allow_key_passthrough}")
         print(f"debug_log              = {self.debug_log}")
         print(f"auto_trim              = {self.auto_trim}")
+        print(f"summary_blocks_enabled = {self.summary_blocks_enabled}")
         print(f"assistant_prefill      = {'set' if self.assistant_prefill.strip() else 'empty'}")
         print(f"assistant_prefill_mode = {self.assistant_prefill_mode}")
         print(f"temperature_override   = {self.temperature_override}")
@@ -1014,6 +1016,231 @@ def content_to_plain_text(content: Any) -> str:
 
 
 # =============================================================================
+# Summary block replacement
+# =============================================================================
+SUMMARY_BLOCK_ANY_RE = re.compile(r"<summary_block_(?:beg|end)\b", re.IGNORECASE)
+SUMMARY_BLOCK_BEG_RE = re.compile(r"<summary_block_beg\b(?P<attrs>[^>]*)>", re.IGNORECASE)
+SUMMARY_BLOCK_END_RE = re.compile(
+    r"<summary_block_end\b(?P<attrs>[^>]*)>(?P<body>.*?)</summary_block_end\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+SUMMARY_BLOCK_ATTR_RE = re.compile(r"""([A-Za-z_][A-Za-z0-9_:-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
+SUMMARY_BLOCK_TAG_VALUE_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
+SUMMARY_BLOCK_ROLES = {"assistant", "user"}
+
+
+def warn_summary_block(message: str) -> None:
+    print(f"WARNING: Summary block ignored. {message}")
+
+
+def parse_summary_block_attrs(raw_attrs: str) -> Dict[str, str]:
+    attrs: Dict[str, str] = {}
+    for match in SUMMARY_BLOCK_ATTR_RE.finditer(raw_attrs or ""):
+        value = match.group(2) if match.group(2) is not None else match.group(3)
+        attrs[match.group(1).lower()] = value
+    return attrs
+
+
+def parse_summary_block_tag(attrs: Dict[str, str], msg_num: int, kind: str) -> Optional[str]:
+    tag = attrs.get("tag", "").strip()
+    if not tag:
+        warn_summary_block(f"Message {msg_num} has a {kind} tag without tag=\"...\".")
+        return None
+    if not SUMMARY_BLOCK_TAG_VALUE_RE.match(tag):
+        warn_summary_block(f"Message {msg_num} has invalid summary tag {tag!r}.")
+        return None
+    if kind == "begin" and tag.lower() == "all":
+        warn_summary_block(f"Message {msg_num} uses reserved summary tag \"all\" as a begin tag.")
+        return None
+    return tag
+
+
+def parse_summary_block_role(attrs: Dict[str, str], msg_num: int) -> Optional[str]:
+    role = attrs.get("role", "assistant").strip().lower()
+    if not role:
+        role = "assistant"
+    if role not in SUMMARY_BLOCK_ROLES:
+        warn_summary_block(f"Message {msg_num} has invalid summary role {role!r}.")
+        return None
+    return role
+
+
+def extract_summary_block_control(content: str, msg_num: int) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """
+    Extracts at most one summary control tag from a message.
+
+    The containing message is always discarded when a summary tag is present.
+    Normal text outside the control tag is intentionally ignored.
+    """
+    text = content or ""
+    if not SUMMARY_BLOCK_ANY_RE.search(text):
+        return None, False
+
+    end_matches = list(SUMMARY_BLOCK_END_RE.finditer(text))
+    if len(end_matches) > 1:
+        warn_summary_block(f"Message {msg_num} contains multiple summary end tags.")
+        return None, True
+    if len(end_matches) == 1:
+        match = end_matches[0]
+        outside = text[:match.start()] + text[match.end():]
+        if SUMMARY_BLOCK_ANY_RE.search(outside):
+            warn_summary_block(f"Message {msg_num} contains multiple or malformed summary control tags.")
+            return None, True
+
+        attrs = parse_summary_block_attrs(match.group("attrs"))
+        tag = parse_summary_block_tag(attrs, msg_num, "end")
+        role = parse_summary_block_role(attrs, msg_num)
+        if tag is None or role is None:
+            return None, True
+
+        return {
+            "kind": "end",
+            "tag": tag,
+            "role": role,
+            "text": match.group("body").strip(),
+        }, True
+
+    begin_matches = list(SUMMARY_BLOCK_BEG_RE.finditer(text))
+    if len(begin_matches) > 1:
+        warn_summary_block(f"Message {msg_num} contains multiple summary begin tags.")
+        return None, True
+    if len(begin_matches) == 1:
+        match = begin_matches[0]
+        outside = text[:match.start()] + text[match.end():]
+        if SUMMARY_BLOCK_ANY_RE.search(outside):
+            warn_summary_block(f"Message {msg_num} contains multiple or malformed summary control tags.")
+            return None, True
+
+        attrs = parse_summary_block_attrs(match.group("attrs"))
+        tag = parse_summary_block_tag(attrs, msg_num, "begin")
+        if tag is None:
+            return None, True
+
+        return {
+            "kind": "begin",
+            "tag": tag,
+        }, True
+
+    warn_summary_block(f"Message {msg_num} contains a malformed summary control tag.")
+    return None, True
+
+
+def build_summary_groups(summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not summaries:
+        return []
+
+    intervals = sorted(summaries, key=lambda item: (item["start"], item["end"], item["ordinal"]))
+    groups: List[Dict[str, Any]] = []
+
+    for summary in intervals:
+        if not groups or summary["start"] > groups[-1]["end"] + 1:
+            groups.append({
+                "start": summary["start"],
+                "end": summary["end"],
+                "summaries": [summary],
+            })
+            continue
+
+        groups[-1]["end"] = max(groups[-1]["end"], summary["end"])
+        groups[-1]["summaries"].append(summary)
+
+    for group in groups:
+        group["summaries"].sort(key=lambda item: (item["end"], item["start"], item["ordinal"]))
+
+    return groups
+
+
+def apply_summary_blocks(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Removes summary control messages and optionally collapses covered ranges.
+
+    Valid summary ranges are computed against the original normalized chat list.
+    Overlapping ranges become one removed span, with their summaries inserted in
+    closing-message order.
+    """
+    if not messages:
+        return messages
+
+    open_starts: Dict[str, int] = {}
+    control_indices = set()
+    summaries: List[Dict[str, Any]] = []
+
+    for idx, msg in enumerate(messages):
+        control, should_discard = extract_summary_block_control(msg.get("content", ""), idx + 1)
+        if should_discard:
+            control_indices.add(idx)
+        if control is None:
+            continue
+
+        tag = control["tag"]
+        if control["kind"] == "begin":
+            if tag in open_starts:
+                warn_summary_block(f"Message {idx + 1} starts duplicate active summary tag {tag!r}.")
+                continue
+            open_starts[tag] = idx
+            continue
+
+        if tag.lower() == "all":
+            summaries.append({
+                "start": 0,
+                "end": idx,
+                "role": control["role"],
+                "text": control["text"],
+                "tag": tag,
+                "ordinal": len(summaries),
+            })
+            continue
+
+        start_idx = open_starts.pop(tag, None)
+        if start_idx is None:
+            warn_summary_block(f"Message {idx + 1} closes summary tag {tag!r} without a matching begin tag.")
+            continue
+
+        summaries.append({
+            "start": start_idx,
+            "end": idx,
+            "role": control["role"],
+            "text": control["text"],
+            "tag": tag,
+            "ordinal": len(summaries),
+        })
+
+    for tag, start_idx in sorted(open_starts.items(), key=lambda item: item[1]):
+        warn_summary_block(f"Message {start_idx + 1} starts summary tag {tag!r} without a matching end tag.")
+
+    if not cfg.summary_blocks_enabled:
+        return [msg for idx, msg in enumerate(messages) if idx not in control_indices]
+
+    groups = build_summary_groups(summaries)
+    if not groups:
+        return [msg for idx, msg in enumerate(messages) if idx not in control_indices]
+
+    result: List[Dict[str, Any]] = []
+    idx = 0
+
+    for group in groups:
+        while idx < group["start"]:
+            if idx not in control_indices:
+                result.append(messages[idx])
+            idx += 1
+
+        for summary in group["summaries"]:
+            result.append({
+                "role": summary["role"],
+                "content": summary["text"],
+            })
+
+        idx = group["end"] + 1
+
+    while idx < len(messages):
+        if idx not in control_indices:
+            result.append(messages[idx])
+        idx += 1
+
+    return result
+
+
+# =============================================================================
 # Anthropic thinking block round-tripping
 # =============================================================================
 # Plain-text envelope lets Janitor carry signed Anthropic thinking blocks across turns.
@@ -1496,6 +1723,8 @@ def split_system_and_messages(raw_messages: Any) -> Tuple[Optional[str], List[Di
         if role == "assistant" and thinking_preservation_enabled() and thinking_blocks:
             msg_obj["anthropic_thinking_blocks"] = thinking_blocks
         chat_messages.append(msg_obj)
+
+    chat_messages = apply_summary_blocks(chat_messages)
 
     if thinking_preservation_enabled():
         # Mark only the last N assistant messages for signed-block rehydration.
