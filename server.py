@@ -241,7 +241,7 @@ class RuntimeConfig:
             print("Manual cache disabled.")
         else:
             print(f"Manual cache marker at message {self.cache_manual_msg} from start (1 is the first). Duration {self.cache_manual_ttl}.")
-        if self.cache_manual_msg <= 0:
+        if self.cache_auto_msg <= 0:
             print("Auto cache disabled.")
         else:
             print(f"Auto cache marker at message {self.cache_auto_msg} from end (1 is the last user message). Duration {self.cache_auto_ttl}.")
