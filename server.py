@@ -83,6 +83,26 @@ def deep_get(obj: Any, path: str, default: Any = None) -> Any:
 
     return cur
 
+def extract_claude_version(value: Any) -> Version:
+    """
+    Extracts a Claude major.minor model version from either display names like
+    "Claude Opus 4.8" or ids like "claude-opus-4-8-YYYYMMDD".
+    """
+    text = str(value or "")
+
+    dot_match = re.search(r"(?<!\d)(\d+(?:\.\d+)+)(?!\d)", text)
+    if dot_match is not None:
+        try: return Version(dot_match.group(1))
+        except Exception: pass
+
+    hyphen_match = re.search(r"(?<!\d)(\d+)[_-](\d+)(?!\d)", text)
+    if hyphen_match is not None:
+        try: return Version(f"{hyphen_match.group(1)}.{hyphen_match.group(2)}")
+        except Exception: pass
+
+    return Version("0.0")
+
+
 PREFILL_MODES = {"none", "assistant", "instruction"}
 class RuntimeConfig:
 
@@ -91,6 +111,8 @@ class RuntimeConfig:
         self.port = getenv_int("PORT", 5001)
 
         self.model = os.getenv("MODEL", "claude-sonnet-4-5-20250929")
+        self.version = extract_claude_version(self.model)
+        self.model_info = {}
 
         self.anthropic_api_key     = os.getenv("ANTHROPIC_API_KEY", "").strip()
         self.proxy_key             = os.getenv("PROXY_KEY", "").strip()
@@ -164,13 +186,14 @@ class RuntimeConfig:
         # Anthropic supports automatic top-level caching and explicit block-level caching.
         # This script uses explicit block-level caching because assistant prefill can otherwise
         # become the final cacheable block. Up to four explicit markers are used:
-        #   1-2  system / lorebook blocks (when split_lorebook=true)
+        #   1-2  system / lorebook blocks (when split_lorebook=true and lorebook_at_end=false)
         #    3   manual first-N-message breakpoint
         #    4   automatic end-relative breakpoint before optional prefill
         self.cache_en             = getenv_bool("CACHE_EN", False)
         self.cache_system         = getenv_bool("CACHE_SYSTEM", True)
         self.cache_system_ttl     = getenv_cache_ttl("CACHE_SYSTEM_TTL", "1h")
         self.split_lorebook       = getenv_bool("SPLIT_LOREBOOK", True)
+        self.lorebook_at_end      = getenv_bool("LOREBOOK_AT_END", False)
         self.cache_manual_ttl     = getenv_cache_ttl("CACHE_MANUAL_TTL", "1h")
         self.cache_manual_msg     = max(0, getenv_int("CACHE_MANUAL_MSG", 0))
         self.cache_auto_ttl       = getenv_cache_ttl("CACHE_AUTO_TTL", "1h")
@@ -234,7 +257,10 @@ class RuntimeConfig:
         else:
             print(f"System cache enabled. Duration {self.cache_system_ttl}.", end='')
             if self.split_lorebook:
-                print(" Lorebook split.")
+                if self.lorebook_at_end:
+                    print(" Lorebook split; lorebook moves to message end.")
+                else:
+                    print(" Lorebook split.")
             else:
                 print()
         if self.cache_manual_msg <= 0:
@@ -272,8 +298,8 @@ class RuntimeConfig:
             return False
         cache_blocks_active : int = 0
         if self.cache_system:
-            if self.split_lorebook : cache_blocks_active += 2
-            else                   : cache_blocks_active += 1
+            if self.split_lorebook and not self.lorebook_at_end : cache_blocks_active += 2
+            else                                                : cache_blocks_active += 1
         if self.cache_auto_msg       : cache_blocks_active += 1
         if self.cache_manual_msg     : cache_blocks_active += 1
         if self.cache_anthropic_auto : cache_blocks_active += 1
@@ -353,9 +379,9 @@ class RuntimeConfig:
         print(f"=== Switching to {self.model} ===")
         self.model_info  = self.info
         display_name_str = deep_get(self.info, "display_name")
-        version_str      = re.search(r'\d+(?:\.\d+)+', display_name_str)
-        if version_str is not None : self.version = Version(version_str.group())
-        else                       : self.version = Version("0.0")
+        self.version     = extract_claude_version(display_name_str)
+        if self.version == Version("0.0"):
+            self.version = extract_claude_version(self.model)
         self.sync_active_costs()
         # Validate the configured prefill mode against the selected model.
         # Do not call set_prefill() here: that would overwrite ASSISTANT_PREFILL
@@ -406,6 +432,7 @@ class RuntimeConfig:
         print(f"cache_system           = {self.cache_system}")
         print(f"cache_system_ttl       = {self.cache_system_ttl}")
         print(f"split_lorebook         = {self.split_lorebook}")
+        print(f"lorebook_at_end        = {self.lorebook_at_end}")
         print(f"cache_manual_ttl       = {self.cache_manual_ttl}")
         print(f"cache_manual_msg       = {self.cache_manual_msg}")
         print(f"cache_auto_ttl         = {self.cache_auto_ttl}")
@@ -1346,112 +1373,105 @@ def openai_stream_chunk(model_used: str, delta: Dict[str, Any], finish_reason: O
 
 PERSONA_END_RE = re.compile(r"</[^<>]*\bPersona>", re.IGNORECASE)
 
-def split_system_prompt_into_text_blocks(system_prompt: str) -> List[Dict[str, str]]:
+
+def format_system_for_claude(system_prompt: Optional[str]) -> Tuple[Optional[Any], Optional[str]]:
     """
-    For more efficient caching, we split the character definition into the core definition (which never changes),
-    and the lorebook / user script additions (which can change in one chat). That way we never have to re-cache
-    the core definition.
+    Formats the top-level Anthropic system prompt and optionally extracts the dynamic lorebook suffix.
+
+    When SPLIT_LOREBOOK=true, the prompt is split into:
+        1. stable core definition
+        2. dynamic lorebook / user-script suffix
 
     Split priority:
         1. After </summary>
-        2. After </example_dialogs>.
-        3. After </Scenario>.
-        4. After the last </* Persona> marker.
-        5. Otherwise keep the whole system prompt as one block.
+        2. After </example_dialogs>
+        3. After </Scenario>
+        4. After the last </* Persona> marker
+        5. Otherwise keep the whole system prompt as one block
 
-    Anything after it becomes the second block, usually lorebook / long term memory.
-    Should the split be performed incorrectly (due to user scripts doing something 'interesting'),
-    the definition will still be sent correctly. Just the caching efficiency will degrade.
-    """
-    if not system_prompt or not system_prompt.strip():
-        return []
+    When LOREBOOK_AT_END=true, the suffix is returned as plain text instead of being kept as a
+    top-level system block. That moved suffix deliberately does not receive the old system/lorebook
+    cache marker; it is handled later as an ordinary end-of-conversation item.
 
-    text = system_prompt.strip()
-
-    split_marker = "</summary>"
-    split_idx    = text.find(split_marker)
-    if (split_idx == -1):
-        split_marker = "</example_dialogs>"
-        split_idx    = text.find(split_marker)
-    if (split_idx == -1):
-        split_marker = "</Scenario>"
-        split_idx    = text.find(split_marker)
-    if (split_idx == -1):
-        persona_matches = list(PERSONA_END_RE.finditer(text))
-        if persona_matches : split_at = persona_matches[-1].end()
-        else               : split_at = -1
-    else:
-        split_at = split_idx + len(split_marker)
-
-    if split_at == -1 or split_at >= len(text):
-        return [{"type": "text", "text": text}]
-
-    before = text[:split_at].rstrip()
-    after  = text[split_at:].strip()
-
-    blocks = [{"type": "text", "text": before}]
-
-    if after:
-        # Keep a clean visual/semantic separator between Scenario/Persona and suffix.
-        blocks.append({"type": "text", "text": "\n\n" + after})
-
-    return blocks
-
-
-def format_system_for_claude(system_prompt: Optional[str]) -> Optional[Any]:
-    """
-    Optionally cache the system prompt separately.
-
-    When SPLIT_LOREBOOK=true, the system prompt is split into core definition and lorebook/suffix blocks.
-    Each non-empty system block receives its own system cache marker when CACHE_SYSTEM=true.
+    Returns:
+        - formatted_system: top-level Anthropic system blocks, or None
+        - lorebook_at_end_text: moved lorebook/suffix text, or None
     """
     if system_prompt is None:
-        return None
+        return None, None
+
+    text = system_prompt.strip()
+    if not text:
+        return None, None
+
+    blocks: List[Dict[str, Any]] = []
+    lorebook_at_end_text: Optional[str] = None
 
     if cfg.split_lorebook:
-        blocks = split_system_prompt_into_text_blocks(system_prompt)
-    else:
-        stripped = system_prompt.strip()
-        blocks = [{"type": "text", "text": stripped}] if stripped else []
+        split_at = -1
 
-    if not blocks:
-        return None
+        for split_marker in ("</summary>", "</example_dialogs>", "</Scenario>"):
+            split_idx = text.find(split_marker)
+            if split_idx != -1:
+                split_at = split_idx + len(split_marker)
+                break
+
+        if split_at == -1:
+            persona_matches = list(PERSONA_END_RE.finditer(text))
+            if persona_matches:
+                split_at = persona_matches[-1].end()
+
+        if split_at == -1 or split_at >= len(text):
+            blocks.append({"type": "text", "text": text})
+        else:
+            before = text[:split_at].rstrip()
+            after  = text[split_at:].strip()
+
+            if before:
+                blocks.append({"type": "text", "text": before})
+
+            if after:
+                if cfg.lorebook_at_end:
+                    lorebook_at_end_text = after
+                else:
+                    # Keep a clean visual/semantic separator between Scenario/Persona and suffix.
+                    blocks.append({"type": "text", "text": "\n\n" + after})
+    else:
+        blocks.append({"type": "text", "text": text})
 
     formatted_system: List[Dict[str, Any]] = []
 
     for block in blocks:
         new_block: Dict[str, Any] = dict(block)
-        if (cfg.cache_en and cfg.cache_system and new_block.get("type") == "text" and new_block.get("text", "").strip()):
+        if cfg.cache_en and cfg.cache_system and new_block.get("text", "").strip():
             new_block["cache_control"] = make_cache_control(cfg.cache_system_ttl)
         formatted_system.append(new_block)
 
-    return formatted_system
+    return (formatted_system if formatted_system else None), (lorebook_at_end_text if lorebook_at_end_text else None)
 
 
-def format_to_claude_messages(mlist: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def format_to_claude_messages(mlist: List[Dict[str, Any]], lorebook_at_end_text: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Converts OpenAI-style chat messages to Anthropic Messages format.
 
-    Consecutive same-role messages are merged because Anthropic expects
-    alternating user/assistant turns.
+    Consecutive same-role user/assistant messages are merged because Anthropic expects alternating user/assistant turns.
+    Internal mid-conversation system messages are inserted only for Claude 4.8+ when LOREBOOK_AT_END moves
+    the split lorebook out of the top-level system prompt.
 
-    Manual caching marks the configured first-N-message prefix. Automatic caching marks
-    an end-relative conversation point before ASSISTANT_PREFILL is applied, so the prefill
-    is never accidentally included in that breakpoint.
+    Manual caching marks the configured first-N-message prefix. Automatic caching marks an
+    end-relative conversation point after any lorebook relocation and before optional prefill,
+    so moved lorebook content is treated like any other end-of-conversation item.
     """
-
-    manual_cache_target_index = 0
-    if cfg.cache_en and cfg.cache_manual_msg > 0 and mlist:
-        manual_cache_target_index = min(cfg.cache_manual_msg, len(mlist))
-
-    auto_cache_target_index = 0
-    if cfg.cache_en and cfg.cache_auto_msg > 0 and mlist:
-        auto_cache_target_index = max(1, len(mlist) - cfg.cache_auto_msg + 1)
 
     formatted: List[Dict[str, Any]] = [{"role": "user", "content": "<OOC>\nBegin the scenario.\n</OOC>"}]
     old_role  = "user"
 
-    for idx, msg in enumerate(mlist, start=1):
+    # Maps each incoming OpenAI-style chat message index to the Anthropic message index
+    # that contains it after same-role merging. Cache markers are applied after the final
+    # message shape is known instead of checking targets on every loop iteration.
+    incoming_to_formatted_index: List[int] = []
+
+    for msg in mlist:
         incoming_role = msg.get("role", "user")
         content       = msg.get("content", "")
 
@@ -1485,14 +1505,26 @@ def format_to_claude_messages(mlist: List[Dict[str, Any]]) -> List[Dict[str, Any
             formatted.append({"role" : claude_role, "content" : content})
 
         old_role = claude_role
+        incoming_to_formatted_index.append(len(formatted) - 1)
 
-        # Manual marker: cache the first N incoming chat messages, preserving the old behavior.
-        if idx == manual_cache_target_index:
-            formatted[-1]["content"] = add_cache_control_to_content(formatted[-1]["content"], cfg.cache_manual_ttl)
+    if lorebook_at_end_text:
+        if cfg.version >= Version("4.8"):
+            formatted.append({"role": "system", "content": lorebook_at_end_text.strip()})
+        else:
+            scenario_update = f"\n<OOC>\nScenario update:\n\n{lorebook_at_end_text.strip()}\n</OOC>"
+            for i in range(len(formatted) - 1, -1, -1):
+                if formatted[i].get("role") == "user":
+                    formatted[i]["content"] = append_text_to_content(formatted[i].get("content", ""), scenario_update)
+                    break
 
-        # Auto marker: count backwards from the final incoming chat message, before optional prefill is added.
-        if idx == auto_cache_target_index:
-            formatted[-1]["content"] = add_cache_control_to_content(formatted[-1]["content"], cfg.cache_auto_ttl)
+    if cfg.cache_en and cfg.cache_manual_msg > 0 and incoming_to_formatted_index:
+        target_incoming_index = min(cfg.cache_manual_msg, len(incoming_to_formatted_index)) - 1
+        target_index = incoming_to_formatted_index[target_incoming_index]
+        formatted[target_index]["content"] = add_cache_control_to_content(formatted[target_index].get("content", ""), cfg.cache_manual_ttl)
+
+    if cfg.cache_en and cfg.cache_auto_msg > 0 and formatted:
+        target_index = max(0, len(formatted) - cfg.cache_auto_msg)
+        formatted[target_index]["content"] = add_cache_control_to_content(formatted[target_index].get("content", ""), cfg.cache_auto_ttl)
 
     # Optional Claude prefill.
     # assistant mode preserves the original assistant-message/prefill behavior.
@@ -1505,7 +1537,6 @@ def format_to_claude_messages(mlist: List[Dict[str, Any]]) -> List[Dict[str, Any
             else                               : formatted[-1]["content"] = append_text_to_content(formatted[-1]["content"], cfg.assistant_prefill)
 
     return formatted
-
 
 def trim_to_end_sentence(input_str: str, include_newline: bool = False) -> str:
     punctuation = set([".", "!", "?", "*", '"', ")", "}", "`", "]", "$", "。", "！", "？", "”", "）", "】", "’", "」"])
@@ -1758,7 +1789,8 @@ def build_claude_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
     if chat_messages and chat_messages[0].get("role") == "user" and chat_messages[0].get("content", "").strip() == ".":
         chat_messages = chat_messages[1:]
 
-    formatted_messages = format_to_claude_messages(chat_messages)
+    formatted_system, lorebook_at_end_text = format_system_for_claude(system_prompt)
+    formatted_messages = format_to_claude_messages(chat_messages, lorebook_at_end_text)
 
     kwargs: Dict[str, Any] = {
         "model"      : cfg.model,
@@ -1780,7 +1812,6 @@ def build_claude_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             kwargs["thinking"] = { "type": "enabled", "budget_tokens": cfg.thinking_budget }
 
-    formatted_system = format_system_for_claude(system_prompt)
     if formatted_system is not None:
         kwargs["system"] = formatted_system
     kwargs["messages"] = formatted_messages
@@ -1993,6 +2024,7 @@ def running():
                 "cache_system"     : cfg.cache_system,
                 "cache_system_ttl" : cfg.cache_system_ttl,
                 "split_lorebook"   : cfg.split_lorebook,
+                "lorebook_at_end"  : cfg.lorebook_at_end,
                 "cache_manual_ttl" : cfg.cache_manual_ttl,
                 "cache_manual_msg" : cfg.cache_manual_msg,
                 "cache_auto_ttl"   : cfg.cache_auto_ttl,
