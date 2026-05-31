@@ -1353,10 +1353,11 @@ def split_system_prompt_into_text_blocks(system_prompt: str) -> List[Dict[str, s
     the core definition.
 
     Split priority:
-        1. After </example_dialogs>.
-        1. After </Scenario>.
-        2. After the last </* Persona> marker.
-        3. Otherwise keep the whole system prompt as one block.
+        1. After </summary>
+        2. After </example_dialogs>.
+        3. After </Scenario>.
+        4. After the last </* Persona> marker.
+        5. Otherwise keep the whole system prompt as one block.
 
     Anything after it becomes the second block, usually lorebook / long term memory.
     Should the split be performed incorrectly (due to user scripts doing something 'interesting'),
@@ -1367,8 +1368,11 @@ def split_system_prompt_into_text_blocks(system_prompt: str) -> List[Dict[str, s
 
     text = system_prompt.strip()
 
-    split_marker = "</example_dialogs>"
+    split_marker = "</summary>"
     split_idx    = text.find(split_marker)
+    if (split_idx == -1):
+        split_marker = "</example_dialogs>"
+        split_idx    = text.find(split_marker)
     if (split_idx == -1):
         split_marker = "</Scenario>"
         split_idx    = text.find(split_marker)
