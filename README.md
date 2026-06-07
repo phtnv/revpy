@@ -241,10 +241,16 @@ I was born at a very young age...
 ```
 In that case a `summary_block_beg` block is not necessary.
 
-The proxy should print a warning if you made mistakes with your tags somewhere (forgot to close one, mistyped the tag, etc...).
+By default, the summary is inserted as an `assistant` chat message. You can also set `role="user"` on any end tag, or set `role="system"` on the special `all` tag:
+```xml
+<summary_block_end tag="all" role="system">
+I was born at a very young age...
+</summary_block_end>
+```
+`role="system"` is only valid with `tag="all"`. It inserts the summary into the system fields (after the core definitions + lorebook) instead of the message.
 
-While these tags can be placed in user messages too, and it will work, it is generally not recommended to do so unless you know what you're doing. Claude expects alternating user+assistant pairs, and will merge several user/assistant messages into one if they arrive sequentially. This can cause the messages to be parsed not exactly as you expected.
+The proxy should print a warning if you made mistakes with your tags somewhere (forgot to close one, mistyped the tag, etc...).
 
 ## If you've read this far...
 
-Check out my [bot](bot_link_will_go_here)!
+Check out my [bot](https://janitorai.com/profiles/c71e4e8f-c4bc-478a-9cb7-6f90cdb5cb16_profile-of-narrava)!

@@ -17,6 +17,8 @@ from waitress          import serve
 ENABLE_VALUES  = {"1", "y", "true" , "yes", "enable" , "on" }
 DISABLE_VALUES = {"0", "n", "false", "no" , "disable", "off"}
 THINK_EFFORTS  = {"low", "medium", "high", "xhigh", "max"}
+INF_VALUES     = {"inf", "all", "infinite", "infinity", "*", "∞"}
+UINT64_MAX     = 2**64 - 1
 
 def getenv_float(name: str, default: float) -> float:
     raw = os.getenv(name, str(default)).strip()
@@ -39,11 +41,11 @@ def getenv_int(name: str, default: int) -> int:
     except Exception:
         print(f"WARNING: {name} must be an integer. Defaulting to {default}.")
         return default
-def getenv_preserve_thinking_blocks(name: str, default: str = "0") -> Optional[int]:
-    raw = os.getenv(name, default)
+def getenv_preserve_thinking_blocks(name: str, default: str = "0") -> int:
+    raw   = os.getenv(name, default)
     value = str(raw).strip().lower()
-    if value in {"inf", "infinite", "infinity", "all", "*"}:
-        return None
+    if value in INF_VALUES:
+        return UINT64_MAX
     try: return max(0, int(value))
     except Exception:
         print(f"WARNING: {name} must be 0, a positive integer, or inf. Defaulting to {default}.")
@@ -158,6 +160,13 @@ class RuntimeConfig:
 
         # Cost tracking. Values are USD per 1 million tokens.
         self.cost_table: Dict[str, Dict[str, float]] = {
+            "opus": {
+                "input"          : getenv_float("OPUS_INPUT_TOKEN_COST_USD"   ,  5.00),
+                "output"         : getenv_float("OPUS_OUTPUT_TOKEN_COST_USD"  , 25.00),
+                "cache_write_5m" : getenv_float("OPUS_CACHE_WRITE_5M_COST_USD",  6.25),
+                "cache_write_1h" : getenv_float("OPUS_CACHE_WRITE_1H_COST_USD", 10.00),
+                "cache_read"     : getenv_float("OPUS_CACHE_READ_COST_USD"    ,  0.50),
+            },
             "sonnet": {
                 "input"          : getenv_float("SONNET_INPUT_TOKEN_COST_USD"   ,  3.00),
                 "output"         : getenv_float("SONNET_OUTPUT_TOKEN_COST_USD"  , 15.00),
@@ -171,14 +180,7 @@ class RuntimeConfig:
                 "cache_write_5m" : getenv_float("HAIKU_CACHE_WRITE_5M_COST_USD",  1.25),
                 "cache_write_1h" : getenv_float("HAIKU_CACHE_WRITE_1H_COST_USD",  2.00),
                 "cache_read"     : getenv_float("HAIKU_CACHE_READ_COST_USD"    ,  0.10),
-            },
-            "opus": {
-                "input"          : getenv_float("OPUS_INPUT_TOKEN_COST_USD"   , 15.00),
-                "output"         : getenv_float("OPUS_OUTPUT_TOKEN_COST_USD"  , 75.00),
-                "cache_write_5m" : getenv_float("OPUS_CACHE_WRITE_5M_COST_USD", 18.75),
-                "cache_write_1h" : getenv_float("OPUS_CACHE_WRITE_1H_COST_USD", 30.00),
-                "cache_read"     : getenv_float("OPUS_CACHE_READ_COST_USD"    ,  1.50),
-            },
+            }
         }
         self.sync_active_costs()
 
@@ -247,44 +249,69 @@ class RuntimeConfig:
         self.thinking_budget = budget
         return True
 
-    def print_cache_status(self):
-        if not self.cache_en:
-            print("All cache disabled.")
-            return
+    def print_lorebook_status(self) -> None:
+        if cfg.split_lorebook  : print("  Lorebook split   ✅")
+        else                   : print("  Lorebook split   ❌")
+        if cfg.lorebook_at_end : print("  Lorebook at end  ✅")
+        else                   : print("  Lorebook at end  ❌")
 
-        if not self.cache_system:
-            print("System cache disabled.")
+    def print_cache_status(self) -> None:
+        if not self.split_lorebook  : system_str = "Lorebook not split"
         else:
-            print(f"System cache enabled. Duration {self.cache_system_ttl}.", end='')
-            if self.split_lorebook:
-                if self.lorebook_at_end:
-                    print(" Lorebook split; lorebook moves to message end.")
-                else:
-                    print(" Lorebook split.")
-            else:
-                print()
-        if self.cache_manual_msg <= 0:
-            print("Manual cache disabled.")
-        else:
-            print(f"Manual cache marker at message {self.cache_manual_msg} from start (1 is the first). Duration {self.cache_manual_ttl}.")
-        if self.cache_auto_msg <= 0:
-            print("Auto cache disabled.")
-        else:
-            print(f"Auto cache marker at message {self.cache_auto_msg} from end (1 is the last user message). Duration {self.cache_auto_ttl}.")
-        if not self.cache_anthropic_auto:
-            print("Anthropic auto cache disabled.")
-        else:
-            print(f"Anthropic auto cache enabled. Duration {self.cache_anthropic_ttl}.")
+            if self.lorebook_at_end : system_str = "Lorebook split and moved to end"
+            else                    : system_str = "Lorebook split"
+
+        if self.cache_en              : print( "  Cache enabled   ✅")
+        else                          : print( "  Cache enabled   ❌")
+        if self.cache_system          : print(f"  System cache    ✅  {self.cache_system_ttl} | {system_str}")
+        else                          : print(f"  System cache    ❌  {self.cache_system_ttl} | {system_str}")
+        if self.cache_manual_msg <= 0 : print(f"  Manual cache    ❌  {self.cache_manual_ttl} | 1 is the first (intro) message")
+        else                          : print(f"  Manual cache   {self.cache_manual_msg:3d}  {self.cache_manual_ttl} | 1 is the first (intro) message")
+        if self.cache_manual_msg <= 0 : print(f"  Auto   cache    ❌  {self.cache_auto_ttl} | 1 is the last user message")
+        else                          : print(f"  Auto   cache   {self.cache_auto_msg:3d}  {self.cache_auto_ttl} | 1 is the last user message")
+        if self.cache_anthropic_auto  : print(f"  Anthropic auto  ✅  {self.cache_anthropic_ttl}")
+        else                          : print(f"  Anthropic auto  ❌  {self.cache_anthropic_ttl}")
+
+    def print_think_status(self) -> None:
+        if self.preserve_thinking_blocks == UINT64_MAX : preserve_str = "inf"
+        else                                           : preserve_str = str(self.preserve_thinking_blocks)
+
+        if self.thinking_enabled              : print( "  Thinking enabled    ✅")
+        else                                  : print( "  Thinking enabled    ❌")
+        if self.use_adaptive                  :
+                                                print(f"  Thinking effort     ✅  {self.thinking_effort}")
+                                                print(f"  Thinking budget     ❌  {self.thinking_budget}")
+        else                                  :
+                                                print(f"  Thinking effort     ❌  {self.thinking_effort}")
+                                                print(f"  Thinking budget     ✅  {self.thinking_budget}")
+        if self.preserve_thinking_blocks <= 0 : print( "  Thinking preserved  ❌")
+        else                                  : print(f"  Thinking preserved  {preserve_str}")
+
+    def check_cache_block_num(self) -> None:
+        cache_blocks_active : int = 0
+        if self.cache_system:
+            if self.split_lorebook and not self.lorebook_at_end : cache_blocks_active += 2
+            else                                                : cache_blocks_active += 1
+        if self.cache_auto_msg       : cache_blocks_active += 1
+        if self.cache_manual_msg     : cache_blocks_active += 1
+        if self.cache_anthropic_auto : cache_blocks_active += 1
+        if (cache_blocks_active > 4):
+            print("Not more than four cache blocks can be active at a time. Disabling auto cache block.")
+            self.cache_auto_msg = 0
+
+    def set_lorebook_split(self, en: bool) -> None:
+        cfg.split_lorebook = en;
+        self.check_cache_block_num()
 
     def set_cache_msg_num(self, type: str, msg_num: int) -> bool:
         if type in {"m", "man", "manual"}:
             self.cache_manual_msg = msg_num
             if msg_num == 0 : print("Manual cache marker disabled.")
-            else            : print(f"Manual cache marker targets {cfg.cache_manual_msg} message(s) from the start.")
+            else            : print(f"Manual cache marker targets {cfg.cache_manual_msg} message(s) from start.")
         elif type in {"a", "auto"}:
             self.cache_auto_msg = msg_num
             if msg_num == 0 : print("Auto cache marker disabled.")
-            else            : print(f"Auto cache marker targets {cfg.cache_auto_msg} message(s) from the start.")
+            else            : print(f"Auto cache marker targets {cfg.cache_auto_msg} message(s) from end.")
         elif type in {"s", "sys", "system"}:
             self.cache_system = msg_num > 0
             if msg_num <= 0 : print("System message caching disabled.")
@@ -296,36 +323,27 @@ class RuntimeConfig:
         else:
             print(f"Unknown cache type '{type}'")
             return False
-        cache_blocks_active : int = 0
-        if self.cache_system:
-            if self.split_lorebook and not self.lorebook_at_end : cache_blocks_active += 2
-            else                                                : cache_blocks_active += 1
-        if self.cache_auto_msg       : cache_blocks_active += 1
-        if self.cache_manual_msg     : cache_blocks_active += 1
-        if self.cache_anthropic_auto : cache_blocks_active += 1
-        if (cache_blocks_active > 4):
-            print("Not more than four cache blocks can be active at a time. Disabling auto cache block.")
-            self.cache_auto_msg = 0
+        self.check_cache_block_num();
         return True
 
     def set_cache_dur(self, type: str, dur: str) -> bool:
         if not dur in {"5m", "1h"}:
-            print(f"Invalid duration type '{dur}'")
+            print(f"Invalid duration type '{dur}'.")
             return False
         if type in {"m", "man", "manual"}:
             self.cache_manual_ttl= dur
-            print(f"Manual cache marker duration is now {dur}")
+            print(f"Manual cache marker duration is now {dur}.")
         elif type in {"a", "auto"}:
             self.cache_auto_ttl = dur
-            print(f"Auto cache marker duration is now {dur}")
+            print(f"Auto cache marker duration is now {dur}.")
         elif type in {"s", "sys", "system"}:
             self.cache_system_ttl = dur
-            print(f"System cache marker duration is now {dur}")
+            print(f"System cache marker duration is now {dur}.")
         elif type in ("ant", "anthropic"):
             self.cache_anthropic_ttl = dur
-            print(f"Anthropic cache marker duration is now {dur}")
+            print(f"Anthropic cache marker duration is now {dur}.")
         else:
-            print(f"Unknown cache type '{type}'")
+            print(f"Unknown cache type '{type}'.")
             return False
         return True
 
@@ -405,6 +423,8 @@ class RuntimeConfig:
 
 
     def print_status(self) -> None:
+        preserve_str = "inf" if self.preserve_thinking_blocks == UINT64_MAX else str(self.preserve_thinking_blocks)
+
         print()
         print("=== Runtime config start ===")
         print(f"host                   = {self.host} (restart required to change)")
@@ -443,7 +463,6 @@ class RuntimeConfig:
         print(f"adaptive_thinking      = {self.use_adaptive}")
         print(f"thinking_budget        = {self.thinking_budget}")
         print(f"thinking_effort        = {self.thinking_effort}")
-        preserve_str = "inf" if self.preserve_thinking_blocks is None else str(self.preserve_thinking_blocks)
         print(f"preserve_thinking      = {preserve_str}")
         print(f"error_log_path         = {self.error_log_path}")
         print(f"model_list_timeout_sec = {self.model_list_timeout_seconds}")
@@ -622,14 +641,13 @@ def select_model_by_number(index: int) -> None:
             print_no_model_list_available()
             return
         if index < 1 or index > len(ANTHROPIC_MODELS):
-            print(f"Model number out of range. Use 1 through {len(ANTHROPIC_MODELS)}.")
+            print(f"Model number out of range [1:{len(ANTHROPIC_MODELS)}].")
             return
         model_info = ANTHROPIC_MODELS[index - 1]
         model_id   = model_id_from_info(model_info)
         if not model_id:
             print(f"Model {index} does not have an id and cannot be selected.")
             return
-        cfg.reload_from_env()
         cfg.apply_model(model_info)
 
 
@@ -658,7 +676,7 @@ CLI_CMD_MODEL_INFO = """\
 
 CLI_CMD_CACHE_INFO = """\
   cache command. Alias: c.
-    cache <bool>          Toggle all caching on / off.
+    cache <bool>          Toggle all caching on/off.
     cache system <bool>   Toggle caching of system messages.
     cache system <5m|1h>  Set cache duration for the system messages.
       Alias: sys, s
@@ -668,6 +686,8 @@ CLI_CMD_CACHE_INFO = """\
     cache auto   <uint>   Message number from end at which to place the auto marker. 0 to disable.
     cache auto   <5m|1h>  Cache duration for the auto marker.
       Alias: a
+    cache help            Display this message
+      Alias: ?
 """
 
 CLI_CMD_PREFILL_INFO = """\
@@ -679,22 +699,29 @@ CLI_CMD_PREFILL_INFO = """\
 
 CLI_CMD_THINK_INFO = """\
   think command. Alias: t, thinking.
-    think <bool>                              Turn thinking on / off.
+    think <bool>                              Turn thinking on/off.
     think effort <low|medium|high|xhigh|max>  Set thinking effort for models with adaptive thinking.
       Alias: e
     think budget <uint>                       Set thinking budget to <uint> for older models.
       Alias: b
-    think preserve <uint>                     Set number of thinking blocks to preserve. 0 to disable.
+    think preserve <uint>                     Set number of thinking blocks to preserve. 0 to disable. inf for all blocks.
       Alias: p
+    think help                                Display this message.
+      Alias: ?
+"""
+
+CLI_CMD_LOREBOOK_INFO = """\
+  lorebook command. Alias l, lore.
+    lorebook split <bool>  Split lorebook from system messages split on/off.
+      Alias: s
+    lorebook end <bool>    Move the lorebook to end of chat. As a system message for >=4.8 models. As OOC for others.
+      Alias: e
+    lorebook help          Display this message
+      Alias: ?
 """
 
 def admin_cli_loop() -> None:
-    """
-    Tiny local CLI for changing runtime-only settings.
-    """
-
-    print("Runtime CLI ready. Type 'help' for commands.")
-    print()
+    print("Runtime CLI ready. Type 'help' for commands.\n")
 
     while True:
         try:
@@ -717,9 +744,11 @@ def admin_cli_loop() -> None:
                 if parts_l < 2:
                     cfg.print_cache_status()
                     continue
+
                 arg1 = parts[1].lower()
-                if arg1 in DISABLE_VALUES : cfg.cache_en = False; continue
-                if arg1 in ENABLE_VALUES  : cfg.cache_en = True ; continue
+                if arg1 in {"?", "help"}  : print(CLI_CMD_CACHE_INFO); continue
+                if arg1 in DISABLE_VALUES : cfg.cache_en = False     ; continue
+                if arg1 in ENABLE_VALUES  : cfg.cache_en = True      ; continue
 
                 if parts_l < 3:
                     print(CLI_CMD_CACHE_INFO)
@@ -734,6 +763,71 @@ def admin_cli_loop() -> None:
                     cfg.set_cache_msg_num(arg1, msg_num)
                     continue
                 print(CLI_CMD_CACHE_INFO)
+                continue
+
+            if cmd in {"t", "think", "thinking"}:
+                if parts_l < 2:
+                    cfg.print_think_status()
+                    continue
+
+                arg1 = parts[1].lower()
+                if arg1 in {"?", "help"}  : print(CLI_CMD_THINK_INFO) ; continue
+                if arg1 in DISABLE_VALUES : cfg.enable_thinking(False); continue
+                if arg1 in ENABLE_VALUES  : cfg.enable_thinking(True) ; continue
+
+                if parts_l < 3:
+                    print(CLI_CMD_THINK_INFO)
+                    continue
+                arg2 = parts[2].lower()
+                if arg1 in {"e", "effort"}:
+                    cfg.set_think_effort(arg2)
+                    continue
+                if arg1 in {"b", "budget"}:
+                    try: budget = int(arg2)
+                    except Exception: pass
+                    else:
+                        cfg.set_think_budget(budget)
+                        continue
+                if arg1 in {"p", "preserve"}:
+                    if arg2 in INF_VALUES:
+                        cfg.set_think_blocks_to_preserve(UINT64_MAX)
+                        continue
+                    try: preserve_blocks = int(arg2)
+                    except Exception: pass
+                    else:
+                        cfg.set_think_blocks_to_preserve(preserve_blocks)
+                        continue
+                print(CLI_CMD_THINK_INFO)
+                continue
+
+            if cmd in {"l", "lore", "lorebook"}:
+                if parts_l < 2:
+                    cfg.print_lorebook_status()
+                    continue
+
+                arg1 = parts[1].lower()
+                if arg1 in {"?", "help"}:
+                    print(CLI_CMD_LOREBOOK_INFO)
+                    continue
+
+                if parts_l < 3:
+                    print(CLI_CMD_LOREBOOK_INFO)
+                    continue
+                arg2 = parts[2].lower()
+
+                if arg1 in {"s", "split"}:
+                    if   arg2 in ENABLE_VALUES  : cfg.set_lorebook_split(True ); continue
+                    elif arg2 in DISABLE_VALUES : cfg.set_lorebook_split(False); continue
+                    else:
+                        print(CLI_CMD_LOREBOOK_INFO)
+                        continue
+                if arg1 in {"e", "end"}:
+                    if   arg2 in ENABLE_VALUES  : cfg.lorebook_at_end = True ; continue
+                    elif arg2 in DISABLE_VALUES : cfg.lorebook_at_end = False; continue
+                    else:
+                        print(CLI_CMD_LOREBOOK_INFO)
+                        continue
+                print(CLI_CMD_LOREBOOK_INFO)
                 continue
 
             if cmd == "prefill":
@@ -756,37 +850,6 @@ def admin_cli_loop() -> None:
                     continue
 
                 cfg.set_prefill(split_line[2])
-                continue
-
-            if cmd in {"t", "think", "thinking"}:
-                if parts_l < 2:
-                    print(CLI_CMD_THINK_INFO)
-                    continue
-
-                arg1 = parts[1].lower()
-                if arg1 in DISABLE_VALUES : cfg.enable_thinking(False); continue
-                if arg1 in ENABLE_VALUES  : cfg.enable_thinking(True) ; continue
-
-                if parts_l < 3:
-                    print(CLI_CMD_THINK_INFO)
-                    continue
-                arg2 = parts[2].lower()
-                if arg1 in {"e", "effort"}:
-                    cfg.set_think_effort(arg2)
-                    continue
-                if arg1 in {"b", "budget"}:
-                    try: budget = int(arg2)
-                    except Exception: pass
-                    else:
-                        cfg.set_think_budget(budget)
-                        continue
-                if arg1 in {"p", "preserve"}:
-                    try: preserve_blocks = int(arg2)
-                    except Exception: pass
-                    else:
-                        cfg.set_think_blocks_to_preserve(preserve_blocks)
-                        continue
-                print(CLI_CMD_THINK_INFO)
                 continue
 
             if cmd in {"reload"}:
@@ -975,29 +1038,11 @@ def make_prefill_instruction(prefix_text: str) -> str:
     This avoids Anthropic assistant prefill by telling Claude, inside the
     last user message, to continue as though the prefix was already present.
     """
-    # return (
-    #     "\n<OOC>\n"
-    #     "The assistant will begin its reply with the following prefix:\n"
-    #     f"<prefix>{prefix_text}</prefix>\n"
-    #     "Continue immediately after that prefix. Do not display the prefix in your answer.\n"
-    #     "</OOC>"
-    # )
-
     return (
         "\n<OOC>\n"
         f"{prefix_text}"
         "</OOC>"
     )
-
-    # return (
-        # "\n<OOC>\n"
-        # "The assistant has began its response with:\n"
-        # "<prefix>\n"
-        # f"{prefix_text}\n"
-        # "</prefix>\n"
-        # "You are generating only the continuation after that already-rendered text.\n"
-        # "</OOC>"
-    # )
 
 
 def append_prefill_instruction_to_last_user_message(formatted: List[Dict[str, Any]], prefix_text: str) -> None:
@@ -1053,7 +1098,7 @@ SUMMARY_BLOCK_END_RE = re.compile(
 )
 SUMMARY_BLOCK_ATTR_RE = re.compile(r"""([A-Za-z_][A-Za-z0-9_:-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
 SUMMARY_BLOCK_TAG_VALUE_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
-SUMMARY_BLOCK_ROLES = {"assistant", "user"}
+SUMMARY_BLOCK_ROLES = {"assistant", "user", "system"}
 
 
 def warn_summary_block(message: str) -> None:
@@ -1082,12 +1127,15 @@ def parse_summary_block_tag(attrs: Dict[str, str], msg_num: int, kind: str) -> O
     return tag
 
 
-def parse_summary_block_role(attrs: Dict[str, str], msg_num: int) -> Optional[str]:
+def parse_summary_block_role(attrs: Dict[str, str], msg_num: int, tag: str) -> Optional[str]:
     role = attrs.get("role", "assistant").strip().lower()
     if not role:
         role = "assistant"
     if role not in SUMMARY_BLOCK_ROLES:
         warn_summary_block(f"Message {msg_num} has invalid summary role {role!r}.")
+        return None
+    if role == "system" and tag.lower() != "all":
+        warn_summary_block(f"Message {msg_num} uses summary role \"system\" with non-all tag {tag!r}.")
         return None
     return role
 
@@ -1116,8 +1164,10 @@ def extract_summary_block_control(content: str, msg_num: int) -> Tuple[Optional[
 
         attrs = parse_summary_block_attrs(match.group("attrs"))
         tag = parse_summary_block_tag(attrs, msg_num, "end")
-        role = parse_summary_block_role(attrs, msg_num)
-        if tag is None or role is None:
+        if tag is None:
+            return None, True
+        role = parse_summary_block_role(attrs, msg_num, tag)
+        if role is None:
             return None, True
 
         return {
@@ -1177,7 +1227,7 @@ def build_summary_groups(summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return groups
 
 
-def apply_summary_blocks(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def apply_summary_blocks(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
     Removes summary control messages and optionally collapses covered ranges.
 
@@ -1186,7 +1236,7 @@ def apply_summary_blocks(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     closing-message order.
     """
     if not messages:
-        return messages
+        return messages, []
 
     open_starts: Dict[str, int] = {}
     control_indices = set()
@@ -1236,13 +1286,14 @@ def apply_summary_blocks(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         warn_summary_block(f"Message {start_idx + 1} starts summary tag {tag!r} without a matching end tag.")
 
     if not cfg.summary_blocks_enabled:
-        return [msg for idx, msg in enumerate(messages) if idx not in control_indices]
+        return [msg for idx, msg in enumerate(messages) if idx not in control_indices], []
 
     groups = build_summary_groups(summaries)
     if not groups:
-        return [msg for idx, msg in enumerate(messages) if idx not in control_indices]
+        return [msg for idx, msg in enumerate(messages) if idx not in control_indices], []
 
     result: List[Dict[str, Any]] = []
+    system_summary_texts: List[str] = []
     idx = 0
 
     for group in groups:
@@ -1252,6 +1303,9 @@ def apply_summary_blocks(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             idx += 1
 
         for summary in group["summaries"]:
+            if summary["role"] == "system":
+                system_summary_texts.append(summary["text"])
+                continue
             result.append({
                 "role": summary["role"],
                 "content": summary["text"],
@@ -1264,7 +1318,7 @@ def apply_summary_blocks(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             result.append(messages[idx])
         idx += 1
 
-    return result
+    return result, system_summary_texts
 
 
 # =============================================================================
@@ -1285,7 +1339,7 @@ VISIBLE_THINK_RE = re.compile(r"\s*<think\b[^>]*>.*?</think>\s*", re.IGNORECASE 
 
 
 def thinking_preservation_enabled() -> bool:
-    return (cfg.preserve_thinking_blocks is None) or (cfg.preserve_thinking_blocks > 0)
+    return cfg.preserve_thinking_blocks > 0
 
 
 def extract_preservable_thinking_blocks(blocks: Any) -> List[Dict[str, Any]]:
@@ -1374,7 +1428,7 @@ def openai_stream_chunk(model_used: str, delta: Dict[str, Any], finish_reason: O
 PERSONA_END_RE = re.compile(r"</[^<>]*\bPersona>", re.IGNORECASE)
 
 
-def format_system_for_claude(system_prompt: Optional[str]) -> Tuple[Optional[Any], Optional[str]]:
+def format_system_for_claude(system_prompt: Optional[str], system_summary_texts: Optional[List[str]] = None) -> Tuple[Optional[Any], Optional[str]]:
     """
     Formats the top-level Anthropic system prompt and optionally extracts the dynamic lorebook suffix.
 
@@ -1397,47 +1451,46 @@ def format_system_for_claude(system_prompt: Optional[str]) -> Tuple[Optional[Any
         - formatted_system: top-level Anthropic system blocks, or None
         - lorebook_at_end_text: moved lorebook/suffix text, or None
     """
-    if system_prompt is None:
-        return None, None
-
-    text = system_prompt.strip()
-    if not text:
+    summary_texts = system_summary_texts or []
+    text = (system_prompt or "").strip()
+    if not text and not any((summary or "").strip() for summary in summary_texts):
         return None, None
 
     blocks: List[Dict[str, Any]] = []
     lorebook_at_end_text: Optional[str] = None
 
-    if cfg.split_lorebook:
-        split_at = -1
+    if text:
+        if cfg.split_lorebook:
+            split_at = -1
 
-        for split_marker in ("</summary>", "</example_dialogs>", "</Scenario>"):
-            split_idx = text.find(split_marker)
-            if split_idx != -1:
-                split_at = split_idx + len(split_marker)
-                break
+            for split_marker in ("</summary>", "</example_dialogs>", "</Scenario>"):
+                split_idx = text.find(split_marker)
+                if split_idx != -1:
+                    split_at = split_idx + len(split_marker)
+                    break
 
-        if split_at == -1:
-            persona_matches = list(PERSONA_END_RE.finditer(text))
-            if persona_matches:
-                split_at = persona_matches[-1].end()
+            if split_at == -1:
+                persona_matches = list(PERSONA_END_RE.finditer(text))
+                if persona_matches:
+                    split_at = persona_matches[-1].end()
 
-        if split_at == -1 or split_at >= len(text):
-            blocks.append({"type": "text", "text": text})
+            if split_at == -1 or split_at >= len(text):
+                blocks.append({"type": "text", "text": text})
+            else:
+                before = text[:split_at].rstrip()
+                after  = text[split_at:].strip()
+
+                if before:
+                    blocks.append({"type": "text", "text": before})
+
+                if after:
+                    if cfg.lorebook_at_end:
+                        lorebook_at_end_text = after
+                    else:
+                        # Keep a clean visual/semantic separator between Scenario/Persona and suffix.
+                        blocks.append({"type": "text", "text": "\n\n" + after})
         else:
-            before = text[:split_at].rstrip()
-            after  = text[split_at:].strip()
-
-            if before:
-                blocks.append({"type": "text", "text": before})
-
-            if after:
-                if cfg.lorebook_at_end:
-                    lorebook_at_end_text = after
-                else:
-                    # Keep a clean visual/semantic separator between Scenario/Persona and suffix.
-                    blocks.append({"type": "text", "text": "\n\n" + after})
-    else:
-        blocks.append({"type": "text", "text": text})
+            blocks.append({"type": "text", "text": text})
 
     formatted_system: List[Dict[str, Any]] = []
 
@@ -1447,7 +1500,14 @@ def format_system_for_claude(system_prompt: Optional[str]) -> Tuple[Optional[Any
             new_block["cache_control"] = make_cache_control(cfg.cache_system_ttl)
         formatted_system.append(new_block)
 
-    return (formatted_system if formatted_system else None), (lorebook_at_end_text if lorebook_at_end_text else None)
+    for text in summary_texts:
+        stripped = (text or "").strip()
+        if not stripped:
+            continue
+        block: Dict[str, Any] = {"type": "text", "text": stripped}
+        formatted_system.append(block)
+
+    return (formatted_system if formatted_system else None), lorebook_at_end_text
 
 
 def format_to_claude_messages(mlist: List[Dict[str, Any]], lorebook_at_end_text: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -1716,7 +1776,7 @@ def get_temperature(payload: Dict[str, Any]) -> float:
     return float(payload.get("temperature", cfg.default_temperature))
 
 
-def split_system_and_messages(raw_messages: Any) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+def split_system_and_messages(raw_messages: Any) -> Tuple[Optional[str], List[Dict[str, Any]], List[str]]:
     """
     Validates and normalizes OpenAI-style chat messages.
 
@@ -1724,6 +1784,7 @@ def split_system_and_messages(raw_messages: Any) -> Tuple[Optional[str], List[Di
     Returns:
         - system_prompt: joined system messages, or None
         - chat_messages: list of normalized message dicts
+        - system_summary_texts: role="system" all-summary blocks to append to system
 
     Invalid message lists abort with 400 and do not return.
     """
@@ -1759,7 +1820,7 @@ def split_system_and_messages(raw_messages: Any) -> Tuple[Optional[str], List[Di
             msg_obj["anthropic_thinking_blocks"] = thinking_blocks
         chat_messages.append(msg_obj)
 
-    chat_messages = apply_summary_blocks(chat_messages)
+    chat_messages, system_summary_texts = apply_summary_blocks(chat_messages)
 
     if thinking_preservation_enabled():
         # Mark only the last N assistant messages for signed-block rehydration.
@@ -1770,26 +1831,23 @@ def split_system_and_messages(raw_messages: Any) -> Tuple[Optional[str], List[Di
                 continue
             if not msg.get("anthropic_thinking_blocks"):
                 continue
-            if remaining is None:
-                msg["send_anthropic_thinking_blocks"] = True
-                continue
             if remaining <= 0:
                 break
             msg["send_anthropic_thinking_blocks"] = True
             remaining -= 1
 
     system_prompt = "\n\n".join(system_parts) if system_parts else None
-    return system_prompt, chat_messages
+    return system_prompt, chat_messages, system_summary_texts
 
 
 def build_claude_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
 
-    system_prompt, chat_messages = split_system_and_messages(payload.get("messages"))
+    system_prompt, chat_messages, system_summary_texts = split_system_and_messages(payload.get("messages"))
 
     if chat_messages and chat_messages[0].get("role") == "user" and chat_messages[0].get("content", "").strip() == ".":
         chat_messages = chat_messages[1:]
 
-    formatted_system, lorebook_at_end_text = format_system_for_claude(system_prompt)
+    formatted_system, lorebook_at_end_text = format_system_for_claude(system_prompt, system_summary_texts)
     formatted_messages = format_to_claude_messages(chat_messages, lorebook_at_end_text)
 
     kwargs: Dict[str, Any] = {
@@ -2050,7 +2108,7 @@ def running():
                 "adaptive_thinking"         : cfg.use_adaptive,
                 "thinking_budget"           : cfg.thinking_budget,
                 "thinking_effort"           : cfg.thinking_effort,
-                "preserve_thinking_blocks"  : "inf" if cfg.preserve_thinking_blocks is None else str(cfg.preserve_thinking_blocks),
+                "preserve_thinking_blocks"  : "inf" if cfg.preserve_thinking_blocks == UINT64_MAX else str(cfg.preserve_thinking_blocks),
             }
         }
     )
