@@ -160,6 +160,13 @@ class RuntimeConfig:
 
         # Cost tracking. Values are USD per 1 million tokens.
         self.cost_table: Dict[str, Dict[str, float]] = {
+            "fable": {
+                "input"          : getenv_float("FABLE_INPUT_TOKEN_COST_USD"   , 10.00),
+                "output"         : getenv_float("FABLE_OUTPUT_TOKEN_COST_USD"  , 50.00),
+                "cache_write_5m" : getenv_float("FABLE_CACHE_WRITE_5M_COST_USD", 12.50),
+                "cache_write_1h" : getenv_float("FABLE_CACHE_WRITE_1H_COST_USD", 20.00),
+                "cache_read"     : getenv_float("FABLE_CACHE_READ_COST_USD"    ,  1.00),
+            },
             "opus": {
                 "input"          : getenv_float("OPUS_INPUT_TOKEN_COST_USD"   ,  5.00),
                 "output"         : getenv_float("OPUS_OUTPUT_TOKEN_COST_USD"  , 25.00),
@@ -209,9 +216,13 @@ class RuntimeConfig:
 
     def sync_active_costs(self) -> None:
         model_l = str(self.model or "").lower()
-        if   "haiku" in model_l : self.model_cost_family = "haiku"
-        elif "opus"  in model_l : self.model_cost_family = "opus"
-        else                    : self.model_cost_family = "sonnet"
+        if   "haiku"  in model_l : self.model_cost_family = "haiku"
+        elif "sonnet" in model_l : self.model_cost_family = "sonnet"
+        elif "opus"   in model_l : self.model_cost_family = "opus"
+        elif "fable"  in model_l : self.model_cost_family = "fable"
+        else:
+            print(f"Unknown model family {model_l}. Using fable's (most expensive) prising estimates.")
+            self.model_cost_family = "fable"
 
         costs = self.cost_table[self.model_cost_family]
         self.input_token_cost_usd    = costs["input"]
