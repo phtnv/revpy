@@ -1463,7 +1463,7 @@ def format_system_for_claude(system_prompt: Optional[str], system_summary_texts:
         if cfg.split_lorebook:
             split_at = -1
 
-            for split_marker in ("</summary>", "</example_dialogs>", "</Scenario>"):
+            for split_marker in ("</summary>", "</example_dialogs>", "</UserPersona>", "</Scenario>"):
                 split_idx = text.find(split_marker)
                 if split_idx != -1:
                     split_at = split_idx + len(split_marker)
