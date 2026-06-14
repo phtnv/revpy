@@ -101,7 +101,7 @@ This is 99% a Janitor-side issue, or you've typed the link wrong in its UI.
 
 > Janitor gives an error, some text appeared in the server console.
 
-Well, this is a server-side issue then. You can open an issue here on GitHub, but you can also ask in the Janitor Discord Claude thread, which I read. The text in your terminal should provide a hint what's happening, and you can always ask your friendly LLM for help. Give it the error message as-is + the `server.py` file, even the free LLMs are usually good about finding bugs in simple stuff like this.
+Well, this is a server-side issue then. You can open an issue here on GitHub. The text in your terminal should provide a hint what's happening, and you can always ask your friendly LLM for help. Give it the error message as-is + the `server.py` file, even the free LLMs are usually good about finding bugs in simple stuff like this.
 
 ## Command-Line Interface
 
