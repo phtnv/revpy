@@ -1,5 +1,5 @@
-# OpenAI to Anthropic reverse proxy
-Reverse proxy for interfacing OpenAI-compatible chat UIs with Claude.
+# OpenAI to Anthropic compatibility adapter
+Compatibility adapter for interfacing OpenAI-style chat requests with Antrhopic Message API requests. Typical usage would be using it as an intermediary server between JanitorAI and Claude (with your own Antropic API key).
 
 ## Requirements
 - Anthropic API key from Claude Console. https://platform.claude.com/settings/workspaces/default/keys

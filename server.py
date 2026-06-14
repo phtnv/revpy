@@ -955,7 +955,7 @@ def get_bearer_token() -> str:
 def get_anthropic_client() -> anthropic.Anthropic:
     """
     Recommended public-tunnel mode:
-        .env contains ANTHROPIC_API_KEY and PROXY_KEY. JanitorAI uses PROXY_KEY as the reverse proxy key.
+        .env contains ANTHROPIC_API_KEY and PROXY_KEY. JanitorAI uses PROXY_KEY as the proxy key.
 
     Optional compatibility mode:
         ALLOW_KEY_PASSTHROUGH=true lets incoming Bearer token act as Anthropic key.
@@ -1450,9 +1450,10 @@ def format_system_for_claude(system_prompt: Optional[str], system_summary_texts:
     Split priority:
         1. After </summary>
         2. After </example_dialogs>
-        3. After </Scenario>
-        4. After the last </* Persona> marker
-        5. Otherwise keep the whole system prompt as one block
+        3. After </UserPersona>
+        4. After </Scenario>
+        5. After the last </* Persona> marker
+        6. Otherwise keep the whole system prompt as one block
 
     When LOREBOOK_AT_END=true, the suffix is returned as plain text instead of being kept as a
     top-level system block. That moved suffix deliberately does not receive the old system/lorebook
@@ -2143,7 +2144,7 @@ if __name__ == "__main__":
     cfg.reload_from_env()
     cfg.find_cfg(ANTHROPIC_MODELS)
 
-    print("Starting Claude reverse proxy")
+    print("Starting Claude proxy")
     print(f"Local URL: http://{cfg.host}:{cfg.port}")
     print(f"Chat completions: http://{cfg.host}:{cfg.port}/chat/completions")
     print("Cloudflare Tunnel service URL should point to this local address:")
