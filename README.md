@@ -134,7 +134,7 @@ system message -> user + assistant message pairs
 
 Which in Janitor's case becomes:
 ```md
-Core definitions (persona->scenario->voice samples) -> lorebooks/user script additions, summary -> intro message -> chat
+Advanced prompt -> Core (scenario->persona->example_dialogs->summary) -> lorebooks/user scripts -> intro -> chat
 ```
 So if the bot uses lorebooks heavily, and these lorebooks often insert/remove entries, then every time they do that your entire chat will need to be re-cached, breaking the entire point of caching.
 
