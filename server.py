@@ -203,6 +203,7 @@ class RuntimeConfig:
         self.cache_system_ttl     = getenv_cache_ttl("CACHE_SYSTEM_TTL", "1h")
         self.split_lorebook       = getenv_bool("SPLIT_LOREBOOK", True)
         self.lorebook_at_end      = getenv_bool("LOREBOOK_AT_END", False)
+        self.lorebook_xml_at_end  = getenv_bool("LOREBOOK_XML_AT_END", False)
         self.cache_manual_ttl     = getenv_cache_ttl("CACHE_MANUAL_TTL", "1h")
         self.cache_manual_msg     = max(0, getenv_int("CACHE_MANUAL_MSG", 0))
         self.cache_auto_ttl       = getenv_cache_ttl("CACHE_AUTO_TTL", "1h")
@@ -265,12 +266,16 @@ class RuntimeConfig:
         else                   : print("  Lorebook split   ❌")
         if cfg.lorebook_at_end : print("  Lorebook at end  ✅")
         else                   : print("  Lorebook at end  ❌")
+        if cfg.lorebook_xml_at_end : print("  XML at end       ✅")
+        else                       : print("  XML at end       ❌")
 
     def print_cache_status(self) -> None:
         if not self.split_lorebook  : system_str = "Lorebook not split"
         else:
             if self.lorebook_at_end : system_str = "Lorebook split and moved to end"
             else                    : system_str = "Lorebook split"
+        if self.lorebook_xml_at_end:
+            system_str = f"{system_str}; XML lorebook moved to end"
 
         if self.cache_en              : print( "  Cache enabled   ✅")
         else                          : print( "  Cache enabled   ❌")
@@ -464,6 +469,7 @@ class RuntimeConfig:
         print(f"cache_system_ttl       = {self.cache_system_ttl}")
         print(f"split_lorebook         = {self.split_lorebook}")
         print(f"lorebook_at_end        = {self.lorebook_at_end}")
+        print(f"lorebook_xml_at_end    = {self.lorebook_xml_at_end}")
         print(f"cache_manual_ttl       = {self.cache_manual_ttl}")
         print(f"cache_manual_msg       = {self.cache_manual_msg}")
         print(f"cache_auto_ttl         = {self.cache_auto_ttl}")
@@ -727,6 +733,8 @@ CLI_CMD_LOREBOOK_INFO = """\
       Alias: s
     lorebook end <bool>    Move the lorebook to end of chat. As a system message for >=4.8 models. As OOC for others.
       Alias: e
+    lorebook xml <bool>    Extract <lorebook>...</lorebook> from system prompt and move it to end of chat.
+      Alias: x
     lorebook help          Display this message
       Alias: ?
 """
@@ -835,6 +843,12 @@ def admin_cli_loop() -> None:
                 if arg1 in {"e", "end"}:
                     if   arg2 in ENABLE_VALUES  : cfg.lorebook_at_end = True ; continue
                     elif arg2 in DISABLE_VALUES : cfg.lorebook_at_end = False; continue
+                    else:
+                        print(CLI_CMD_LOREBOOK_INFO)
+                        continue
+                if arg1 in {"x", "xml"}:
+                    if   arg2 in ENABLE_VALUES  : cfg.lorebook_xml_at_end = True ; continue
+                    elif arg2 in DISABLE_VALUES : cfg.lorebook_xml_at_end = False; continue
                     else:
                         print(CLI_CMD_LOREBOOK_INFO)
                         continue
@@ -1431,10 +1445,9 @@ def openai_stream_chunk(model_used: str, delta: Dict[str, Any], finish_reason: O
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
-PERSONA_END_RE = re.compile(r"</[^<>]*\bPersona>", re.IGNORECASE)
-
-
-def format_system_for_claude(system_prompt: Optional[str], system_summary_texts: Optional[List[str]] = None) -> Tuple[Optional[Any], Optional[str]]:
+PERSONA_END_RE  = re.compile(r"</[^<>]*\bPersona>", re.IGNORECASE)
+LOREBOOK_XML_RE = re.compile(r"<lorebook\b[^>]*>.*?</lorebook>", re.IGNORECASE | re.DOTALL)
+def format_system_for_claude(system_prompt: str, system_summary_texts: Optional[List[str]] = None) -> Tuple[List[Dict[str, Any]], str]:
     """
     Formats the top-level Anthropic system prompt and optionally extracts the dynamic lorebook suffix.
 
@@ -1454,17 +1467,27 @@ def format_system_for_claude(system_prompt: Optional[str], system_summary_texts:
     top-level system block. That moved suffix deliberately does not receive the old system/lorebook
     cache marker; it is handled later as an ordinary end-of-conversation item.
 
+    When LOREBOOK_XML_AT_END=true, every <lorebook>...</lorebook> block is removed from the
+    top-level system prompt and appended after any other moved end-of-chat lorebook text.
+
     Returns:
-        - formatted_system: top-level Anthropic system blocks, or None
-        - lorebook_at_end_text: moved lorebook/suffix text, or None
+        - formatted_system: top-level Anthropic system blocks, or an empty list
+        - lorebook_at_end_text: moved lorebook/suffix text, or an empty string
     """
     summary_texts = system_summary_texts or []
-    text = (system_prompt or "").strip()
+    text = system_prompt.strip()
     if not text and not any((summary or "").strip() for summary in summary_texts):
-        return None, None
+        return [], ""
 
     blocks: List[Dict[str, Any]] = []
-    lorebook_at_end_text: Optional[str] = None
+    lorebook_at_end_text     = ""
+    lorebook_xml_at_end_text = ""
+
+    if text and cfg.lorebook_xml_at_end:
+        matches = [match.group(0).strip() for match in LOREBOOK_XML_RE.finditer(text) if match.group(0).strip()]
+        if matches:
+            text = LOREBOOK_XML_RE.sub("", text).strip()
+            lorebook_xml_at_end_text = "\n\n".join(matches)
 
     if text:
         if cfg.split_lorebook:
@@ -1492,12 +1515,17 @@ def format_system_for_claude(system_prompt: Optional[str], system_summary_texts:
 
                 if after:
                     if cfg.lorebook_at_end:
-                        lorebook_at_end_text = after
+                        existing_text = lorebook_at_end_text.strip()
+                        lorebook_at_end_text = f"{existing_text}\n\n{after}" if existing_text else after
                     else:
                         # Keep a clean visual/semantic separator between Scenario/Persona and suffix.
                         blocks.append({"type": "text", "text": "\n\n" + after})
         else:
             blocks.append({"type": "text", "text": text})
+
+    if lorebook_xml_at_end_text:
+        existing_text = lorebook_at_end_text.strip()
+        lorebook_at_end_text = f"{existing_text}\n\n{lorebook_xml_at_end_text}" if existing_text else lorebook_xml_at_end_text
 
     formatted_system: List[Dict[str, Any]] = []
 
@@ -1514,10 +1542,10 @@ def format_system_for_claude(system_prompt: Optional[str], system_summary_texts:
         block: Dict[str, Any] = {"type": "text", "text": stripped}
         formatted_system.append(block)
 
-    return (formatted_system if formatted_system else None), lorebook_at_end_text
+    return formatted_system, lorebook_at_end_text
 
 
-def format_to_claude_messages(mlist: List[Dict[str, Any]], lorebook_at_end_text: Optional[str] = None) -> List[Dict[str, Any]]:
+def format_to_claude_messages(mlist: List[Dict[str, Any]], lorebook_at_end_text: str = "") -> List[Dict[str, Any]]:
     """
     Converts OpenAI-style chat messages to Anthropic Messages format.
 
@@ -1783,13 +1811,13 @@ def get_temperature(payload: Dict[str, Any]) -> float:
     return float(payload.get("temperature", cfg.default_temperature))
 
 
-def split_system_and_messages(raw_messages: Any) -> Tuple[Optional[str], List[Dict[str, Any]], List[str]]:
+def split_system_and_messages(raw_messages: Any) -> Tuple[str, List[Dict[str, Any]], List[str]]:
     """
     Validates and normalizes OpenAI-style chat messages.
 
     Accepts untrusted request payload data.
     Returns:
-        - system_prompt: joined system messages, or None
+        - system_prompt: joined system messages, or an empty string
         - chat_messages: list of normalized message dicts
         - system_summary_texts: role="system" all-summary blocks to append to system
 
@@ -1843,7 +1871,7 @@ def split_system_and_messages(raw_messages: Any) -> Tuple[Optional[str], List[Di
             msg["send_anthropic_thinking_blocks"] = True
             remaining -= 1
 
-    system_prompt = "\n\n".join(system_parts) if system_parts else None
+    system_prompt = "\n\n".join(system_parts)
     return system_prompt, chat_messages, system_summary_texts
 
 
@@ -1877,7 +1905,7 @@ def build_claude_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             kwargs["thinking"] = { "type": "enabled", "budget_tokens": cfg.thinking_budget }
 
-    if formatted_system is not None:
+    if formatted_system:
         kwargs["system"] = formatted_system
     kwargs["messages"] = formatted_messages
 
@@ -2081,15 +2109,16 @@ def running():
             "model"         : cfg.model,
             "prompt_cache"  : cfg.cache_en,
             "cache"         : {
-                "cache_en"        : cfg.cache_en,
-                "cache_system"     : cfg.cache_system,
-                "cache_system_ttl" : cfg.cache_system_ttl,
-                "split_lorebook"   : cfg.split_lorebook,
-                "lorebook_at_end"  : cfg.lorebook_at_end,
-                "cache_manual_ttl" : cfg.cache_manual_ttl,
-                "cache_manual_msg" : cfg.cache_manual_msg,
-                "cache_auto_ttl"   : cfg.cache_auto_ttl,
-                "cache_auto_msg"   : cfg.cache_auto_msg,
+                "cache_en"            : cfg.cache_en,
+                "cache_system"         : cfg.cache_system,
+                "cache_system_ttl"     : cfg.cache_system_ttl,
+                "split_lorebook"       : cfg.split_lorebook,
+                "lorebook_at_end"      : cfg.lorebook_at_end,
+                "lorebook_xml_at_end"  : cfg.lorebook_xml_at_end,
+                "cache_manual_ttl"     : cfg.cache_manual_ttl,
+                "cache_manual_msg"     : cfg.cache_manual_msg,
+                "cache_auto_ttl"       : cfg.cache_auto_ttl,
+                "cache_auto_msg"       : cfg.cache_auto_msg,
             },
             "cost_tracking" : {
                 "model_cost_family"                                : cfg.model_cost_family,
