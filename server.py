@@ -112,7 +112,7 @@ class RuntimeConfig:
         self.host = os.getenv("HOST", "127.0.0.1")
         self.port = getenv_int("PORT", 5001)
 
-        self.model = os.getenv("MODEL", "claude-sonnet-4-5-20250929")
+        self.model = os.getenv("MODEL", "claude-sonnet-4-6")
         self.version = extract_claude_version(self.model)
         self.model_info = {}
 
@@ -139,14 +139,13 @@ class RuntimeConfig:
             self.assistant_prefill_mode = "none"
 
         # Generation defaults
-        self.temperature_override = getenv_float("TEMPERATURE_OVERRIDE", -1.0)
-        self.default_temperature  = getenv_float("DEFAULT_TEMPERATURE", 0.9)
-        self.send_temperature     = True
-        self.send_top_p           = getenv_bool("SEND_TOP_P", False)
-        self.top_p                = getenv_float("TOP_P", 0.9)
-        self.send_top_k           = True
-        self.top_k                = getenv_int("TOP_K", 75)
-        self.max_tokens           = getenv_int("MAX_TOKENS", 8192)
+        self.max_tokens       = getenv_int("MAX_TOKENS", 8192)
+        self.send_temperature = getenv_bool("SEND_TEMPERATURE", False)
+        self.temperature      = getenv_float("TEMPERATURE", 0.9)
+        self.send_top_p       = getenv_bool("SEND_TOP_P", False)
+        self.top_p            = getenv_float("TOP_P", 0.95)
+        self.send_top_k       = getenv_bool("SEND_TOP_P", False)
+        self.top_k            = getenv_int("TOP_K", 75)
 
         # Thinking
         self.thinking_enabled = getenv_bool("THINKING_ENABLED", False)
@@ -262,10 +261,10 @@ class RuntimeConfig:
         return True
 
     def print_lorebook_status(self) -> None:
-        if cfg.split_lorebook  : print("  Lorebook split   ✅")
-        else                   : print("  Lorebook split   ❌")
-        if cfg.lorebook_at_end : print("  Lorebook at end  ✅")
-        else                   : print("  Lorebook at end  ❌")
+        if cfg.split_lorebook      : print("  Lorebook split   ✅")
+        else                       : print("  Lorebook split   ❌")
+        if cfg.lorebook_at_end     : print("  Lorebook at end  ✅")
+        else                       : print("  Lorebook at end  ❌")
         if cfg.lorebook_xml_at_end : print("  XML at end       ✅")
         else                       : print("  XML at end       ❌")
 
@@ -459,8 +458,7 @@ class RuntimeConfig:
         print(f"summary_blocks_enabled = {self.summary_blocks_enabled}")
         print(f"assistant_prefill      = {'set' if self.assistant_prefill.strip() else 'empty'}")
         print(f"assistant_prefill_mode = {self.assistant_prefill_mode}")
-        print(f"temperature_override   = {self.temperature_override}")
-        print(f"default_temperature    = {self.default_temperature}")
+        print(f"temperature            = {self.temperature}")
         print(f"top_p                  = {self.top_p}")
         print(f"top_k                  = {self.top_k}")
         print(f"max_tokens             = {self.max_tokens}")
@@ -1787,9 +1785,9 @@ def usage_to_openai_dict(usage: Any) -> Dict[str, int]:
 
     This preserves both.
     """
-    input_tokens   = int(getattr(usage, "input_tokens", 0) or 0)
-    output_tokens  = int(getattr(usage, "output_tokens", 0) or 0)
-    cache_read     = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+    input_tokens   = int(getattr(usage, "input_tokens"               , 0) or 0)
+    output_tokens  = int(getattr(usage, "output_tokens"              , 0) or 0)
+    cache_read     = int(getattr(usage, "cache_read_input_tokens"    , 0) or 0)
     cache_creation = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
 
     prompt_tokens = input_tokens + cache_read + cache_creation
@@ -1802,12 +1800,6 @@ def usage_to_openai_dict(usage: Any) -> Dict[str, int]:
         "cache_creation_input_tokens" : cache_creation,
         "cache_read_input_tokens"     : cache_read,
     }
-
-
-def get_temperature(payload: Dict[str, Any]) -> float:
-    if cfg.temperature_override != -1:
-        return cfg.temperature_override
-    return float(payload.get("temperature", cfg.default_temperature))
 
 
 def split_system_and_messages(raw_messages: Any) -> Tuple[str, List[Dict[str, Any]], str]:
@@ -1894,9 +1886,9 @@ def build_claude_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
     # Guard it with cfg.cache_en so USE_CACHE=false disables all cache behavior.
     if cfg.cache_en and cfg.cache_anthropic_auto:
         kwargs["cache_control"] = make_cache_control(cfg.cache_anthropic_ttl)
-    if cfg.send_temperature : kwargs["temperature"] = get_temperature(payload)
-    if cfg.send_top_k       : kwargs["top_k"] = cfg.top_k
-    if cfg.send_top_p       : kwargs["top_p"] = cfg.top_p
+    if cfg.send_temperature : kwargs["temperature"] = cfg.temperature
+    if cfg.send_top_k       : kwargs["top_k"      ] = cfg.top_k
+    if cfg.send_top_p       : kwargs["top_p"      ] = cfg.top_p
     if cfg.thinking_enabled:
         if   cfg.use_adaptive:
             kwargs["thinking"]      = { "type": "adaptive", "display": "summarized" };
