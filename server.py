@@ -1185,7 +1185,7 @@ def extract_summary_block_control(content: str, msg_num: int) -> Tuple[Optional[
             return None, True
 
         attrs = parse_summary_block_attrs(match.group("attrs"))
-        tag = parse_summary_block_tag(attrs, msg_num, "end")
+        tag   = parse_summary_block_tag(attrs, msg_num, "end")
         if tag is None:
             return None, True
         role = parse_summary_block_role(attrs, msg_num, tag)
@@ -1193,10 +1193,10 @@ def extract_summary_block_control(content: str, msg_num: int) -> Tuple[Optional[
             return None, True
 
         return {
-            "kind": "end",
-            "tag": tag,
-            "role": role,
-            "text": match.group("body").strip(),
+            "kind" : "end",
+            "tag"  : tag,
+            "role" : role,
+            "text" : match.group("body").strip(),
         }, True
 
     begin_matches = list(SUMMARY_BLOCK_BEG_RE.finditer(text))
@@ -1211,13 +1211,13 @@ def extract_summary_block_control(content: str, msg_num: int) -> Tuple[Optional[
             return None, True
 
         attrs = parse_summary_block_attrs(match.group("attrs"))
-        tag = parse_summary_block_tag(attrs, msg_num, "begin")
+        tag   = parse_summary_block_tag(attrs, msg_num, "begin")
         if tag is None:
             return None, True
 
         return {
-            "kind": "begin",
-            "tag": tag,
+            "kind" : "begin",
+            "tag"  : tag,
         }, True
 
     warn_summary_block(f"Message {msg_num} contains a malformed summary control tag.")
@@ -1234,9 +1234,9 @@ def build_summary_groups(summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]
     for summary in intervals:
         if not groups or summary["start"] > groups[-1]["end"] + 1:
             groups.append({
-                "start": summary["start"],
-                "end": summary["end"],
-                "summaries": [summary],
+                "start"     : summary["start"],
+                "end"       : summary["end"],
+                "summaries" : [summary],
             })
             continue
 
@@ -1249,7 +1249,7 @@ def build_summary_groups(summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return groups
 
 
-def apply_summary_blocks(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
+def apply_summary_blocks(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], str]:
     """
     Removes summary control messages and optionally collapses covered ranges.
 
@@ -1258,11 +1258,12 @@ def apply_summary_blocks(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str,
     closing-message order.
     """
     if not messages:
-        return messages, []
+        return messages, ""
 
-    open_starts: Dict[str, int] = {}
+    open_starts : Dict[str, int]       = {}
+    summaries   : List[Dict[str, Any]] = []
     control_indices = set()
-    summaries: List[Dict[str, Any]] = []
+
 
     for idx, msg in enumerate(messages):
         control, should_discard = extract_summary_block_control(msg.get("content", ""), idx + 1)
@@ -1281,12 +1282,12 @@ def apply_summary_blocks(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str,
 
         if tag.lower() == "all":
             summaries.append({
-                "start": 0,
-                "end": idx,
-                "role": control["role"],
-                "text": control["text"],
-                "tag": tag,
-                "ordinal": len(summaries),
+                "start"   : 0,
+                "end"     : idx,
+                "role"    : control["role"],
+                "text"    : control["text"],
+                "tag"     : tag,
+                "ordinal" : len(summaries),
             })
             continue
 
@@ -1296,26 +1297,26 @@ def apply_summary_blocks(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str,
             continue
 
         summaries.append({
-            "start": start_idx,
-            "end": idx,
-            "role": control["role"],
-            "text": control["text"],
-            "tag": tag,
-            "ordinal": len(summaries),
+            "start"   : start_idx,
+            "end"     : idx,
+            "role"    : control["role"],
+            "text"    : control["text"],
+            "tag"     : tag,
+            "ordinal" : len(summaries),
         })
 
     for tag, start_idx in sorted(open_starts.items(), key=lambda item: item[1]):
         warn_summary_block(f"Message {start_idx + 1} starts summary tag {tag!r} without a matching end tag.")
 
     if not cfg.summary_blocks_enabled:
-        return [msg for idx, msg in enumerate(messages) if idx not in control_indices], []
+        return [msg for idx, msg in enumerate(messages) if idx not in control_indices], ""
 
     groups = build_summary_groups(summaries)
     if not groups:
-        return [msg for idx, msg in enumerate(messages) if idx not in control_indices], []
+        return [msg for idx, msg in enumerate(messages) if idx not in control_indices], ""
 
     result: List[Dict[str, Any]] = []
-    system_summary_texts: List[str] = []
+    system_summary_text = ""
     idx = 0
 
     for group in groups:
@@ -1326,11 +1327,13 @@ def apply_summary_blocks(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str,
 
         for summary in group["summaries"]:
             if summary["role"] == "system":
-                system_summary_texts.append(summary["text"])
+                stripped = summary["text"].strip()
+                if stripped:
+                    system_summary_text += f"{stripped}\n\n"
                 continue
             result.append({
-                "role": summary["role"],
-                "content": summary["text"],
+                "role"    : summary["role"],
+                "content" : summary["text"],
             })
 
         idx = group["end"] + 1
@@ -1340,7 +1343,7 @@ def apply_summary_blocks(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str,
             result.append(messages[idx])
         idx += 1
 
-    return result, system_summary_texts
+    return result, system_summary_text.strip()
 
 
 # Anthropic thinking block round-tripping
@@ -1387,16 +1390,16 @@ def make_hidden_thinking_envelope(blocks: List[Dict[str, Any]]) -> str:
         return ""
 
     payload = {
-        "version": 1,
-        "kind": "anthropic_thinking_blocks",
-        "blocks": blocks,
+        "version" : 1,
+        "kind"    : "anthropic_thinking_blocks",
+        "blocks"  : blocks,
     }
 
     # Keep the envelope ASCII-safe and line-wrapped for text-only clients.
-    raw = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    raw     = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
     encoded = base64.b64encode(raw).decode("ascii")
     wrapped = [encoded[i:i + 120] for i in range(0, len(encoded), 120)]
-    body = "\n".join(f"~~~{line}" for line in wrapped)
+    body    = "\n".join(f"~~~{line}" for line in wrapped)
 
     return f"\n{THINKING_ENVELOPE_START}\n{body}\n{THINKING_ENVELOPE_END}"
 
@@ -1430,14 +1433,14 @@ def extract_hidden_thinking_envelopes(text: str) -> Tuple[str, List[Dict[str, An
 
 def openai_stream_chunk(model_used: str, delta: Dict[str, Any], finish_reason: Optional[str] = None, usage: Optional[Dict[str, int]] = None, message_id: str = "claude") -> str:
     chunk: Dict[str, Any] = {
-        "id": message_id,
-        "object": "chat.completion.chunk",
-        "created": int(time.time()),
-        "model": f"anthropic/{model_used}",
-        "choices": [{
-            "index": 0,
-            "finish_reason": finish_reason,
-            "delta": delta,
+        "id"      : message_id,
+        "object"  : "chat.completion.chunk",
+        "created" : int(time.time()),
+        "model"   : f"anthropic/{model_used}",
+        "choices" : [{
+            "index"         : 0,
+            "finish_reason" : finish_reason,
+            "delta"         : delta,
         }],
     }
     if usage is not None:
@@ -1447,7 +1450,7 @@ def openai_stream_chunk(model_used: str, delta: Dict[str, Any], finish_reason: O
 
 PERSONA_END_RE  = re.compile(r"</[^<>]*\bPersona>", re.IGNORECASE)
 LOREBOOK_XML_RE = re.compile(r"<lorebook\b[^>]*>.*?</lorebook>", re.IGNORECASE | re.DOTALL)
-def format_system_for_claude(system_prompt: str, system_summary_texts: Optional[List[str]] = None) -> Tuple[List[Dict[str, Any]], str]:
+def format_system_for_claude(system_prompt: str, system_summary_text: str = "") -> Tuple[List[Dict[str, Any]], str]:
     """
     Formats the top-level Anthropic system prompt and optionally extracts the dynamic lorebook suffix.
 
@@ -1474,9 +1477,9 @@ def format_system_for_claude(system_prompt: str, system_summary_texts: Optional[
         - formatted_system: top-level Anthropic system blocks, or an empty list
         - lorebook_at_end_text: moved lorebook/suffix text, or an empty string
     """
-    summary_texts = system_summary_texts or []
-    text = system_prompt.strip()
-    if not text and not any((summary or "").strip() for summary in summary_texts):
+    text         = system_prompt.strip()
+    summary_text = system_summary_text.strip()
+    if (not text) and (not summary_text):
         return [], ""
 
     blocks: List[Dict[str, Any]] = []
@@ -1535,12 +1538,8 @@ def format_system_for_claude(system_prompt: str, system_summary_texts: Optional[
             new_block["cache_control"] = make_cache_control(cfg.cache_system_ttl)
         formatted_system.append(new_block)
 
-    for text in summary_texts:
-        stripped = (text or "").strip()
-        if not stripped:
-            continue
-        block: Dict[str, Any] = {"type": "text", "text": stripped}
-        formatted_system.append(block)
+    if summary_text:
+        formatted_system.append({"type": "text", "text": summary_text})
 
     return formatted_system, lorebook_at_end_text
 
@@ -1811,7 +1810,7 @@ def get_temperature(payload: Dict[str, Any]) -> float:
     return float(payload.get("temperature", cfg.default_temperature))
 
 
-def split_system_and_messages(raw_messages: Any) -> Tuple[str, List[Dict[str, Any]], List[str]]:
+def split_system_and_messages(raw_messages: Any) -> Tuple[str, List[Dict[str, Any]], str]:
     """
     Validates and normalizes OpenAI-style chat messages.
 
@@ -1819,7 +1818,7 @@ def split_system_and_messages(raw_messages: Any) -> Tuple[str, List[Dict[str, An
     Returns:
         - system_prompt: joined system messages, or an empty string
         - chat_messages: list of normalized message dicts
-        - system_summary_texts: role="system" all-summary blocks to append to system
+        - system_summary_text: role="system" all-summary text to append to system, or an empty string
 
     Invalid message lists abort with 400 and do not return.
     """
@@ -1855,7 +1854,7 @@ def split_system_and_messages(raw_messages: Any) -> Tuple[str, List[Dict[str, An
             msg_obj["anthropic_thinking_blocks"] = thinking_blocks
         chat_messages.append(msg_obj)
 
-    chat_messages, system_summary_texts = apply_summary_blocks(chat_messages)
+    chat_messages, system_summary_text = apply_summary_blocks(chat_messages)
 
     if thinking_preservation_enabled():
         # Mark only the last N assistant messages for signed-block rehydration.
@@ -1872,17 +1871,17 @@ def split_system_and_messages(raw_messages: Any) -> Tuple[str, List[Dict[str, An
             remaining -= 1
 
     system_prompt = "\n\n".join(system_parts)
-    return system_prompt, chat_messages, system_summary_texts
+    return system_prompt, chat_messages, system_summary_text
 
 
 def build_claude_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
 
-    system_prompt, chat_messages, system_summary_texts = split_system_and_messages(payload.get("messages"))
+    system_prompt, chat_messages, system_summary_text = split_system_and_messages(payload.get("messages"))
 
     if chat_messages and chat_messages[0].get("role") == "user" and chat_messages[0].get("content", "").strip() == ".":
         chat_messages = chat_messages[1:]
 
-    formatted_system, lorebook_at_end_text = format_system_for_claude(system_prompt, system_summary_texts)
+    formatted_system, lorebook_at_end_text = format_system_for_claude(system_prompt, system_summary_text)
     formatted_messages = format_to_claude_messages(chat_messages, lorebook_at_end_text)
 
     kwargs: Dict[str, Any] = {
