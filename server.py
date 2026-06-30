@@ -935,7 +935,6 @@ def admin_cli_loop() -> None:
 
 
 # Utility helpers
-
 def write_error_log(body: Any) -> None:
     try:
         with open(cfg.error_log_path, "a", encoding="utf-8") as f:
@@ -1098,9 +1097,7 @@ def content_to_plain_text(content: Any) -> str:
     return str(content)
 
 
-# =============================================================================
 # Summary block replacement
-# =============================================================================
 SUMMARY_BLOCK_ANY_RE = re.compile(r"<summary_block_(?:beg|end)\b", re.IGNORECASE)
 SUMMARY_BLOCK_BEG_RE = re.compile(r"<summary_block_beg\b(?P<attrs>[^>]*)>", re.IGNORECASE)
 SUMMARY_BLOCK_END_RE = re.compile(
@@ -1332,9 +1329,7 @@ def apply_summary_blocks(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str,
     return result, system_summary_texts
 
 
-# =============================================================================
 # Anthropic thinking block round-tripping
-# =============================================================================
 # Plain-text envelope lets Janitor carry signed Anthropic thinking blocks across turns.
 THINKING_ENVELOPE_TAG   = "thinking_preservation_block_v1"
 THINKING_ENVELOPE_START = f"~~~<{THINKING_ENVELOPE_TAG}>"
@@ -1583,7 +1578,7 @@ def format_to_claude_messages(mlist: List[Dict[str, Any]], lorebook_at_end_text:
         if cfg.version >= Version("4.8"):
             formatted.append({"role": "system", "content": lorebook_at_end_text.strip()})
         else:
-            scenario_update = f"\n<OOC>\nScenario update:\n\n{lorebook_at_end_text.strip()}\n</OOC>"
+            scenario_update = f"\n<OOC>\nGameMaster lore update:\n\n{lorebook_at_end_text.strip()}\n</OOC>"
             for i in range(len(formatted) - 1, -1, -1):
                 if formatted[i].get("role") == "user":
                     formatted[i]["content"] = append_text_to_content(formatted[i].get("content", ""), scenario_update)
@@ -1969,9 +1964,7 @@ def make_error_response(exc: Exception, payload: Optional[Dict[str, Any]] = None
     return Response(json.dumps(error_body, ensure_ascii=False), status=status_code, content_type="application/json")
 
 
-# =============================================================================
 # Generation
-# =============================================================================
 def print_payload(kwargs: Dict[str, Any]) -> None:
     if not cfg.debug_log:
         return
@@ -2073,8 +2066,6 @@ def handle_chat_completion():
 
 @app.route("/", methods=["GET"])
 def running():
-    base_url = request.base_url.rstrip("/")
-
     with SESSION_COST_LOCK:
         session_total_spent         = SESSION_TTL_SPENT_USD
         session_total_input_cost    = SESSION_TTL_INPUT_COST_USD
