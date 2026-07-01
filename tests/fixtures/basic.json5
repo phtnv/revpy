@@ -37,7 +37,7 @@
         messages: [
             {
                 role: "user",
-                content: "<OOC>\nBegin the scenario.\n</OOC>\nHello.",
+                content: "Hello.",
             },
         ],
     },

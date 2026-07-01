@@ -1596,8 +1596,8 @@ def format_to_claude_messages(mlist: List[Dict[str, Any]], lorebook_at_end_text:
     so moved lorebook content is treated like any other end-of-conversation item.
     """
 
-    formatted: List[Dict[str, Any]] = [{"role": "user", "content": "<OOC>\nBegin the scenario.\n</OOC>"}]
-    old_role  = "user"
+    formatted: List[Dict[str, Any]] = []
+    old_role: Optional[str] = None
 
     # Maps each incoming OpenAI-style chat message index to the Anthropic message index
     # that contains it after same-role merging. Cache markers are applied after the final
@@ -1619,7 +1619,7 @@ def format_to_claude_messages(mlist: List[Dict[str, Any]], lorebook_at_end_text:
 
         claude_role = "assistant" if incoming_role == "assistant" else "user"
 
-        if claude_role == old_role:
+        if formatted and claude_role == old_role:
             if isinstance(content, list):
                 # Preserve block form when a same-role assistant turn carries thinking blocks.
                 merged_blocks: List[Dict[str, Any]] = []
@@ -1666,6 +1666,7 @@ def format_to_claude_messages(mlist: List[Dict[str, Any]], lorebook_at_end_text:
         if cfg.assistant_prefill_mode == "instruction":
             append_prefill_instruction_to_last_user_message(formatted, cfg.assistant_prefill)
         elif cfg.assistant_prefill_mode == "assistant":
+            if not formatted                   : formatted.append({"role" : "user", "content" : ""})
             if formatted[-1]["role"] == "user" : formatted.append({"role" : "assistant", "content" : cfg.assistant_prefill})
             else                               : formatted[-1]["content"] = append_text_to_content(formatted[-1]["content"], cfg.assistant_prefill)
 
@@ -1911,8 +1912,10 @@ def build_claude_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     system_prompt, chat_messages, system_summary_text = split_system_and_messages(payload.get("messages"))
 
+    # JanitorAI sends '.' as the first fake user message (because all chats start with a user message).
+    # We're replacing it with the <OOC>\nBegin the scenario.\n</OOC> version since it seems more natural.
     if chat_messages and chat_messages[0].get("role") == "user" and chat_messages[0].get("content", "").strip() == ".":
-        chat_messages = chat_messages[1:]
+        chat_messages = [{"role": "user", "content": "<OOC>\nBegin the scenario.\n</OOC>"}] + chat_messages[1:]
 
     formatted_system, lorebook_at_end_text = format_system_for_claude(system_prompt, system_summary_text)
     formatted_messages = format_to_claude_messages(chat_messages, lorebook_at_end_text)
