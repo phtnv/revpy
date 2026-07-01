@@ -5,11 +5,13 @@
 
     system: "You are helpful.",
 
-    // OpenAI-compatible request text.
-    openai_user: "Hello.",
+    messages: [
+        { role: "user", content: "Hello." },
+    ],
 
-    // Anthropic request text expected at the fake client boundary.
-    expected_anthropic_user: "Hello.",
+    expected_anthropic_messages: [
+        { role: "user", content: "Hello." },
+    ],
 
     // Text returned by the fake Anthropic client.
     anthropic_response: "Hi there.",

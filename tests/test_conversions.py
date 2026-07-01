@@ -79,13 +79,13 @@ def reference_from_fixture(name) -> dict[str, Any]:
     messages = []
     if fixture.get("system"):
         messages.append({"role": "system", "content": fixture["system"]})
-    messages.append({"role": "user", "content": fixture["openai_user"]})
+    messages.extend(fixture["messages"])
 
     expected = {
         "status_code"          : 200,
         "anthropic_model"      : MODEL,
         "anthropic_max_tokens" : MAX_TOKENS,
-        "anthropic_content"    : fixture.get("expected_anthropic_user", fixture["openai_user"]),
+        "anthropic_messages"   : fixture.get("expected_anthropic_messages", fixture["messages"]),
         "openai_model"         : f"anthropic/{MODEL}",
         "openai_created"       : CREATED,
         "openai_content"       : fixture.get("expected_openai_assistant", fixture["anthropic_response"]),
@@ -109,7 +109,7 @@ def received_from(response: Any, fake: FakeAnthropic) -> dict[str, Any]:
         received.update({
             "anthropic_model"      : call.get("model"),
             "anthropic_max_tokens" : call.get("max_tokens"),
-            "anthropic_content"    : call.get("messages", [{}])[0].get("content"),
+            "anthropic_messages"   : call.get("messages"),
         })
 
     if body:
