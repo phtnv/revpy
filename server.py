@@ -221,7 +221,7 @@ class RuntimeConfig:
         elif "opus"   in model_l : self.model_cost_family = "opus"
         elif "fable"  in model_l : self.model_cost_family = "fable"
         else:
-            print(f"Unknown model family {model_l}. Using fable's (most expensive) prising estimates.")
+            print(f"Unknown model family {model_l}. Using fable's (most expensive) pricing estimates.")
             self.model_cost_family = "fable"
 
         costs = self.cost_table[self.model_cost_family]
