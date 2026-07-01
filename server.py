@@ -547,13 +547,24 @@ def anthropic_object_to_dict(obj: Any) -> Dict[str, Any]:
     return {"value": str(obj)}
 
 
-def model_id_from_info(model_info: Dict[str, Any]) -> str:
-    return str(model_info.get("id") or model_info.get("model") or "").strip()
-
-
-def anthropic_exception_message(exc: Exception) -> str:
+def anthropic_error_body(exc: Exception) -> Optional[Dict[str, Any]]:
     body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        return body
 
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            response_body = response.json()
+            if isinstance(response_body, dict):
+                return response_body
+        except Exception:
+            pass
+
+    return None
+
+
+def anthropic_error_message(body: Optional[Dict[str, Any]], fallback: str) -> str:
     if isinstance(body, dict):
         error_obj = body.get("error", {})
         if isinstance(error_obj, dict):
@@ -563,7 +574,36 @@ def anthropic_exception_message(exc: Exception) -> str:
 
         return json.dumps(body, ensure_ascii=False, default=str)
 
-    return str(exc) or exc.__class__.__name__
+    return fallback
+
+
+def print_anthropic_error(exc: Exception) -> bool:
+    ANSI_RED   : str = "\033[31m"
+    ANSI_RESET : str = "\033[0m"
+    body   = anthropic_error_body(exc)
+    module = exc.__class__.__module__.split(".", 1)[0]
+    if module != "anthropic" and body is None:
+        return False
+
+    fallback = str(exc) or exc.__class__.__name__
+
+    if body is None:
+        body = {
+            "type"  : "error",
+            "error" : {
+                "type"    : exc.__class__.__name__,
+                "message" : fallback,
+            },
+        }
+
+    message = anthropic_error_message(body, fallback)
+    print(json.dumps(body, indent=2, ensure_ascii=False, default=str))
+    print(f"{ANSI_RED}{message}{ANSI_RESET}")
+    return True
+
+
+def model_id_from_info(model_info: Dict[str, Any]) -> str:
+    return str(model_info.get("id") or model_info.get("model") or "").strip()
 
 
 def refresh_anthropic_models(key: str, timeout_s: float) -> bool:
@@ -603,11 +643,12 @@ def refresh_anthropic_models(key: str, timeout_s: float) -> bool:
         return False
 
     except Exception as exc:
+        anthropic_exception_msg : str = anthropic_error_message(anthropic_error_body(exc), str(exc) or exc.__class__.__name__)
         with MODEL_LOCK:
             ANTHROPIC_MODELS        = []
-            MODEL_LIST_LAST_ERROR   = anthropic_exception_message(exc)
+            MODEL_LIST_LAST_ERROR   = anthropic_exception_msg
             MODEL_LIST_LAST_TIMEOUT = False
-        print(f"WARNING: Could not retrieve a model list from Anthropic. {anthropic_exception_message(exc)}.")
+        print(f"WARNING: Could not retrieve a model list from Anthropic. {anthropic_exception_msg}.")
         return False
 
 
@@ -1935,27 +1976,27 @@ def make_openai_non_stream_response(message: Any, model: str) -> Dict[str, Any]:
         output_text += make_hidden_thinking_envelope(thinking_blocks)
 
     return {
-        "id": getattr(message, "id", "claude"),
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": f"anthropic/{model}",
-        "choices": [
+        "id"      : getattr(message, "id", "claude"),
+        "object"  : "chat.completion",
+        "created" : int(time.time()),
+        "model"   : f"anthropic/{model}",
+        "choices" : [
             {
-                "index": 0,
-                "finish_reason": getattr(message, "stop_reason", "stop"),
-                "message": {
-                    "role": "assistant",
-                    "content": output_text,
-                    "anthropic_content": anthropic_content,
-                    "anthropic_thinking_preserved": bool(thinking_preservation_enabled() and thinking_blocks),
+                "index"         : 0,
+                "finish_reason" : getattr(message, "stop_reason", "stop"),
+                "message"       : {
+                    "role"                         : "assistant",
+                    "content"                      : output_text,
+                    "anthropic_content"            : anthropic_content,
+                    "anthropic_thinking_preserved" : bool(thinking_preservation_enabled() and thinking_blocks),
                 },
             }
         ],
-        "usage": usage_to_openai_dict(getattr(message, "usage", None)),
+        "usage"   : usage_to_openai_dict(getattr(message, "usage", None)),
     }
 
 
-def make_error_response(exc: Exception, payload: Optional[Dict[str, Any]] = None) -> Response:
+def build_error_body(exc: Exception) -> Tuple[int, Dict[str, Any]]:
     status_code = 500
     message = str(exc)
     error_type = exc.__class__.__name__
@@ -1969,14 +2010,21 @@ def make_error_response(exc: Exception, payload: Optional[Dict[str, Any]] = None
     if hasattr(exc, "status_code"):
         status_code = getattr(exc, "status_code", status_code)
 
-    if hasattr(exc, "body"):
-        body = getattr(exc, "body", None)
-        if isinstance(body, dict):
-            error_obj  = body.get("error", {})
+    body = anthropic_error_body(exc)
+    if isinstance(body, dict):
+        error_obj = body.get("error", {})
+        if isinstance(error_obj, dict):
             message    = error_obj.get("message", message)
             error_type = error_obj.get("type", error_type)
 
     error_body = { "error": { "message": message, "type": error_type, "code": status_code } }
+    return status_code, error_body
+
+
+def make_error_response(exc: Exception, payload: Optional[Dict[str, Any]] = None) -> Response:
+    status_code, error_body = build_error_body(exc)
+    print_anthropic_error(exc)
+
     log_body   = { "error": error_body, "request": payload, "traceback": traceback.format_exc() }
     write_error_log(log_body)
 
@@ -2009,51 +2057,61 @@ def generate_non_stream(payload: Dict[str, Any], route_model: str) -> Dict[str, 
 
 
 def generate_stream(payload: Dict[str, Any], route_model: str):
-    client = get_anthropic_client()
-    kwargs = build_claude_kwargs(payload)
+    try:
+        client = get_anthropic_client()
+        kwargs = build_claude_kwargs(payload)
 
-    print_payload(kwargs)
+        print_payload(kwargs)
 
-    model_used = kwargs.get("model", route_model)
+        model_used = kwargs.get("model", route_model)
 
-    with client.messages.stream(**kwargs) as stream:
-        for event in stream:
-            if event.type == "content_block_delta":
-                if event.delta.type == "thinking_delta":
-                    # Stream reasoning_content only; Janitor already renders it as <think> text.
-                    yield openai_stream_chunk(model_used, {
-                        "role": "assistant",
-                        "reasoning_content": event.delta.thinking,
-                    })
+        with client.messages.stream(**kwargs) as stream:
+            for event in stream:
+                if event.type == "content_block_delta":
+                    if event.delta.type == "thinking_delta":
+                        # Stream reasoning_content only; Janitor already renders it as <think> text.
+                        yield openai_stream_chunk(model_used, {
+                            "role": "assistant",
+                            "reasoning_content": event.delta.thinking,
+                        })
 
-                elif event.delta.type == "text_delta":
-                    yield openai_stream_chunk(model_used, {
-                        "role": "assistant",
-                        "content": event.delta.text,
-                    })
-            time.sleep(0.01)
+                    elif event.delta.type == "text_delta":
+                        yield openai_stream_chunk(model_used, {
+                            "role": "assistant",
+                            "content": event.delta.text,
+                        })
+                time.sleep(0.01)
 
-        final_message = stream.get_final_message()
+            final_message = stream.get_final_message()
 
-        # The visible <think> text has already gone through reasoning_content above.
-        thinking_blocks = extract_preservable_thinking_blocks(anthropic_blocks_to_dicts(final_message))
-        if thinking_preservation_enabled() and thinking_blocks:
-            # Send only the hidden signed-block envelope for next-turn rehydration.
-            yield openai_stream_chunk(model_used, {
-                "role": "assistant",
-                "content": make_hidden_thinking_envelope(thinking_blocks),
-            })
+            # The visible <think> text has already gone through reasoning_content above.
+            thinking_blocks = extract_preservable_thinking_blocks(anthropic_blocks_to_dicts(final_message))
+            if thinking_preservation_enabled() and thinking_blocks:
+                # Send only the hidden signed-block envelope for next-turn rehydration.
+                yield openai_stream_chunk(model_used, {
+                    "role"    : "assistant",
+                    "content" : make_hidden_thinking_envelope(thinking_blocks),
+                })
 
-        usage = getattr(final_message, "usage", None)
-        print_usage(usage)
+            usage = getattr(final_message, "usage", None)
+            print_usage(usage)
 
-        yield openai_stream_chunk(
-            model_used,
-            {},
-            finish_reason=getattr(final_message, "stop_reason", "stop"),
-            usage=usage_to_openai_dict(getattr(final_message, "usage", None)),
-            message_id=getattr(final_message, "id", "claude"),
-        )
+            yield openai_stream_chunk(
+                model_used,
+                {},
+                finish_reason=getattr(final_message, "stop_reason", "stop"),
+                usage=usage_to_openai_dict(getattr(final_message, "usage", None)),
+                message_id=getattr(final_message, "id", "claude"),
+            )
+
+    except Exception as exc:
+        _, error_body = build_error_body(exc)
+        print_anthropic_error(exc)
+        log_body = { "error": error_body, "request": payload, "traceback": traceback.format_exc() }
+        write_error_log(log_body)
+        yield "data: " + json.dumps(error_body, ensure_ascii=False) + "\n\n"
+        yield "data: [DONE]\n\n"
+        return
 
     yield "data: [DONE]\n\n"
 
