@@ -1,6 +1,7 @@
 anthropic
 flask
 flask-cors
+json5
 packaging
 python-dotenv
 waitress
