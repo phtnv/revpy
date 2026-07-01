@@ -501,6 +501,8 @@ ANTHROPIC_MODELS      : List[Dict[str, Any]] = []
 MODEL_LIST_LAST_ERROR : Optional[str]        = None
 MODEL_LIST_LAST_TIMEOUT                      = False
 MODEL_LOCK                                   = threading.Lock()
+LATEST_CHAT_SNAPSHOT : Dict[str, Any]        = {}
+LATEST_CHAT_LOCK                             = threading.Lock()
 
 # Flask app
 app = Flask(__name__)
@@ -960,6 +962,20 @@ def admin_cli_loop() -> None:
                 cfg.print_status()
                 continue
 
+            if cmd in {"d", "dump"}:
+                if parts_l > 1 : path = line.split(maxsplit=1)[1]
+                else           : path = "chat_snapshot.json"
+                with LATEST_CHAT_LOCK:
+                    snapshot = LATEST_CHAT_SNAPSHOT
+                if not snapshot:
+                    print("No chat snapshot captured yet.")
+                    continue
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(snapshot, f, indent=2, ensure_ascii=False)
+                    f.write("\n")
+                print(f"Wrote latest chat snapshot to {path}.")
+                continue
+
             if cmd in {"help", "?"}:
                 print()
                 print("Commands:")
@@ -967,16 +983,18 @@ def admin_cli_loop() -> None:
                 print(CLI_CMD_MODEL_INFO)
                 print(CLI_CMD_PREFILL_INFO)
                 print(CLI_CMD_THINK_INFO)
-                print("  reload  Reload runtime settings from .env.")
-                print("  status  Show runtime settings.")
-                print("  help    Show this help.")
+                print("  reload         Reload runtime settings from .env.")
+                print("  status         Show runtime settings.")
+                print("  dump   <path>  Write the latest chat snapshot as a JSON.")
+                print("    Alias: d")
+                print("  help           Display this message.")
                 print("    Alias: ?")
-                print("  quit    Stop the process.")
-                print("    Alias: exit")
+                print("  quit           Stop the server.")
+                print("    Alias: q, exit")
                 print()
                 continue
 
-            if cmd in {"quit", "exit"}:
+            if cmd in {"q", "quit", "exit"}:
                 print("Stopping proxy.")
                 os._exit(0)
 
@@ -1908,6 +1926,49 @@ def split_system_and_messages(raw_messages: Any) -> Tuple[str, List[Dict[str, An
     return system_prompt, chat_messages, system_summary_text
 
 
+def capture_chat_snapshot(payload: Dict[str, Any], assistant_content: str, assistant_reasoning: str = "") -> None:
+    global LATEST_CHAT_SNAPSHOT
+
+    system_parts : List[str]            = []
+    messages     : List[Dict[str, Any]] = []
+    raw_messages = payload.get("messages", [])
+
+    if isinstance(raw_messages, list):
+        for msg in raw_messages:
+            if not isinstance(msg, dict):
+                continue
+
+            raw_role = msg.get("role", "user")
+            role     = raw_role if isinstance(raw_role, str) else "user"
+            content  = content_to_plain_text(msg.get("content", ""))
+
+            if role == "system":
+                if content.strip():
+                    system_parts.append(content.strip())
+                continue
+            if role not in ("user", "assistant"):
+                role = "user"
+
+            messages.append({"role": role, "content": content})
+
+    assistant_message : Dict[str, Any] = {"role": "assistant", "content": assistant_content or ""}
+    if assistant_reasoning:
+        assistant_message["reasoning"] = assistant_reasoning
+    messages.append(assistant_message)
+
+    now         = time.time()
+    exported_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + f".{int((now % 1)*1000):03d}Z"
+
+    with LATEST_CHAT_LOCK:
+        LATEST_CHAT_SNAPSHOT = {
+            "app"          : "mini-chat",
+            "version"      : 8,
+            "exportedAt"   : exported_at,
+            "systemPrompt" : "\n\n".join(system_parts),
+            "messages"     : messages,
+        }
+
+
 def build_claude_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     system_prompt, chat_messages, system_summary_text = split_system_and_messages(payload.get("messages"))
@@ -2056,7 +2117,9 @@ def generate_non_stream(payload: Dict[str, Any], route_model: str) -> Dict[str, 
     print_usage(usage)
 
     model_used = kwargs.get("model", route_model)
-    return make_openai_non_stream_response(message, model_used)
+    response = make_openai_non_stream_response(message, model_used)
+    capture_chat_snapshot(payload, response["choices"][0]["message"].get("content", ""))
+    return response
 
 
 def generate_stream(payload: Dict[str, Any], route_model: str):
@@ -2067,37 +2130,45 @@ def generate_stream(payload: Dict[str, Any], route_model: str):
         print_payload(kwargs)
 
         model_used = kwargs.get("model", route_model)
+        response_parts  : List[str] = []
+        reasoning_parts : List[str] = []
 
         with client.messages.stream(**kwargs) as stream:
             for event in stream:
                 if event.type == "content_block_delta":
                     if event.delta.type == "thinking_delta":
+                        reasoning_parts.append(event.delta.thinking)
                         # Stream reasoning_content only; Janitor already renders it as <think> text.
                         yield openai_stream_chunk(model_used, {
-                            "role": "assistant",
-                            "reasoning_content": event.delta.thinking,
+                            "role"              : "assistant",
+                            "reasoning_content" : event.delta.thinking,
                         })
-
                     elif event.delta.type == "text_delta":
+                        response_parts.append(event.delta.text)
                         yield openai_stream_chunk(model_used, {
-                            "role": "assistant",
-                            "content": event.delta.text,
+                            "role"    : "assistant",
+                            "content" : event.delta.text,
                         })
                 time.sleep(0.01)
 
             final_message = stream.get_final_message()
+            if not response_parts:
+                response_parts.append(extract_text_from_anthropic_message(final_message))
 
             # The visible <think> text has already gone through reasoning_content above.
             thinking_blocks = extract_preservable_thinking_blocks(anthropic_blocks_to_dicts(final_message))
             if thinking_preservation_enabled() and thinking_blocks:
                 # Send only the hidden signed-block envelope for next-turn rehydration.
+                thinking_envelope = make_hidden_thinking_envelope(thinking_blocks)
+                response_parts.append(thinking_envelope)
                 yield openai_stream_chunk(model_used, {
                     "role"    : "assistant",
-                    "content" : make_hidden_thinking_envelope(thinking_blocks),
+                    "content" : thinking_envelope,
                 })
 
             usage = getattr(final_message, "usage", None)
             print_usage(usage)
+            capture_chat_snapshot(payload, "".join(response_parts), "".join(reasoning_parts))
 
             yield openai_stream_chunk(
                 model_used,
@@ -2195,6 +2266,22 @@ def running():
                 "preserve_thinking_blocks"  : "inf" if cfg.preserve_thinking_blocks == UINT64_MAX else str(cfg.preserve_thinking_blocks),
             }
         }
+    )
+
+
+@app.route("/chat/snapshot"   , methods=["GET"])
+@app.route("/v1/chat/snapshot", methods=["GET"])
+def chat_snapshot():
+    with LATEST_CHAT_LOCK:
+        snapshot = LATEST_CHAT_SNAPSHOT
+
+    if not snapshot:
+        return Response(json.dumps({"error": "No chat snapshot captured yet."}), status=404, content_type="application/json")
+
+    return Response(
+        json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n",
+        content_type="application/json; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="mini-chat-latest.json"'},
     )
 
 
