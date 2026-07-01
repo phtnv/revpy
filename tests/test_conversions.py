@@ -4,7 +4,6 @@ import types
 
 from pathlib           import Path
 from typing            import Any, Callable, Protocol, cast
-from unittest.mock     import patch
 from packaging.version import Version
 
 
@@ -16,9 +15,14 @@ RESET    = "\033[0m"
 
 
 class ServerModule(Protocol):
-    cfg  : Any
-    app  : Any
-    time : Any
+    cfg                  : Any
+    app                  : Any
+    time                 : "ClockModule"
+    get_anthropic_client : Callable[[], Any]
+
+
+class ClockModule(Protocol):
+    time: Callable[[], float]
 
 
 def load_server_module() -> ServerModule:
@@ -136,14 +140,18 @@ def test_basic_non_streaming_roundtrip() -> bool:
         max_tokens = fixture["config"]["max_tokens"],
     )
 
-    with (
-        patch.object(server, "get_anthropic_client", return_value=fake_client),
-        patch.object(server.time, "time", return_value=fixture["expected_openai_response"]["created"]),
-    ):
+    original_get_anthropic_client = server.get_anthropic_client
+    original_time                 = server.time.time
+    server.get_anthropic_client   = lambda: fake_client
+    server.time.time              = lambda: fixture["expected_openai_response"]["created"]
+    try:
         response = server.app.test_client().post(
             "/v1/chat/completions",
             json=fixture["openai_request"],
         )
+    finally:
+        server.get_anthropic_client = original_get_anthropic_client
+        server.time.time = original_time
 
     expected_anthropic_content = fixture["expected_anthropic_request"]["messages"][0]["content"]
     received_anthropic_content = fake_client.messages.calls[0]["messages"][0]["content"]
