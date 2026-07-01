@@ -1,0 +1,17 @@
+{
+    name: "basic_text_conversion",
+
+    system: "You are helpful.",
+
+    // OpenAI-compatible request text.
+    openai_user: ".",
+
+    // Anthropic request text expected at the fake client boundary.
+    expected_anthropic_user: "<OOC>\nBegin the scenario.\n</OOC>",
+
+    // Text returned by the fake Anthropic client.
+    anthropic_response: "Starting.",
+
+    // OpenAI-compatible response text expected from the route.
+    expected_openai_assistant: "Starting.",
+}

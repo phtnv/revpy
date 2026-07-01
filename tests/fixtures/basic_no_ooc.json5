@@ -1,0 +1,19 @@
+// Basic non-streaming route roundtrip.
+// The test runner fills boring request/response metadata from defaults.
+{
+    name: "basic_text_conversion",
+
+    system: "You are helpful.",
+
+    // OpenAI-compatible request text.
+    openai_user: "Hello.",
+
+    // Anthropic request text expected at the fake client boundary.
+    expected_anthropic_user: "Hello.",
+
+    // Text returned by the fake Anthropic client.
+    anthropic_response: "Hi there.",
+
+    // OpenAI-compatible response text expected from the route.
+    expected_openai_assistant: "Hi there.",
+}
