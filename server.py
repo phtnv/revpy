@@ -963,17 +963,33 @@ def admin_cli_loop() -> None:
                 continue
 
             if cmd in {"d", "dump"}:
-                if parts_l > 1 : path = line.split(maxsplit=1)[1]
-                else           : path = "chat_snapshot.json"
+                fmt  = "json"
+                path = ""
+                if parts_l > 1:
+                    arg1 = parts[1].lower()
+                    if arg1 in {"n", "nat", "natural", "md", "markdown"}:
+                        fmt = "natural"
+                        split_line = line.split(maxsplit=2)
+                        if len(split_line) > 2 : path = split_line[2]
+                    elif arg1 in {"j", "json"}:
+                        split_line = line.split(maxsplit=2)
+                        if len(split_line) > 2 : path = split_line[2]
+                    else:
+                        path = line.split(maxsplit=1)[1]
+                if not path:
+                    path = "chat_snapshot.md" if fmt == "natural" else "chat_snapshot.json"
                 with LATEST_CHAT_LOCK:
                     snapshot = LATEST_CHAT_SNAPSHOT
                 if not snapshot:
                     print("No chat snapshot captured yet.")
                     continue
                 with open(path, "w", encoding="utf-8") as f:
-                    json.dump(snapshot, f, indent=2, ensure_ascii=False)
-                    f.write("\n")
-                print(f"Wrote latest chat snapshot to {path}.")
+                    if fmt == "natural":
+                        f.write(snapshot_to_markdown(snapshot))
+                    else:
+                        json.dump(snapshot, f, indent=2, ensure_ascii=False)
+                        f.write("\n")
+                print(f"Wrote latest chat snapshot to {path} ({fmt}).")
                 continue
 
             if cmd in {"help", "?"}:
@@ -985,7 +1001,9 @@ def admin_cli_loop() -> None:
                 print(CLI_CMD_THINK_INFO)
                 print("  reload         Reload runtime settings from .env.")
                 print("  status         Show runtime settings.")
-                print("  dump   <path>  Write the latest chat snapshot as a JSON.")
+                print("  dump [json|natural] [path]  Write the latest chat snapshot.")
+                print("    json     JSON snapshot (default). Alias: j")
+                print("    natural  Human-readable markdown. Alias: n, nat, md, markdown")
                 print("    Alias: d")
                 print("  help           Display this message.")
                 print("    Alias: ?")
@@ -1967,6 +1985,53 @@ def capture_chat_snapshot(payload: Dict[str, Any], assistant_content: str, assis
             "systemPrompt" : "\n\n".join(system_parts),
             "messages"     : messages,
         }
+
+
+NATURAL_DUMP_ESCAPE_RE  = re.compile(r"""\\(\\|n|t|r|"|')""")
+NATURAL_DUMP_ESCAPE_MAP = {"\\": "\\", "n": "\n", "t": "\t", "r": "\r", '"': '"', "'": "'"}
+
+def naturalize_dump_text(text: str) -> str:
+    """
+    Replaces literal JSON escape sequences (\\n, \\t, \\', ...) that leaked into
+    message text with the natural characters they represent.
+    """
+    return NATURAL_DUMP_ESCAPE_RE.sub(lambda m: NATURAL_DUMP_ESCAPE_MAP[m.group(1)], text)
+
+
+def snapshot_to_markdown(snapshot: Dict[str, Any]) -> str:
+    """
+    Renders a chat snapshot as human-readable markdown.
+    """
+    lines: List[str] = []
+
+    lines.append(f"# Chat dump {snapshot.get('exportedAt', '')}".rstrip())
+    lines.append("")
+
+    lines.append("## System")
+    system_text = naturalize_dump_text(str(snapshot.get("systemPrompt", "")))
+    lines.append(system_text if system_text.strip() else "(empty)")
+    lines.append("")
+
+    lines.append("## Chat")
+    lines.append("")
+
+    messages = snapshot.get("messages", [])
+    if isinstance(messages, list):
+        for index, msg in enumerate(messages, start=1):
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", "user"))
+            lines.append(f"### Message {index} ({role})")
+
+            reasoning = naturalize_dump_text(str(msg.get("reasoning", "")))
+            if reasoning.strip():
+                lines.append("\n".join(f"> {ln}" for ln in reasoning.splitlines()))
+                lines.append("")
+
+            lines.append(naturalize_dump_text(str(msg.get("content", ""))))
+            lines.append("")
+
+    return "\n".join(lines).rstrip("\n") + "\n"
 
 
 def build_claude_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:

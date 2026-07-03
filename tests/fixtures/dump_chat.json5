@@ -1,0 +1,34 @@
+// Directed test for the CLI 'dump' command in json and natural (markdown) formats.
+// Message 3 carries literal JSON escape artifacts (\n, \') that the natural
+// format must replace with real characters while the json format keeps them.
+{
+    name: "dump_chat",
+
+    system: "You are helpful.",
+
+    messages: [
+        { role: "user"     , content: "Hello." },
+        { role: "assistant", content: "Hi there." },
+        { role: "user"     , content: "Escaped\\nartifact and \\'quote\\'." },
+    ],
+
+    // Text returned by the fake Anthropic client.
+    anthropic_response: "Final reply.",
+
+    // Snapshot expected in the json dump. exportedAt derives from the frozen test clock.
+    expected_snapshot: {
+        app          : "mini-chat",
+        version      : 8,
+        exportedAt   : "2009-02-13T23:31:30.000Z",
+        systemPrompt : "You are helpful.",
+        messages     : [
+            { role: "user"     , content: "Hello." },
+            { role: "assistant", content: "Hi there." },
+            { role: "user"     , content: "Escaped\\nartifact and \\'quote\\'." },
+            { role: "assistant", content: "Final reply." },
+        ],
+    },
+
+    // File with the markdown expected from the natural dump.
+    expected_markdown_file: "dump_chat_expected.md",
+}

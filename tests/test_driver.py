@@ -1,5 +1,10 @@
+import builtins
+import contextlib
 import importlib
+import io
+import json
 import sys
+import tempfile
 
 from pathlib           import Path
 from types             import SimpleNamespace
@@ -136,6 +141,25 @@ def check_equal(expected: dict[str, Any], received: dict[str, Any]) -> bool:
 
     return all_ok
 
+def run_cli_commands(commands: list[str]) -> None:
+    """
+    Feeds commands to the admin CLI loop, then EOF. CLI output is swallowed.
+    """
+    pending = iter(commands)
+
+    def fake_input(prompt: str = "") -> str:
+        try                  : return next(pending)
+        except StopIteration : raise EOFError
+
+    original_input = builtins.input
+    builtins.input = fake_input
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            server.admin_cli_loop()
+    finally:
+        builtins.input = original_input
+
+
 tests_ttl : int = 0
 
 def test_basic_non_streaming_roundtrip(name: str) -> bool:
@@ -158,12 +182,53 @@ def test_basic_non_streaming_roundtrip(name: str) -> bool:
     return passed
 
 
+def test_chat_dump_formats(name: str) -> bool:
+    global tests_ttl
+    tests_ttl += 1
+    print(f"Testing chat dump (json and natural) with '{name}'... ", end="")
+
+    fixture = json5.loads((FIXTURES / name).read_text(encoding="utf-8"))
+    ref_msg = reference_from_fixture(name)
+    fake    = FakeAnthropic(ref_msg["reply"])
+
+    server.get_anthropic_client = lambda: fake
+    server.time.time            = lambda: CREATED
+    server.print_usage          = lambda usage: None
+    server.app.test_client().post("/v1/chat/completions", json=ref_msg["request"])
+
+    expected_snapshot = fixture["expected_snapshot"]
+    expected_markdown = (FIXTURES / fixture["expected_markdown_file"]).read_text(encoding="utf-8")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        json_path = Path(tmp_dir) / "chat_snapshot.json"
+        md_path   = Path(tmp_dir) / "chat_snapshot.md"
+
+        run_cli_commands([f"dump json {json_path}", f"dump natural {md_path}"])
+
+        if not json_path.is_file() or not md_path.is_file():
+            print(f"{RED}FAIL{RESET} (dump command wrote no file)")
+            return False
+
+        received_snapshot = json.loads(json_path.read_text(encoding="utf-8"))
+        received_markdown = md_path.read_text(encoding="utf-8")
+
+    passed = check_equal(expected_snapshot, received_snapshot)
+    if expected_markdown != received_markdown:
+        print(f"markdown exp={expected_markdown!r}, rec={received_markdown!r}")
+        passed = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
 if __name__ == "__main__":
     server.cfg = make_config()
 
     tests_passed : int = 0
     tests_passed += test_basic_non_streaming_roundtrip("basic_no_ooc.json5")
     tests_passed += test_basic_non_streaming_roundtrip("basic_with_ooc.json5")
+    tests_passed += test_chat_dump_formats("dump_chat.json5")
 
     tests_failed : int = tests_ttl - tests_passed
 
