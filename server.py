@@ -400,10 +400,10 @@ class RuntimeConfig:
             print("top_k is not compatible with thinking. Disabling.")
             self.send_top_k = False
         if self.send_top_p:
-            if   self.top_p < 0.95 : self.top_p = 0.95
-            elif self.top_p > 1.00 : self.top_p = 1.00
             if (self.top_p < 0.95) or (self.top_p > 1.00) :
                 print("Thinking supports top_p in the range [0.95:1]. Clamping.")
+            if   self.top_p < 0.95 : self.top_p = 0.95
+            elif self.top_p > 1.00 : self.top_p = 1.00
 
 
     def apply_model(self, i_info: Dict[str, Any]) -> None:
@@ -814,7 +814,7 @@ def admin_cli_loop() -> None:
                     print(CLI_CMD_CACHE_INFO)
                     continue
                 arg2 = parts[2].lower()
-                if arg2 in {"5m", "1h"}   : cfg.set_cache_dur(arg1, arg2); continue
+                if arg2 in {"5m", "1h"}   : cfg.set_cache_dur(arg1, arg2) ; continue
                 if arg2 in DISABLE_VALUES : cfg.set_cache_msg_num(arg1, 0); continue
                 if arg2 in ENABLE_VALUES  : cfg.set_cache_msg_num(arg1, 1); continue
                 try: msg_num = int(arg2)
@@ -1001,10 +1001,11 @@ def admin_cli_loop() -> None:
                 print(CLI_CMD_THINK_INFO)
                 print("  reload         Reload runtime settings from .env.")
                 print("  status         Show runtime settings.")
-                print("  dump [json|natural] [path]  Write the latest chat snapshot.")
-                print("    json     JSON snapshot (default). Alias: j")
-                print("    natural  Human-readable markdown. Alias: n, nat, md, markdown")
-                print("    Alias: d")
+                print("  dump command. Alias d.")
+                print("    dump  json    JSON snapshot (default).")
+                print("      Alias: j")
+                print("    dump natural  Human-readable markdown.")
+                print("      Alias: n, nat, md, markdown")
                 print("  help           Display this message.")
                 print("    Alias: ?")
                 print("  quit           Stop the server.")
