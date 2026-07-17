@@ -84,9 +84,13 @@ def refresh_openai_models(timeout_s: float) -> None:
             if response.status_code != 200:
                 raise error_from_response(name, response)
 
-            data    = response.json()
-            entries = data.get("data") if isinstance(data, dict) else None
-            got     = []
+            data = response.json()
+            # OpenAI-style APIs return {"data": [...]}, but not everyone follows the
+            # spec: Aion returns {"models": [...]}, and some providers a bare list.
+            if   isinstance(data, dict)  : entries = data.get("data") or data.get("models")
+            elif isinstance(data, list)  : entries = data
+            else                         : entries = None
+            got = []
             for entry in entries or []:
                 if isinstance(entry, dict) and entry.get("id"):
                     got.append({**entry, "id": str(entry["id"]), "provider": name})
@@ -330,7 +334,8 @@ def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
     message = choices[0].get("message") or {}
 
     output_text    = str(message.get("content") or "")
-    reasoning_text = str(message.get("reasoning_content") or "")
+    # DeepSeek-style APIs (GLM, ...) use reasoning_content; OpenRouter-style ones (Aion, ...) use reasoning.
+    reasoning_text = str(message.get("reasoning_content") or message.get("reasoning") or "")
 
     if cfg.auto_trim:
         output_text = trim_to_end_sentence(output_text)
@@ -405,7 +410,7 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
 
                 delta = choice.get("delta") or {}
 
-                reasoning_delta = delta.get("reasoning_content")
+                reasoning_delta = delta.get("reasoning_content") or delta.get("reasoning")
                 if reasoning_delta:
                     reasoning_parts.append(reasoning_delta)
                     yield ("reasoning", reasoning_delta)
