@@ -12,6 +12,7 @@ from typing     import Any, Dict, List, Optional, Tuple
 from waitress   import serve
 
 import claude
+import open_ai
 
 from claude import (
     anthropic_error_body,
@@ -37,6 +38,18 @@ from common import (
 LATEST_CHAT_SNAPSHOT : Dict[str, Any] = {}
 LATEST_CHAT_LOCK                      = threading.Lock()
 
+
+def active_backend():
+    """
+    The backend module serving requests: claude, or open_ai for any provider
+    configured through OPENAI_PROVIDERS. Both expose the same generate functions.
+    """
+    return claude if cfg.backend == "anthropic" else open_ai
+
+
+def model_label() -> str:
+    return f"{cfg.backend}/{cfg.model}"
+
 # Flask app
 app = Flask(__name__)
 CORS(app)
@@ -59,9 +72,36 @@ def reload_runtime_env() -> None:
     cfg.port = bound_port
 
     refresh_anthropic_models(cfg.anthropic_api_key, cfg.model_list_timeout_seconds)
+    open_ai.refresh_openai_models(cfg.model_list_timeout_seconds)
 
     print("Reloaded runtime configuration from .env.")
     print("HOST and PORT were not changed; restart the process to change bind address.")
+
+
+def cli_print_model_list() -> None:
+    print_model_list()
+    open_ai.print_model_list(number_offset=len(claude.ANTHROPIC_MODELS))
+
+
+def cli_select_model(number: int) -> None:
+    anthropic_count = len(claude.ANTHROPIC_MODELS)
+    if number <= anthropic_count : select_model_by_number(number)
+    else                         : open_ai.select_model_by_number(number - anthropic_count)
+
+
+def cli_print_model_info(number: int) -> None:
+    anthropic_count = len(claude.ANTHROPIC_MODELS)
+    if number <= anthropic_count : print_model_info(number)
+    else                         : open_ai.print_model_info(number - anthropic_count)
+
+
+def cli_refresh_models() -> None:
+    refresh_anthropic_models(cfg.anthropic_api_key, cfg.model_list_timeout_seconds)
+    open_ai.refresh_openai_models(cfg.model_list_timeout_seconds)
+    if cfg.backend == "anthropic":
+        cfg.find_cfg(claude.ANTHROPIC_MODELS)
+    elif not open_ai.apply_model_by_id(f"{cfg.backend}/{cfg.model}"):
+        print(f"Model {cfg.backend}/{cfg.model} is no longer in the refreshed provider list.")
 
 
 CLI_CMD_MODEL_INFO = """\
@@ -144,6 +184,9 @@ def admin_cli_loop() -> None:
 
         try:
             if cmd in {"c", "cache"}:
+                if cfg.backend != "anthropic":
+                    print(f"Cache markers are Anthropic-only. Backend '{cfg.backend}' has no explicit cache control (use EXTRA_BODY if the provider supports one).")
+                    continue
                 if parts_l < 2:
                     cfg.print_cache_status()
                     continue
@@ -169,6 +212,9 @@ def admin_cli_loop() -> None:
                 continue
 
             if cmd in {"t", "think", "thinking"}:
+                if cfg.backend != "anthropic":
+                    print(f"Thinking controls are Anthropic-only. For backend '{cfg.backend}', configure thinking through the provider's EXTRA_BODY.")
+                    continue
                 if parts_l < 2:
                     cfg.print_think_status()
                     continue
@@ -268,7 +314,7 @@ def admin_cli_loop() -> None:
 
             if cmd in {"m", "model", "models"}:
                 if parts_l < 2:
-                    print_model_list()
+                    cli_print_model_list()
                     continue
 
                 arg1 = parts[1].lower()
@@ -276,14 +322,13 @@ def admin_cli_loop() -> None:
                     try: model_id = int(arg1)
                     except Exception: pass
                     else:
-                        select_model_by_number(model_id)
+                        cli_select_model(model_id)
                         continue
                     if arg1 in {"i", "info"}:
                         print(json.dumps(cfg.model_info, indent=2, ensure_ascii=False, default=str))
                         continue
                     if arg1 in {"r", "refresh"}:
-                        refresh_anthropic_models(cfg.anthropic_api_key, cfg.model_list_timeout_seconds)
-                        cfg.find_cfg(claude.ANTHROPIC_MODELS)
+                        cli_refresh_models()
                         continue
                     print(CLI_CMD_MODEL_INFO)
                     continue
@@ -296,7 +341,7 @@ def admin_cli_loop() -> None:
                     try: model_id = int(arg2)
                     except Exception: pass
                     else:
-                        print_model_info(model_id)
+                        cli_print_model_info(model_id)
                         continue
                 print(CLI_CMD_MODEL_INFO)
                 continue
@@ -612,12 +657,12 @@ def apply_summary_blocks(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str,
     return result, system_summary_text.strip()
 
 
-def openai_stream_chunk(model_used: str, delta: Dict[str, Any], finish_reason: Optional[str] = None, usage: Optional[Dict[str, int]] = None, message_id: str = "claude") -> str:
+def openai_stream_chunk(model_label_str: str, delta: Dict[str, Any], finish_reason: Optional[str] = None, usage: Optional[Dict[str, int]] = None, message_id: str = "claude") -> str:
     chunk: Dict[str, Any] = {
         "id"      : message_id,
         "object"  : "chat.completion.chunk",
         "created" : int(time.time()),
-        "model"   : f"anthropic/{model_used}",
+        "model"   : model_label_str,
         "choices" : [{
             "index"         : 0,
             "finish_reason" : finish_reason,
@@ -907,7 +952,7 @@ def make_openai_non_stream_response(result: Dict[str, Any]) -> Dict[str, Any]:
         "id"      : result["id"],
         "object"  : "chat.completion",
         "created" : int(time.time()),
-        "model"   : f"anthropic/{cfg.model}",
+        "model"   : model_label(),
         "choices" : [
             {
                 "index"         : 0,
@@ -957,7 +1002,7 @@ def make_error_response(exc: Exception, payload: Optional[Dict[str, Any]] = None
 # Generation
 def generate_non_stream(payload: Dict[str, Any]) -> Dict[str, Any]:
     prepared = prepare_chat_request(payload)
-    result   = claude.generate_non_stream(prepared)
+    result   = active_backend().generate_non_stream(prepared)
 
     response = make_openai_non_stream_response(result)
     capture_chat_snapshot(payload, response["choices"][0]["message"].get("content", ""))
@@ -967,23 +1012,24 @@ def generate_non_stream(payload: Dict[str, Any]) -> Dict[str, Any]:
 def generate_stream(payload: Dict[str, Any]):
     try:
         prepared = prepare_chat_request(payload)
+        label    = model_label()
 
-        for kind, data in claude.generate_stream(prepared):
+        for kind, data in active_backend().generate_stream(prepared):
             if kind == "reasoning":
                 # Stream reasoning_content only; Janitor already renders it as <think> text.
-                yield openai_stream_chunk(cfg.model, {
+                yield openai_stream_chunk(label, {
                     "role"              : "assistant",
                     "reasoning_content" : data,
                 })
             elif kind == "text":
-                yield openai_stream_chunk(cfg.model, {
+                yield openai_stream_chunk(label, {
                     "role"    : "assistant",
                     "content" : data,
                 })
             elif kind == "final":
                 capture_chat_snapshot(payload, data["snapshot_text"], data["snapshot_reasoning"])
                 yield openai_stream_chunk(
-                    cfg.model,
+                    label,
                     {},
                     finish_reason=data["stop_reason"],
                     usage=data["usage"],
@@ -1034,6 +1080,7 @@ def running():
     return jsonify(
         {
             "status"        : "ok",
+            "backend"       : cfg.backend,
             "model"         : cfg.model,
             "prompt_cache"  : cfg.cache_en,
             "cache"         : {
@@ -1102,7 +1149,10 @@ if __name__ == "__main__":
     load_dotenv()
     cfg.reload_from_env()
     refresh_anthropic_models(cfg.anthropic_api_key, cfg.model_list_timeout_seconds)
-    cfg.find_cfg(claude.ANTHROPIC_MODELS)
+    open_ai.refresh_openai_models(cfg.model_list_timeout_seconds)
+    # MODEL may name either an Anthropic model or a provider model ("glm-4.7" or "glm/glm-4.7").
+    if not open_ai.apply_model_by_id(cfg.model):
+        cfg.find_cfg(claude.ANTHROPIC_MODELS)
 
     print("Starting Claude proxy")
     print(f"Local URL: http://{cfg.host}:{cfg.port}")

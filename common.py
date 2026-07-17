@@ -1,8 +1,10 @@
 import json
+import json5
 import os
 import re
 import threading
 
+from flask             import abort, request
 from packaging.version import Version
 from typing            import Any, Dict, List
 
@@ -110,6 +112,48 @@ class RuntimeConfig:
         # Full model record from the provider model list. Empty until apply_model()
         # runs, so capability checks (resolve_thinking) fail closed instead of crashing.
         self.info = {}
+
+        # Active backend: "anthropic", or the name of an OpenAI-style provider
+        # from OPENAI_PROVIDERS. Switched by selecting a model in the CLI.
+        self.backend = "anthropic"
+
+        # OpenAI-style providers (GLM, Aion, ...). Each name in OPENAI_PROVIDERS
+        # is configured through <NAME>_BASE_URL, <NAME>_API_KEY, and optionally:
+        #   <NAME>_MODELS                 comma-separated model ids; skips the /models request
+        #   <NAME>_EXTRA_BODY             json5 object merged verbatim into every request
+        #                                 (the escape hatch for provider thinking/caching dialects)
+        #   <NAME>_INPUT_TOKEN_COST_USD, <NAME>_OUTPUT_TOKEN_COST_USD, <NAME>_CACHE_READ_COST_USD
+        self.openai_providers: Dict[str, Dict[str, Any]] = {}
+        for name in [p.strip().lower() for p in os.getenv("OPENAI_PROVIDERS", "").split(",") if p.strip()]:
+            prefix = re.sub(r"[^A-Z0-9]", "_", name.upper())
+
+            extra_body = {}
+            extra_raw  = os.getenv(f"{prefix}_EXTRA_BODY", "").strip()
+            if extra_raw:
+                try:
+                    parsed = json5.loads(extra_raw)
+                    if isinstance(parsed, dict) : extra_body = parsed
+                    else                        : print(f"WARNING: {prefix}_EXTRA_BODY must be a JSON object. Ignoring.")
+                except Exception as exc:
+                    print(f"WARNING: {prefix}_EXTRA_BODY is not valid json5 ({exc}). Ignoring.")
+
+            base_url = os.getenv(f"{prefix}_BASE_URL", "").strip().rstrip("/")
+            if not base_url:
+                print(f"WARNING: provider '{name}' listed in OPENAI_PROVIDERS but {prefix}_BASE_URL is missing. Skipping.")
+                continue
+
+            self.openai_providers[name] = {
+                "base_url"        : base_url,
+                "api_key"         : os.getenv(f"{prefix}_API_KEY", "").strip(),
+                "api_key_name"    : f"{prefix}_API_KEY",
+                "models"          : [m.strip() for m in os.getenv(f"{prefix}_MODELS", "").split(",") if m.strip()],
+                "extra_body"      : extra_body,
+                "input_cost"      : getenv_float(f"{prefix}_INPUT_TOKEN_COST_USD" , 0.0),
+                "output_cost"     : getenv_float(f"{prefix}_OUTPUT_TOKEN_COST_USD", 0.0),
+                "cache_read_cost" : getenv_float(f"{prefix}_CACHE_READ_COST_USD"  , 0.0),
+            }
+
+        self.openai_request_timeout_seconds = getenv_float("OPENAI_REQUEST_TIMEOUT_SECONDS", 600.0)
 
         self.anthropic_api_key     = os.getenv("ANTHROPIC_API_KEY", "").strip()
         self.proxy_key             = os.getenv("PROXY_KEY", "").strip()
@@ -402,6 +446,7 @@ class RuntimeConfig:
 
 
     def apply_model(self, i_info: Dict[str, Any]) -> None:
+        self.backend = "anthropic"
         self.info  = i_info
         self.model = deep_get(self.info, "id")
         print(f"=== Switching to {self.model} ===")
@@ -439,6 +484,7 @@ class RuntimeConfig:
         print("=== Runtime config start ===")
         print(f"host                   = {self.host} (restart required to change)")
         print(f"port                   = {self.port} (restart required to change)")
+        print(f"backend                = {self.backend}")
         print(f"model                  = {self.model}")
         print(f"model_cost_family      = {self.model_cost_family}")
         print(f"  input_token_cost     = {self.input_token_cost_usd}")
@@ -530,6 +576,37 @@ def add_session_cost(request_total_cost: float, total_input_cost: float, output_
 def session_cost_snapshot() -> Dict[str, Any]:
     with SESSION_COST_LOCK:
         return session_cost_totals_locked()
+
+
+def get_bearer_token() -> str:
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return auth.strip()
+
+
+def resolve_api_key(configured_key: str, key_name: str) -> str:
+    """
+    Per-request auth shared by every backend.
+
+    Recommended public-tunnel mode:
+        .env contains the provider API key and PROXY_KEY. JanitorAI uses PROXY_KEY as the proxy key.
+
+    Optional compatibility mode:
+        ALLOW_KEY_PASSTHROUGH=true lets the incoming Bearer token act as the provider key.
+    """
+    provided_key = get_bearer_token()
+
+    if configured_key:
+        if cfg.require_proxy_key:
+            if not cfg.proxy_key             : abort(500, description=("Server is configured with REQUIRE_PROXY_KEY=true, but PROXY_KEY is missing from .env."))
+            if provided_key != cfg.proxy_key : abort(401, description="Invalid proxy key.")
+        return configured_key
+    if cfg.allow_key_passthrough:
+        if not provided_key : abort(401, description="Missing Authorization bearer token.")
+        return provided_key
+    abort(500, description=(f"{key_name} is not configured. Either set {key_name} and PROXY_KEY in .env, or set ALLOW_KEY_PASSTHROUGH=true."))
+    raise RuntimeError("unreachable")
 
 
 def content_to_plain_text(content: Any) -> str:

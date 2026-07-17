@@ -5,14 +5,14 @@ import re
 import threading
 import time
 
-from flask             import abort, request
 from packaging.version import Version
-from typing            import Any, Dict, List, Optional, Tuple
+from typing            import Any, Dict, Iterator, List, Optional, Tuple
 
 from common import (
     append_prefill_instruction_to_last_user_message,
     append_text_to_content,
     cfg,
+    resolve_api_key,
     track_usage,
     trim_to_end_sentence,
 )
@@ -216,32 +216,8 @@ def print_model_info(index: int) -> None:
     print(json.dumps(model_info, indent=2, ensure_ascii=False, default=str))
 
 
-def get_bearer_token() -> str:
-    auth = request.headers.get("Authorization", "")
-    if auth.lower().startswith("bearer "):
-        return auth[7:].strip()
-    return auth.strip()
-
-
 def get_anthropic_client() -> anthropic.Anthropic:
-    """
-    Recommended public-tunnel mode:
-        .env contains ANTHROPIC_API_KEY and PROXY_KEY. JanitorAI uses PROXY_KEY as the proxy key.
-
-    Optional compatibility mode:
-        ALLOW_KEY_PASSTHROUGH=true lets incoming Bearer token act as Anthropic key.
-    """
-    provided_key = get_bearer_token()
-
-    if cfg.anthropic_api_key:
-        if cfg.require_proxy_key:
-            if not cfg.proxy_key             : abort(500, description=("Server is configured with REQUIRE_PROXY_KEY=true, but PROXY_KEY is missing from .env."))
-            if provided_key != cfg.proxy_key : abort(401, description="Invalid proxy key.")
-        return anthropic.Anthropic(api_key=cfg.anthropic_api_key)
-    if cfg.allow_key_passthrough:
-        if not provided_key : abort(401, description="Missing Authorization bearer token.")
-        return anthropic.Anthropic(api_key=provided_key)
-    abort(500, description=("ANTHROPIC_API_KEY is not configured. Either set ANTHROPIC_API_KEY and PROXY_KEY in .env, or set ALLOW_KEY_PASSTHROUGH=true."))
+    return anthropic.Anthropic(api_key=resolve_api_key(cfg.anthropic_api_key, "ANTHROPIC_API_KEY"))
 
 
 def make_cache_control(ttl: str) -> Dict[str, str]:
@@ -693,7 +669,7 @@ def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def generate_stream(prepared: Dict[str, Any]):
+def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
     """
     Runs one streaming completion, yielding backend-neutral events:
         ("reasoning", text)  incremental reasoning text
