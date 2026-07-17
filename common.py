@@ -142,12 +142,47 @@ class RuntimeConfig:
                 print(f"WARNING: provider '{name}' listed in OPENAI_PROVIDERS but {prefix}_BASE_URL is missing. Skipping.")
                 continue
 
+            # Per-model cost families: <PREFIX>_MODEL_<FAMILY>_REGEX is matched (re.search)
+            # against the selected model id; the first declared match wins. The costs live in
+            # <PREFIX>_MODEL_<FAMILY>_COST as a json5 object, USD per 1 million tokens:
+            #   {input: 0.80, output: 1.60, cache_read: 0.20}
+            # Missing cost keys default to 0. Models matching no family use the provider-level costs.
+            cost_families: List[Dict[str, Any]] = []
+            family_var_re = re.compile(rf"^{re.escape(prefix)}_MODEL_([A-Za-z0-9]+)_REGEX$")
+            for env_name in os.environ:
+                match = family_var_re.match(env_name)
+                if match is None:
+                    continue
+                family   = match.group(1)
+                cost_var = f"{prefix}_MODEL_{family}_COST"
+
+                try:
+                    pattern = re.compile(os.environ[env_name].strip())
+                except re.error as exc:
+                    print(f"WARNING: {env_name} is not a valid regex ({exc}). Skipping cost family.")
+                    continue
+
+                try:
+                    costs = json5.loads(os.getenv(cost_var, "").strip() or "null")
+                    if not isinstance(costs, dict):
+                        raise ValueError("must be a json5 object like {input: 0.8, output: 1.6, cache_read: 0.2}")
+                    cost_families.append({
+                        "name"            : family.lower(),
+                        "regex"           : pattern,
+                        "input_cost"      : float(costs.get("input"     , 0.0) or 0.0),
+                        "output_cost"     : float(costs.get("output"    , 0.0) or 0.0),
+                        "cache_read_cost" : float(costs.get("cache_read", 0.0) or 0.0),
+                    })
+                except Exception as exc:
+                    print(f"WARNING: {cost_var}: {exc}. Skipping cost family.")
+
             self.openai_providers[name] = {
                 "base_url"        : base_url,
                 "api_key"         : os.getenv(f"{prefix}_API_KEY", "").strip(),
                 "api_key_name"    : f"{prefix}_API_KEY",
                 "models"          : [m.strip() for m in os.getenv(f"{prefix}_MODELS", "").split(",") if m.strip()],
                 "extra_body"      : extra_body,
+                "cost_families"   : cost_families,
                 "input_cost"      : getenv_float(f"{prefix}_INPUT_TOKEN_COST_USD" , 0.0),
                 "output_cost"     : getenv_float(f"{prefix}_OUTPUT_TOKEN_COST_USD", 0.0),
                 "cache_read_cost" : getenv_float(f"{prefix}_CACHE_READ_COST_USD"  , 0.0),

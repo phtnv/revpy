@@ -161,14 +161,24 @@ def apply_openai_model(entry: Dict[str, Any]) -> None:
     cfg.model_info = dict(entry)
     cfg.version    = Version("0.0")
 
-    cfg.model_cost_family     = entry["provider"]
-    cfg.input_token_cost_usd  = provider["input_cost"]
-    cfg.output_token_cost_usd = provider["output_cost"]
-    cfg.cache_read_cost_usd   = provider["cache_read_cost"]
+    # Per-model cost family when one matches, provider-level costs otherwise.
+    cost_source = provider
+    cost_family = entry["provider"]
+    for family in provider["cost_families"]:
+        if family["regex"].search(entry["id"]):
+            cost_source = family
+            cost_family = f"{entry['provider']}:{family['name']}"
+            break
+
+    print(f"Using cost family '{cost_family}'.")
+    cfg.model_cost_family     = cost_family
+    cfg.input_token_cost_usd  = cost_source["input_cost"]
+    cfg.output_token_cost_usd = cost_source["output_cost"]
+    cfg.cache_read_cost_usd   = cost_source["cache_read_cost"]
     # OpenAI-style providers have no explicit cache writes. Price writes as plain
     # input so any stray write tokens net to zero in the cache-cost accounting.
-    cfg.cache_write_5m_cost_usd = provider["input_cost"]
-    cfg.cache_write_1h_cost_usd = provider["input_cost"]
+    cfg.cache_write_5m_cost_usd = cost_source["input_cost"]
+    cfg.cache_write_1h_cost_usd = cost_source["input_cost"]
     print(f"=== Switching to {entry['provider']}/{entry['id']} complete ===")
 
 
