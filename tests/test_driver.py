@@ -31,6 +31,7 @@ USAGE      = {
 }
 
 sys.path.insert(0, str(ROOT))
+common: Any = importlib.import_module("common")
 server: Any = importlib.import_module("server")
 
 
@@ -55,7 +56,8 @@ class FakeAnthropic:
 
 
 def make_config() -> Any:
-    cfg = server.RuntimeConfig()
+    # common.cfg is a shared singleton; configure it in place instead of rebinding it.
+    cfg = common.cfg
     cfg.reload_from_env()
     cfg.model                    = MODEL
     cfg.version                  = Version("4.0")
@@ -223,7 +225,7 @@ def test_chat_dump_formats(name: str) -> bool:
 
 
 if __name__ == "__main__":
-    server.cfg = make_config()
+    make_config()
 
     tests_passed : int = 0
     tests_passed += test_basic_non_streaming_roundtrip("basic_no_ooc.json5")
