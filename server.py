@@ -14,24 +14,14 @@ from waitress   import serve
 import claude
 
 from claude import (
-    anthropic_blocks_to_dicts,
     anthropic_error_body,
     extract_hidden_thinking_envelopes,
-    extract_preservable_thinking_blocks,
-    extract_text_from_anthropic_message,
-    format_system_for_claude,
-    format_to_claude_messages,
-    get_anthropic_client,
-    make_cache_control,
-    make_hidden_thinking_envelope,
     print_anthropic_error,
     print_model_info,
     print_model_list,
-    print_usage,
     refresh_anthropic_models,
     select_model_by_number,
     thinking_preservation_enabled,
-    usage_to_openai_dict,
 )
 from common import (
     DISABLE_VALUES,
@@ -291,7 +281,7 @@ def admin_cli_loop() -> None:
                     if arg1 in {"i", "info"}:
                         print(json.dumps(cfg.model_info, indent=2, ensure_ascii=False, default=str))
                         continue
-                    if arg1 == {"r", "refresh"}:
+                    if arg1 in {"r", "refresh"}:
                         refresh_anthropic_models(cfg.anthropic_api_key, cfg.model_list_timeout_seconds)
                         cfg.find_cfg(claude.ANTHROPIC_MODELS)
                         continue
@@ -302,7 +292,7 @@ def admin_cli_loop() -> None:
                     print(CLI_CMD_MODEL_INFO)
                     continue
                 arg2 = parts[2].lower()
-                if arg1 == {"i", "info"}:
+                if arg1 in {"i", "info"}:
                     try: model_id = int(arg2)
                     except Exception: pass
                     else:
@@ -639,26 +629,90 @@ def openai_stream_chunk(model_used: str, delta: Dict[str, Any], finish_reason: O
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
-def trim_to_end_sentence(input_str: str, include_newline: bool = False) -> str:
-    punctuation = set([".", "!", "?", "*", '"', ")", "}", "`", "]", "$", "。", "！", "？", "”", "）", "】", "’", "」"])
+PERSONA_END_RE  = re.compile(r"</[^<>]*\bPersona>", re.IGNORECASE)
+LOREBOOK_XML_RE = re.compile(r"<lorebook\b[^>]*>.*?</lorebook>", re.IGNORECASE | re.DOTALL)
+def split_system_text(system_prompt: str) -> Tuple[List[str], str]:
+    """
+    Splits the joined system prompt into segments and an optional moved-to-end suffix.
 
-    last = -1
-    for i in range(len(input_str) - 1, -1, -1):
-        char = input_str[i]
+    This is pure string surgery driven by the lorebook settings; how the segments
+    are represented on the wire (Anthropic system blocks with cache markers, plain
+    OpenAI system messages, ...) is up to the backend.
 
-        if char in punctuation:
-            if i > 0 and input_str[i - 1] in [" ", "\n"] : last = i - 1
-            else                                         : last = i
-            break
+    When SPLIT_LOREBOOK=true, the prompt is split into:
+        1. stable core definition
+        2. dynamic lorebook / user-script suffix
 
-        if include_newline and char == "\n":
-            last = i
-            break
+    Split priority:
+        1. After </summary>
+        2. After </example_dialogs>
+        3. After </UserPersona>
+        4. After </Scenario>
+        5. After the last </* Persona> marker
+        6. Otherwise keep the whole system prompt as one segment
 
-    if last == -1:
-        return input_str.rstrip()
+    When LOREBOOK_AT_END=true, the suffix is returned as plain text instead of being
+    kept as a system segment. That moved suffix deliberately does not receive the old
+    system/lorebook cache marker; it is handled later as an ordinary end-of-conversation item.
 
-    return input_str[: last + 1].rstrip()
+    When LOREBOOK_XML_AT_END=true, every <lorebook>...</lorebook> block is removed from the
+    system prompt and appended after any other moved end-of-chat lorebook text.
+
+    Returns:
+        - system_segments: system prompt segments, or an empty list
+        - lorebook_at_end_text: moved lorebook/suffix text, or an empty string
+    """
+    text = system_prompt.strip()
+
+    segments: List[str] = []
+    lorebook_at_end_text     = ""
+    lorebook_xml_at_end_text = ""
+
+    if text and cfg.lorebook_xml_at_end:
+        matches = [match.group(0).strip() for match in LOREBOOK_XML_RE.finditer(text) if match.group(0).strip()]
+        if matches:
+            text = LOREBOOK_XML_RE.sub("", text).strip()
+            lorebook_xml_at_end_text = "\n\n".join(matches)
+
+    if text:
+        if cfg.split_lorebook:
+            split_at = -1
+
+            for split_marker in ("</summary>", "</example_dialogs>", "</UserPersona>", "</Scenario>"):
+                split_idx = text.find(split_marker)
+                if split_idx != -1:
+                    split_at = split_idx + len(split_marker)
+                    break
+
+            if split_at == -1:
+                persona_matches = list(PERSONA_END_RE.finditer(text))
+                if persona_matches:
+                    split_at = persona_matches[-1].end()
+
+            if split_at == -1 or split_at >= len(text):
+                segments.append(text)
+            else:
+                before = text[:split_at].rstrip()
+                after  = text[split_at:].strip()
+
+                if before:
+                    segments.append(before)
+
+                if after:
+                    if cfg.lorebook_at_end:
+                        existing_text = lorebook_at_end_text.strip()
+                        lorebook_at_end_text = f"{existing_text}\n\n{after}" if existing_text else after
+                    else:
+                        # Keep a clean visual/semantic separator between Scenario/Persona and suffix.
+                        segments.append("\n\n" + after)
+        else:
+            segments.append(text)
+
+    if lorebook_xml_at_end_text:
+        existing_text = lorebook_at_end_text.strip()
+        lorebook_at_end_text = f"{existing_text}\n\n{lorebook_xml_at_end_text}" if existing_text else lorebook_xml_at_end_text
+
+    return segments, lorebook_at_end_text
 
 
 def split_system_and_messages(raw_messages: Any) -> Tuple[str, List[Dict[str, Any]], str]:
@@ -815,8 +869,12 @@ def snapshot_to_markdown(snapshot: Dict[str, Any]) -> str:
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
-def build_claude_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
-
+def prepare_chat_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Runs every model-agnostic transform on the incoming OpenAI-style payload
+    and returns the prepared request that backends build their API call from:
+        messages, system_segments, system_summary_text, lorebook_at_end_text, max_tokens
+    """
     system_prompt, chat_messages, system_summary_text = split_system_and_messages(payload.get("messages"))
 
     # JanitorAI sends '.' as the first fake user message (because all chats start with a user message).
@@ -824,76 +882,40 @@ def build_claude_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
     if chat_messages and chat_messages[0].get("role") == "user" and chat_messages[0].get("content", "").strip() == ".":
         chat_messages = [{"role": "user", "content": "<OOC>\nBegin the scenario.\n</OOC>"}] + chat_messages[1:]
 
-    formatted_system, lorebook_at_end_text = format_system_for_claude(system_prompt, system_summary_text)
-    formatted_messages = format_to_claude_messages(chat_messages, lorebook_at_end_text)
-
-    kwargs: Dict[str, Any] = {
-        "model"      : cfg.model,
-        "max_tokens" : int(payload.get("max_tokens", cfg.max_tokens)),
-    }
-
-    # Anthropic request-level automatic prompt caching.
-    # This is separate from the script's existing explicit block-level markers.
-    # Guard it with cfg.cache_en so USE_CACHE=false disables all cache behavior.
-    if cfg.cache_en and cfg.cache_anthropic_auto:
-        kwargs["cache_control"] = make_cache_control(cfg.cache_anthropic_ttl)
-    if cfg.send_temperature : kwargs["temperature"] = cfg.temperature
-    if cfg.send_top_k       : kwargs["top_k"      ] = cfg.top_k
-    if cfg.send_top_p       : kwargs["top_p"      ] = cfg.top_p
-    if cfg.thinking_enabled:
-        if   cfg.use_adaptive:
-            kwargs["thinking"]      = { "type": "adaptive", "display": "summarized" };
-            kwargs["output_config"] = { "effort": cfg.thinking_effort }
-        else:
-            kwargs["thinking"] = { "type": "enabled", "budget_tokens": cfg.thinking_budget }
-
-    if formatted_system:
-        kwargs["system"] = formatted_system
-    kwargs["messages"] = formatted_messages
-
-    return kwargs
-
-
-def make_openai_non_stream_response(message: Any, model: str) -> Dict[str, Any]:
-    output_text = extract_text_from_anthropic_message(message)
-
-    if cfg.auto_trim:
-        output_text = trim_to_end_sentence(output_text)
-
-    anthropic_content = anthropic_blocks_to_dicts(message)
-    thinking_blocks   = extract_preservable_thinking_blocks(anthropic_content)
-
-    # Keep ordinary <think> output for Janitor/client compatibility.
-    thinking_text = "\n".join(
-        block.get("thinking", "")
-        for block in thinking_blocks
-        if block.get("type") == "thinking" and block.get("thinking", "")
-    ).strip()
-    if thinking_text:
-        output_text = f"<think>\n{thinking_text}\n</think>\n\n" + output_text
-
-    # Add a second, hidden-ish signed-block envelope only when preservation is enabled.
-    if thinking_preservation_enabled() and thinking_blocks:
-        output_text += make_hidden_thinking_envelope(thinking_blocks)
+    system_segments, lorebook_at_end_text = split_system_text(system_prompt)
 
     return {
-        "id"      : getattr(message, "id", "claude"),
+        "messages"             : chat_messages,
+        "system_segments"      : system_segments,
+        "system_summary_text"  : system_summary_text,
+        "lorebook_at_end_text" : lorebook_at_end_text,
+        "max_tokens"           : int(payload.get("max_tokens", cfg.max_tokens)),
+    }
+
+
+def make_openai_non_stream_response(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Wraps a backend generate_non_stream() result into an OpenAI chat completion.
+    """
+    message: Dict[str, Any] = {
+        "role"    : "assistant",
+        "content" : result["text"],
+    }
+    message.update(result["message_extra"])
+
+    return {
+        "id"      : result["id"],
         "object"  : "chat.completion",
         "created" : int(time.time()),
-        "model"   : f"anthropic/{model}",
+        "model"   : f"anthropic/{cfg.model}",
         "choices" : [
             {
                 "index"         : 0,
-                "finish_reason" : getattr(message, "stop_reason", "stop"),
-                "message"       : {
-                    "role"                         : "assistant",
-                    "content"                      : output_text,
-                    "anthropic_content"            : anthropic_content,
-                    "anthropic_thinking_preserved" : bool(thinking_preservation_enabled() and thinking_blocks),
-                },
+                "finish_reason" : result["stop_reason"],
+                "message"       : message,
             }
         ],
-        "usage"   : usage_to_openai_dict(getattr(message, "usage", None)),
+        "usage"   : result["usage"],
     }
 
 
@@ -933,87 +955,40 @@ def make_error_response(exc: Exception, payload: Optional[Dict[str, Any]] = None
 
 
 # Generation
-def print_payload(kwargs: Dict[str, Any]) -> None:
-    if not cfg.debug_log:
-        return
-    print()
-    print("=== Claude payload start ===")
-    print(json.dumps(kwargs, indent=2, ensure_ascii=False))
-    print("=== Claude payload end ===")
+def generate_non_stream(payload: Dict[str, Any]) -> Dict[str, Any]:
+    prepared = prepare_chat_request(payload)
+    result   = claude.generate_non_stream(prepared)
 
-
-def generate_non_stream(payload: Dict[str, Any], route_model: str) -> Dict[str, Any]:
-    client = get_anthropic_client()
-    kwargs = build_claude_kwargs(payload)
-
-    print_payload(kwargs)
-
-    message = client.messages.create(**kwargs)
-
-    usage = getattr(message, "usage", None)
-    print_usage(usage)
-
-    model_used = kwargs.get("model", route_model)
-    response = make_openai_non_stream_response(message, model_used)
+    response = make_openai_non_stream_response(result)
     capture_chat_snapshot(payload, response["choices"][0]["message"].get("content", ""))
     return response
 
 
-def generate_stream(payload: Dict[str, Any], route_model: str):
+def generate_stream(payload: Dict[str, Any]):
     try:
-        client = get_anthropic_client()
-        kwargs = build_claude_kwargs(payload)
+        prepared = prepare_chat_request(payload)
 
-        print_payload(kwargs)
-
-        model_used = kwargs.get("model", route_model)
-        response_parts  : List[str] = []
-        reasoning_parts : List[str] = []
-
-        with client.messages.stream(**kwargs) as stream:
-            for event in stream:
-                if event.type == "content_block_delta":
-                    if event.delta.type == "thinking_delta":
-                        reasoning_parts.append(event.delta.thinking)
-                        # Stream reasoning_content only; Janitor already renders it as <think> text.
-                        yield openai_stream_chunk(model_used, {
-                            "role"              : "assistant",
-                            "reasoning_content" : event.delta.thinking,
-                        })
-                    elif event.delta.type == "text_delta":
-                        response_parts.append(event.delta.text)
-                        yield openai_stream_chunk(model_used, {
-                            "role"    : "assistant",
-                            "content" : event.delta.text,
-                        })
-                time.sleep(0.01)
-
-            final_message = stream.get_final_message()
-            if not response_parts:
-                response_parts.append(extract_text_from_anthropic_message(final_message))
-
-            # The visible <think> text has already gone through reasoning_content above.
-            thinking_blocks = extract_preservable_thinking_blocks(anthropic_blocks_to_dicts(final_message))
-            if thinking_preservation_enabled() and thinking_blocks:
-                # Send only the hidden signed-block envelope for next-turn rehydration.
-                thinking_envelope = make_hidden_thinking_envelope(thinking_blocks)
-                response_parts.append(thinking_envelope)
-                yield openai_stream_chunk(model_used, {
-                    "role"    : "assistant",
-                    "content" : thinking_envelope,
+        for kind, data in claude.generate_stream(prepared):
+            if kind == "reasoning":
+                # Stream reasoning_content only; Janitor already renders it as <think> text.
+                yield openai_stream_chunk(cfg.model, {
+                    "role"              : "assistant",
+                    "reasoning_content" : data,
                 })
-
-            usage = getattr(final_message, "usage", None)
-            print_usage(usage)
-            capture_chat_snapshot(payload, "".join(response_parts), "".join(reasoning_parts))
-
-            yield openai_stream_chunk(
-                model_used,
-                {},
-                finish_reason=getattr(final_message, "stop_reason", "stop"),
-                usage=usage_to_openai_dict(getattr(final_message, "usage", None)),
-                message_id=getattr(final_message, "id", "claude"),
-            )
+            elif kind == "text":
+                yield openai_stream_chunk(cfg.model, {
+                    "role"    : "assistant",
+                    "content" : data,
+                })
+            elif kind == "final":
+                capture_chat_snapshot(payload, data["snapshot_text"], data["snapshot_reasoning"])
+                yield openai_stream_chunk(
+                    cfg.model,
+                    {},
+                    finish_reason=data["stop_reason"],
+                    usage=data["usage"],
+                    message_id=data["id"],
+                )
 
     except Exception as exc:
         _, error_body = build_error_body(exc)
@@ -1037,7 +1012,7 @@ def handle_chat_completion():
 
         if stream:
             return Response(
-                stream_with_context(generate_stream(payload, cfg.model)),
+                stream_with_context(generate_stream(payload)),
                 content_type="text/event-stream",
                 headers={
                     "Cache-Control"     : "no-cache",
@@ -1045,7 +1020,7 @@ def handle_chat_completion():
                 },
             )
 
-        response = generate_non_stream(payload, cfg.model)
+        response = generate_non_stream(payload)
         return jsonify(response)
 
     except Exception as exc:

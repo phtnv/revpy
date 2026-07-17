@@ -3,15 +3,18 @@ import base64
 import json
 import re
 import threading
+import time
 
 from flask             import abort, request
 from packaging.version import Version
 from typing            import Any, Dict, List, Optional, Tuple
 
 from common import (
-    add_session_cost,
+    append_prefill_instruction_to_last_user_message,
     append_text_to_content,
     cfg,
+    track_usage,
+    trim_to_end_sentence,
 )
 
 
@@ -297,35 +300,6 @@ def add_cache_control_to_content(content: Any, ttl: str) -> Any:
     return [{"type": "text", "text": text, "cache_control": cache_control}]
 
 
-def make_prefill_instruction(prefix_text: str) -> str:
-    """
-    Creates the instruction-mode version of ASSISTANT_PREFILL.
-
-    This avoids Anthropic assistant prefill by telling Claude, inside the
-    last user message, to continue as though the prefix was already present.
-    """
-    return (
-        "\n<OOC>\n"
-        f"{prefix_text}"
-        "</OOC>"
-    )
-
-
-def append_prefill_instruction_to_last_user_message(formatted: List[Dict[str, Any]], prefix_text: str) -> None:
-    """
-    Appends instruction-mode prefill text to the last user message in-place.
-    """
-    instruction = make_prefill_instruction(prefix_text)
-
-    for i in range(len(formatted) - 1, -1, -1):
-        if formatted[i].get("role") == "user":
-            formatted[i]["content"] = append_text_to_content(formatted[i].get("content", ""), instruction)
-            return
-
-    # Defensive fallback. The current formatter always creates an initial user message, but keep this here in case that changes later.
-    formatted.append({"role": "user", "content": instruction})
-
-
 # Anthropic thinking block round-tripping
 # Plain-text envelope lets Janitor carry signed Anthropic thinking blocks across turns.
 THINKING_ENVELOPE_TAG   = "thinking_preservation_block_v1"
@@ -411,100 +385,28 @@ def extract_hidden_thinking_envelopes(text: str) -> Tuple[str, List[Dict[str, An
     return cleaned.rstrip(), all_blocks
 
 
-PERSONA_END_RE  = re.compile(r"</[^<>]*\bPersona>", re.IGNORECASE)
-LOREBOOK_XML_RE = re.compile(r"<lorebook\b[^>]*>.*?</lorebook>", re.IGNORECASE | re.DOTALL)
-def format_system_for_claude(system_prompt: str, system_summary_text: str = "") -> Tuple[List[Dict[str, Any]], str]:
+def format_system_for_claude(system_segments: List[str], system_summary_text: str = "") -> List[Dict[str, Any]]:
     """
-    Formats the top-level Anthropic system prompt and optionally extracts the dynamic lorebook suffix.
+    Turns pre-split system prompt segments into top-level Anthropic system blocks.
 
-    When SPLIT_LOREBOOK=true, the prompt is split into:
-        1. stable core definition
-        2. dynamic lorebook / user-script suffix
-
-    Split priority:
-        1. After </summary>
-        2. After </example_dialogs>
-        3. After </UserPersona>
-        4. After </Scenario>
-        5. After the last </* Persona> marker
-        6. Otherwise keep the whole system prompt as one block
-
-    When LOREBOOK_AT_END=true, the suffix is returned as plain text instead of being kept as a
-    top-level system block. That moved suffix deliberately does not receive the old system/lorebook
-    cache marker; it is handled later as an ordinary end-of-conversation item.
-
-    When LOREBOOK_XML_AT_END=true, every <lorebook>...</lorebook> block is removed from the
-    top-level system prompt and appended after any other moved end-of-chat lorebook text.
-
-    Returns:
-        - formatted_system: top-level Anthropic system blocks, or an empty list
-        - lorebook_at_end_text: moved lorebook/suffix text, or an empty string
+    The model-agnostic lorebook splitting happens in server.split_system_text();
+    this only decides the Anthropic representation: one text block per segment,
+    with the explicit system cache marker applied to each non-empty block.
     """
-    text         = system_prompt.strip()
     summary_text = system_summary_text.strip()
-    if (not text) and (not summary_text):
-        return [], ""
-
-    blocks: List[Dict[str, Any]] = []
-    lorebook_at_end_text     = ""
-    lorebook_xml_at_end_text = ""
-
-    if text and cfg.lorebook_xml_at_end:
-        matches = [match.group(0).strip() for match in LOREBOOK_XML_RE.finditer(text) if match.group(0).strip()]
-        if matches:
-            text = LOREBOOK_XML_RE.sub("", text).strip()
-            lorebook_xml_at_end_text = "\n\n".join(matches)
-
-    if text:
-        if cfg.split_lorebook:
-            split_at = -1
-
-            for split_marker in ("</summary>", "</example_dialogs>", "</UserPersona>", "</Scenario>"):
-                split_idx = text.find(split_marker)
-                if split_idx != -1:
-                    split_at = split_idx + len(split_marker)
-                    break
-
-            if split_at == -1:
-                persona_matches = list(PERSONA_END_RE.finditer(text))
-                if persona_matches:
-                    split_at = persona_matches[-1].end()
-
-            if split_at == -1 or split_at >= len(text):
-                blocks.append({"type": "text", "text": text})
-            else:
-                before = text[:split_at].rstrip()
-                after  = text[split_at:].strip()
-
-                if before:
-                    blocks.append({"type": "text", "text": before})
-
-                if after:
-                    if cfg.lorebook_at_end:
-                        existing_text = lorebook_at_end_text.strip()
-                        lorebook_at_end_text = f"{existing_text}\n\n{after}" if existing_text else after
-                    else:
-                        # Keep a clean visual/semantic separator between Scenario/Persona and suffix.
-                        blocks.append({"type": "text", "text": "\n\n" + after})
-        else:
-            blocks.append({"type": "text", "text": text})
-
-    if lorebook_xml_at_end_text:
-        existing_text = lorebook_at_end_text.strip()
-        lorebook_at_end_text = f"{existing_text}\n\n{lorebook_xml_at_end_text}" if existing_text else lorebook_xml_at_end_text
 
     formatted_system: List[Dict[str, Any]] = []
 
-    for block in blocks:
-        new_block: Dict[str, Any] = dict(block)
-        if cfg.cache_en and cfg.cache_system and new_block.get("text", "").strip():
+    for segment in system_segments:
+        new_block: Dict[str, Any] = {"type": "text", "text": segment}
+        if cfg.cache_en and cfg.cache_system and segment.strip():
             new_block["cache_control"] = make_cache_control(cfg.cache_system_ttl)
         formatted_system.append(new_block)
 
     if summary_text:
         formatted_system.append({"type": "text", "text": summary_text})
 
-    return formatted_system, lorebook_at_end_text
+    return formatted_system
 
 
 def format_to_claude_messages(mlist: List[Dict[str, Any]], lorebook_at_end_text: str = "") -> List[Dict[str, Any]]:
@@ -632,17 +534,11 @@ def fallback_cache_write_ttl() -> str:
     return "1h" if "1h" in active_ttl else "5m"
 
 
-def print_usage(usage: Any) -> None:
-    def tok_usd(tokens: int, usd_per_million_tokens: float) -> float:
-        return (tokens*usd_per_million_tokens)/1_000_000.0
-    def fmt_usd(amount: float) -> str:
-        sign = "-" if amount < 0 else ""
-        return f"{sign}${abs(amount):,.6f}"
-    def cache_lbl(net_cost_usd: float) -> str:
-        if net_cost_usd < 0: return f"{fmt_usd(abs(net_cost_usd))} saved"
-        if net_cost_usd > 0: return f"{fmt_usd(net_cost_usd)} lost"
-        return "$0.000000 break-even"
-
+def usage_to_cost_tokens(usage: Any) -> Dict[str, int]:
+    """
+    Maps an Anthropic usage payload to the normalized token-count dict that
+    common.track_usage() expects.
+    """
     cache_creation       = getattr(usage, "cache_creation", {}) or {}
     ephemeral_1h         = int(getattr(cache_creation, "ephemeral_1h_input_tokens", 0) or 0)
     ephemeral_5m         = int(getattr(cache_creation, "ephemeral_5m_input_tokens", 0) or 0)
@@ -650,7 +546,6 @@ def print_usage(usage: Any) -> None:
     output_tok           = int(getattr(usage, "output_tokens", 0) or 0)
     cache_read           = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
     cache_creation_input = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
-    ttl_tokens = input_tok + cache_read + cache_creation_input;
 
     # Older SDK responses may expose only cache_creation_input_tokens without the 5m/1h split.
     # Mixed-TTL requests cannot be reconstructed from that legacy shape, so use a conservative fallback.
@@ -660,55 +555,17 @@ def print_usage(usage: Any) -> None:
         if fallback_cache_write_ttl() == "1h" : ephemeral_1h += unknown_cache_write
         else                                  : ephemeral_5m += unknown_cache_write
 
-    cache_creation_input = ephemeral_1h + ephemeral_5m
-    ttl_tokens           = input_tok + cache_read + cache_creation_input
+    return {
+        "uncached_input" : input_tok,
+        "cache_read"     : cache_read,
+        "cache_write_1h" : ephemeral_1h,
+        "cache_write_5m" : ephemeral_5m,
+        "output"         : output_tok,
+    }
 
-    input_cost          = tok_usd(input_tok, cfg.input_token_cost_usd)
-    cache_read_cost     = tok_usd(cache_read, cfg.cache_read_cost_usd)
-    cache_write_1h_cost = tok_usd(ephemeral_1h, cfg.cache_write_1h_cost_usd)
-    cache_write_5m_cost = tok_usd(ephemeral_5m, cfg.cache_write_5m_cost_usd)
-    cache_write_cost    = cache_write_1h_cost + cache_write_5m_cost
-    total_input_cost    = input_cost + cache_read_cost + cache_write_cost
 
-    output_cost        = tok_usd(output_tok, cfg.output_token_cost_usd)
-    request_total_cost = total_input_cost + output_cost
-
-    cache_write_extra_cost = (
-        tok_usd(ephemeral_1h, cfg.cache_write_1h_cost_usd - cfg.input_token_cost_usd)
-        +
-        tok_usd(ephemeral_5m, cfg.cache_write_5m_cost_usd - cfg.input_token_cost_usd)
-    )
-    cache_read_saved_cost  = tok_usd(cache_read, cfg.input_token_cost_usd - cfg.cache_read_cost_usd)
-    request_cache_net_cost = cache_write_extra_cost - cache_read_saved_cost
-
-    session = add_session_cost(
-        request_total_cost = request_total_cost,
-        total_input_cost   = total_input_cost,
-        output_cost        = output_cost,
-        input_tokens       = ttl_tokens,
-        output_tokens      = output_tok,
-        cache_net_cost     = request_cache_net_cost,
-    )
-
-    if not cfg.debug_log:
-        return
-
-    print("=== Claude usage start ===")
-    print("Request:")
-    print("    Input tokens       =   uncached + cache read + cache write (        1h +         5m)")
-    print("    {:18d} = {:10d} + {:10d} + {:11d} ({:10d} + {:10d})".format(ttl_tokens, input_tok, cache_read, cache_creation_input, ephemeral_1h, ephemeral_5m))
-    print("    {:>18s} = {:>10s} + {:>10s} + {:>11s} ({:>10s} + {:>10s})".format(fmt_usd(total_input_cost), fmt_usd(input_cost), fmt_usd(cache_read_cost), fmt_usd(cache_write_cost), fmt_usd(cache_write_1h_cost), fmt_usd(cache_write_5m_cost)))
-    print("    Output tokens      = {:d} ({})".format(output_tok, fmt_usd(output_cost)))
-    print("    Cache cost         = {} ({})".format(fmt_usd(request_cache_net_cost), cache_lbl(request_cache_net_cost)))
-    print("    Total cost         = {}".format(fmt_usd(request_total_cost)))
-    print("Session:")
-    print("    Input tokens       = {:d} ({})".format(session["input_tokens"], fmt_usd(session["input_cost_usd"])))
-    print("    Output tokens      = {:d} ({})".format(session["output_tokens"], fmt_usd(session["output_cost_usd"])))
-    print("    Cache cost         = {} ({})".format(fmt_usd(session["cache_net_cost_usd"]), cache_lbl(session["cache_net_cost_usd"])))
-    print("    Average input cost = {} / MTok.".format(fmt_usd(session["average_input_cost_usd"]*1_000_000)))
-    print("    Total cost         = {} ({} input / {} output)".format(fmt_usd(session["total_spent_usd"]), fmt_usd(session["input_cost_usd"]), fmt_usd(session["output_cost_usd"])))
-    print("=== Claude usage end ===")
-    print("> ", end="", flush=True)
+def print_usage(usage: Any) -> None:
+    track_usage(usage_to_cost_tokens(usage))
 
 
 def usage_to_openai_dict(usage: Any) -> Dict[str, int]:
@@ -741,3 +598,147 @@ def usage_to_openai_dict(usage: Any) -> Dict[str, int]:
         "cache_creation_input_tokens" : cache_creation,
         "cache_read_input_tokens"     : cache_read,
     }
+
+
+# Generation
+def print_payload(kwargs: Dict[str, Any]) -> None:
+    if not cfg.debug_log:
+        return
+    print()
+    print("=== Claude payload start ===")
+    print(json.dumps(kwargs, indent=2, ensure_ascii=False))
+    print("=== Claude payload end ===")
+
+
+def build_claude_kwargs(prepared: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Builds the Anthropic Messages API request from a prepared chat request
+    (see server.prepare_chat_request for the dict shape).
+    """
+    formatted_system   = format_system_for_claude(prepared["system_segments"], prepared["system_summary_text"])
+    formatted_messages = format_to_claude_messages(prepared["messages"], prepared["lorebook_at_end_text"])
+
+    kwargs: Dict[str, Any] = {
+        "model"      : cfg.model,
+        "max_tokens" : prepared["max_tokens"],
+    }
+
+    # Anthropic request-level automatic prompt caching.
+    # This is separate from the script's existing explicit block-level markers.
+    # Guard it with cfg.cache_en so USE_CACHE=false disables all cache behavior.
+    if cfg.cache_en and cfg.cache_anthropic_auto:
+        kwargs["cache_control"] = make_cache_control(cfg.cache_anthropic_ttl)
+    if cfg.send_temperature : kwargs["temperature"] = cfg.temperature
+    if cfg.send_top_k       : kwargs["top_k"      ] = cfg.top_k
+    if cfg.send_top_p       : kwargs["top_p"      ] = cfg.top_p
+    if cfg.thinking_enabled:
+        if   cfg.use_adaptive:
+            kwargs["thinking"]      = { "type": "adaptive", "display": "summarized" }
+            kwargs["output_config"] = { "effort": cfg.thinking_effort }
+        else:
+            kwargs["thinking"] = { "type": "enabled", "budget_tokens": cfg.thinking_budget }
+
+    if formatted_system:
+        kwargs["system"] = formatted_system
+    kwargs["messages"] = formatted_messages
+
+    return kwargs
+
+
+def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Runs one non-streaming completion.
+
+    Returns the backend-neutral result dict consumed by the server core:
+        id, stop_reason, text, usage, message_extra
+    """
+    client = get_anthropic_client()
+    kwargs = build_claude_kwargs(prepared)
+
+    print_payload(kwargs)
+
+    message = client.messages.create(**kwargs)
+
+    print_usage(getattr(message, "usage", None))
+
+    output_text = extract_text_from_anthropic_message(message)
+    if cfg.auto_trim:
+        output_text = trim_to_end_sentence(output_text)
+
+    anthropic_content = anthropic_blocks_to_dicts(message)
+    thinking_blocks   = extract_preservable_thinking_blocks(anthropic_content)
+
+    # Keep ordinary <think> output for Janitor/client compatibility.
+    thinking_text = "\n".join(
+        block.get("thinking", "")
+        for block in thinking_blocks
+        if block.get("type") == "thinking" and block.get("thinking", "")
+    ).strip()
+    if thinking_text:
+        output_text = f"<think>\n{thinking_text}\n</think>\n\n" + output_text
+
+    # Add a second, hidden-ish signed-block envelope only when preservation is enabled.
+    if thinking_preservation_enabled() and thinking_blocks:
+        output_text += make_hidden_thinking_envelope(thinking_blocks)
+
+    return {
+        "id"            : getattr(message, "id", "claude"),
+        "stop_reason"   : getattr(message, "stop_reason", "stop"),
+        "text"          : output_text,
+        "usage"         : usage_to_openai_dict(getattr(message, "usage", None)),
+        "message_extra" : {
+            "anthropic_content"            : anthropic_content,
+            "anthropic_thinking_preserved" : bool(thinking_preservation_enabled() and thinking_blocks),
+        },
+    }
+
+
+def generate_stream(prepared: Dict[str, Any]):
+    """
+    Runs one streaming completion, yielding backend-neutral events:
+        ("reasoning", text)  incremental reasoning text
+        ("text", text)       incremental visible content
+        ("final", dict)      id, stop_reason, usage, snapshot_text, snapshot_reasoning
+
+    Errors propagate to the caller, which owns SSE error formatting and logging.
+    """
+    client = get_anthropic_client()
+    kwargs = build_claude_kwargs(prepared)
+
+    print_payload(kwargs)
+
+    response_parts  : List[str] = []
+    reasoning_parts : List[str] = []
+
+    with client.messages.stream(**kwargs) as stream:
+        for event in stream:
+            if event.type == "content_block_delta":
+                if event.delta.type == "thinking_delta":
+                    reasoning_parts.append(event.delta.thinking)
+                    yield ("reasoning", event.delta.thinking)
+                elif event.delta.type == "text_delta":
+                    response_parts.append(event.delta.text)
+                    yield ("text", event.delta.text)
+            time.sleep(0.01)
+
+        final_message = stream.get_final_message()
+        if not response_parts:
+            response_parts.append(extract_text_from_anthropic_message(final_message))
+
+        # The visible <think> text has already gone through the reasoning events above.
+        thinking_blocks = extract_preservable_thinking_blocks(anthropic_blocks_to_dicts(final_message))
+        if thinking_preservation_enabled() and thinking_blocks:
+            # Send only the hidden signed-block envelope for next-turn rehydration.
+            thinking_envelope = make_hidden_thinking_envelope(thinking_blocks)
+            response_parts.append(thinking_envelope)
+            yield ("text", thinking_envelope)
+
+        print_usage(getattr(final_message, "usage", None))
+
+        yield ("final", {
+            "id"                 : getattr(final_message, "id", "claude"),
+            "stop_reason"        : getattr(final_message, "stop_reason", "stop"),
+            "usage"              : usage_to_openai_dict(getattr(final_message, "usage", None)),
+            "snapshot_text"      : "".join(response_parts),
+            "snapshot_reasoning" : "".join(reasoning_parts),
+        })

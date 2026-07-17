@@ -107,6 +107,9 @@ class RuntimeConfig:
         self.model = os.getenv("MODEL", "claude-sonnet-4-6")
         self.version = extract_claude_version(self.model)
         self.model_info = {}
+        # Full model record from the provider model list. Empty until apply_model()
+        # runs, so capability checks (resolve_thinking) fail closed instead of crashing.
+        self.info = {}
 
         self.anthropic_api_key     = os.getenv("ANTHROPIC_API_KEY", "").strip()
         self.proxy_key             = os.getenv("PROXY_KEY", "").strip()
@@ -136,7 +139,7 @@ class RuntimeConfig:
         self.temperature      = getenv_float("TEMPERATURE", 0.9)
         self.send_top_p       = getenv_bool("SEND_TOP_P", False)
         self.top_p            = getenv_float("TOP_P", 0.95)
-        self.send_top_k       = getenv_bool("SEND_TOP_P", False)
+        self.send_top_k       = getenv_bool("SEND_TOP_K", False)
         self.top_k            = getenv_int("TOP_K", 75)
 
         # Thinking
@@ -567,3 +570,127 @@ def append_text_to_content(content: Any, text: str) -> Any:
     if isinstance(content, list) : return content + [{"type": "text", "text": "\n" + text}]
 
     return str(content) + "\n" + text
+
+
+def trim_to_end_sentence(input_str: str, include_newline: bool = False) -> str:
+    punctuation = set([".", "!", "?", "*", '"', ")", "}", "`", "]", "$", "。", "！", "？", "”", "）", "】", "’", "」"])
+
+    last = -1
+    for i in range(len(input_str) - 1, -1, -1):
+        char = input_str[i]
+
+        if char in punctuation:
+            if i > 0 and input_str[i - 1] in [" ", "\n"] : last = i - 1
+            else                                         : last = i
+            break
+
+        if include_newline and char == "\n":
+            last = i
+            break
+
+    if last == -1:
+        return input_str.rstrip()
+
+    return input_str[: last + 1].rstrip()
+
+
+def make_prefill_instruction(prefix_text: str) -> str:
+    """
+    Creates the instruction-mode version of ASSISTANT_PREFILL.
+
+    This avoids assistant prefill by telling the model, inside the
+    last user message, to continue as though the prefix was already present.
+    """
+    return (
+        "\n<OOC>\n"
+        f"{prefix_text}"
+        "</OOC>"
+    )
+
+
+def append_prefill_instruction_to_last_user_message(formatted: List[Dict[str, Any]], prefix_text: str) -> None:
+    """
+    Appends instruction-mode prefill text to the last user message in-place.
+    """
+    instruction = make_prefill_instruction(prefix_text)
+
+    for i in range(len(formatted) - 1, -1, -1):
+        if formatted[i].get("role") == "user":
+            formatted[i]["content"] = append_text_to_content(formatted[i].get("content", ""), instruction)
+            return
+
+    # Defensive fallback. The current formatter always creates an initial user message, but keep this here in case that changes later.
+    formatted.append({"role": "user", "content": instruction})
+
+
+def track_usage(tokens: Dict[str, int]) -> None:
+    """
+    Model-agnostic cost accounting over a normalized token-count dict:
+        uncached_input, cache_read, cache_write_1h, cache_write_5m, output
+    Backends are responsible for mapping their provider's usage payload to this
+    shape (for providers without cache writes, the write counts are simply 0).
+    """
+    def tok_usd(tokens: int, usd_per_million_tokens: float) -> float:
+        return (tokens*usd_per_million_tokens)/1_000_000.0
+    def fmt_usd(amount: float) -> str:
+        sign = "-" if amount < 0 else ""
+        return f"{sign}${abs(amount):,.6f}"
+    def cache_lbl(net_cost_usd: float) -> str:
+        if net_cost_usd < 0: return f"{fmt_usd(abs(net_cost_usd))} saved"
+        if net_cost_usd > 0: return f"{fmt_usd(net_cost_usd)} lost"
+        return "$0.000000 break-even"
+
+    input_tok            = tokens["uncached_input"]
+    cache_read           = tokens["cache_read"]
+    ephemeral_1h         = tokens["cache_write_1h"]
+    ephemeral_5m         = tokens["cache_write_5m"]
+    output_tok           = tokens["output"]
+    cache_creation_input = ephemeral_1h + ephemeral_5m
+    ttl_tokens           = input_tok + cache_read + cache_creation_input
+
+    input_cost          = tok_usd(input_tok, cfg.input_token_cost_usd)
+    cache_read_cost     = tok_usd(cache_read, cfg.cache_read_cost_usd)
+    cache_write_1h_cost = tok_usd(ephemeral_1h, cfg.cache_write_1h_cost_usd)
+    cache_write_5m_cost = tok_usd(ephemeral_5m, cfg.cache_write_5m_cost_usd)
+    cache_write_cost    = cache_write_1h_cost + cache_write_5m_cost
+    total_input_cost    = input_cost + cache_read_cost + cache_write_cost
+
+    output_cost        = tok_usd(output_tok, cfg.output_token_cost_usd)
+    request_total_cost = total_input_cost + output_cost
+
+    cache_write_extra_cost = (
+        tok_usd(ephemeral_1h, cfg.cache_write_1h_cost_usd - cfg.input_token_cost_usd)
+        +
+        tok_usd(ephemeral_5m, cfg.cache_write_5m_cost_usd - cfg.input_token_cost_usd)
+    )
+    cache_read_saved_cost  = tok_usd(cache_read, cfg.input_token_cost_usd - cfg.cache_read_cost_usd)
+    request_cache_net_cost = cache_write_extra_cost - cache_read_saved_cost
+
+    session = add_session_cost(
+        request_total_cost = request_total_cost,
+        total_input_cost   = total_input_cost,
+        output_cost        = output_cost,
+        input_tokens       = ttl_tokens,
+        output_tokens      = output_tok,
+        cache_net_cost     = request_cache_net_cost,
+    )
+
+    if not cfg.debug_log:
+        return
+
+    print("=== Claude usage start ===")
+    print("Request:")
+    print("    Input tokens       =   uncached + cache read + cache write (        1h +         5m)")
+    print("    {:18d} = {:10d} + {:10d} + {:11d} ({:10d} + {:10d})".format(ttl_tokens, input_tok, cache_read, cache_creation_input, ephemeral_1h, ephemeral_5m))
+    print("    {:>18s} = {:>10s} + {:>10s} + {:>11s} ({:>10s} + {:>10s})".format(fmt_usd(total_input_cost), fmt_usd(input_cost), fmt_usd(cache_read_cost), fmt_usd(cache_write_cost), fmt_usd(cache_write_1h_cost), fmt_usd(cache_write_5m_cost)))
+    print("    Output tokens      = {:d} ({})".format(output_tok, fmt_usd(output_cost)))
+    print("    Cache cost         = {} ({})".format(fmt_usd(request_cache_net_cost), cache_lbl(request_cache_net_cost)))
+    print("    Total cost         = {}".format(fmt_usd(request_total_cost)))
+    print("Session:")
+    print("    Input tokens       = {:d} ({})".format(session["input_tokens"], fmt_usd(session["input_cost_usd"])))
+    print("    Output tokens      = {:d} ({})".format(session["output_tokens"], fmt_usd(session["output_cost_usd"])))
+    print("    Cache cost         = {} ({})".format(fmt_usd(session["cache_net_cost_usd"]), cache_lbl(session["cache_net_cost_usd"])))
+    print("    Average input cost = {} / MTok.".format(fmt_usd(session["average_input_cost_usd"]*1_000_000)))
+    print("    Total cost         = {} ({} input / {} output)".format(fmt_usd(session["total_spent_usd"]), fmt_usd(session["input_cost_usd"]), fmt_usd(session["output_cost_usd"])))
+    print("=== Claude usage end ===")
+    print("> ", end="", flush=True)
