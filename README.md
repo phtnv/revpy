@@ -1,6 +1,8 @@
 # OpenAI to Anthropic compatibility adapter
 Compatibility adapter for interfacing OpenAI-style chat requests with Antrhopic Message API requests. Typical usage would be using it as an intermediary server between JanitorAI and Claude (with your own Antropic API key).
 
+Besides Claude, the proxy can also route to OpenAI-style API providers (GLM, Aion Labs, ...) configured through `OPENAI_PROVIDERS` in `.env` (see `env_example.ini`). Their models appear in the CLI `model` list after the Anthropic ones; selecting one switches the active backend. Model-agnostic features (summary blocks, lorebook handling, cost tracking, instruction prefill, auto-trim, dumps) work for every backend; Claude-only features (explicit cache markers, thinking controls, signed thinking-block preservation, assistant prefill) apply only to Claude. Provider-specific request options (for example GLM's `thinking` flag) are passed through verbatim via `<NAME>_EXTRA_BODY`.
+
 ## Requirements
 - Anthropic API key from Claude Console. https://platform.claude.com/settings/workspaces/default/keys
 - [Python](https://www.python.org/downloads/).

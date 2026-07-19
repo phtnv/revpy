@@ -31,6 +31,8 @@ USAGE      = {
 }
 
 sys.path.insert(0, str(ROOT))
+common: Any = importlib.import_module("common")
+claude: Any = importlib.import_module("claude")
 server: Any = importlib.import_module("server")
 
 
@@ -55,7 +57,8 @@ class FakeAnthropic:
 
 
 def make_config() -> Any:
-    cfg = server.RuntimeConfig()
+    # common.cfg is a shared singleton; configure it in place instead of rebinding it.
+    cfg = common.cfg
     cfg.reload_from_env()
     cfg.model                    = MODEL
     cfg.version                  = Version("4.0")
@@ -170,9 +173,9 @@ def test_basic_non_streaming_roundtrip(name: str) -> bool:
     ref_msg = reference_from_fixture(name)
     rx_msg  = FakeAnthropic(ref_msg["reply"])
 
-    server.get_anthropic_client = lambda: rx_msg
+    claude.get_anthropic_client = lambda: rx_msg
     server.time.time            = lambda: CREATED
-    server.print_usage          = lambda usage: None
+    claude.print_usage          = lambda usage: None
     response = server.app.test_client().post("/v1/chat/completions", json=ref_msg["request"])
 
     rx_msg = received_from(response, rx_msg)
@@ -191,9 +194,9 @@ def test_chat_dump_formats(name: str) -> bool:
     ref_msg = reference_from_fixture(name)
     fake    = FakeAnthropic(ref_msg["reply"])
 
-    server.get_anthropic_client = lambda: fake
+    claude.get_anthropic_client = lambda: fake
     server.time.time            = lambda: CREATED
-    server.print_usage          = lambda usage: None
+    claude.print_usage          = lambda usage: None
     server.app.test_client().post("/v1/chat/completions", json=ref_msg["request"])
 
     expected_snapshot = fixture["expected_snapshot"]
@@ -223,7 +226,7 @@ def test_chat_dump_formats(name: str) -> bool:
 
 
 if __name__ == "__main__":
-    server.cfg = make_config()
+    make_config()
 
     tests_passed : int = 0
     tests_passed += test_basic_non_streaming_roundtrip("basic_no_ooc.json5")
