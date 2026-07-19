@@ -351,33 +351,38 @@ def admin_cli_loop() -> None:
                 continue
 
             if cmd in {"d", "dump"}:
-                fmt  = "json"
-                path = ""
-                if parts_l > 1:
-                    arg1 = parts[1].lower()
-                    if arg1 in {"n", "nat", "natural", "md", "markdown"}:
-                        fmt = "natural"
-                        split_line = line.split(maxsplit=2)
-                        if len(split_line) > 2 : path = split_line[2]
-                    elif arg1 in {"j", "json"}:
-                        split_line = line.split(maxsplit=2)
-                        if len(split_line) > 2 : path = split_line[2]
+                fmt      = "json"
+                raw_dump = False
+                path     = ""
+                opt_count = 0
+                for tok in parts[1:]:
+                    tok_l = tok.lower()
+                    if   tok_l in {"n", "nat", "natural", "md", "markdown"} : fmt = "natural"
+                    elif tok_l in {"j", "json"}                             : fmt = "json"
+                    elif tok_l in {"r", "raw"}                              : raw_dump = True
                     else:
-                        path = line.split(maxsplit=1)[1]
+                        break
+                    opt_count += 1
+                split_line = line.split(maxsplit=1 + opt_count)
+                if len(split_line) > 1 + opt_count:
+                    path = split_line[1 + opt_count]
                 if not path:
-                    path = "chat_snapshot.md" if fmt == "natural" else "chat_snapshot.json"
+                    suffix = "_raw" if raw_dump else ""
+                    path   = f"chat_snapshot{suffix}.md" if fmt == "natural" else f"chat_snapshot{suffix}.json"
                 with LATEST_CHAT_LOCK:
                     snapshot = LATEST_CHAT_SNAPSHOT
                 if not snapshot:
                     print("No chat snapshot captured yet.")
                     continue
+                if not raw_dump:
+                    snapshot = postprocess_chat_snapshot(snapshot)
                 with open(path, "w", encoding="utf-8") as f:
                     if fmt == "natural":
                         f.write(snapshot_to_markdown(snapshot))
                     else:
                         json.dump(snapshot, f, indent=2, ensure_ascii=False)
                         f.write("\n")
-                print(f"Wrote latest chat snapshot to {path} ({fmt}).")
+                print(f"Wrote latest chat snapshot to {path} ({fmt}{', raw' if raw_dump else ''}).")
                 continue
 
             if cmd in {"help", "?"}:
@@ -394,6 +399,8 @@ def admin_cli_loop() -> None:
                 print("      Alias: j")
                 print("    dump natural  Human-readable markdown.")
                 print("      Alias: n, nat, md, markdown")
+                print("    dump raw      Dump without summary block substitutions. Combines with a format, e.g. 'dump raw md'.")
+                print("      Alias: r")
                 print("  help           Display this message.")
                 print("    Alias: ?")
                 print("  quit           Stop the server.")
@@ -867,6 +874,31 @@ def capture_chat_snapshot(payload: Dict[str, Any], assistant_content: str, assis
         }
 
 
+def postprocess_chat_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Applies summary block substitutions to a raw snapshot, mirroring what
+    split_system_and_messages() does to the outgoing request: control messages
+    are removed, covered ranges collapse into their summaries, and role="system"
+    summaries are appended after the system prompt.
+    """
+    messages = snapshot.get("messages", [])
+    if not isinstance(messages, list):
+        return snapshot
+
+    chat = [dict(msg) for msg in messages if isinstance(msg, dict)]
+    chat, system_summary_text = apply_summary_blocks(chat)
+
+    if not chat or chat[0].get("role") != "user":
+        chat = [{"role": "user", "content": OOC_SCENARIO_START}] + chat
+
+    processed = dict(snapshot)
+    processed["messages"] = chat
+    if system_summary_text:
+        system_prompt = str(processed.get("systemPrompt", "")).strip()
+        processed["systemPrompt"] = f"{system_prompt}\n\n{system_summary_text}".strip()
+    return processed
+
+
 NATURAL_DUMP_ESCAPE_RE  = re.compile(r"""\\(\\|n|t|r|"|')""")
 NATURAL_DUMP_ESCAPE_MAP = {"\\": "\\", "n": "\n", "t": "\t", "r": "\r", '"': '"', "'": "'"}
 
@@ -914,6 +946,8 @@ def snapshot_to_markdown(snapshot: Dict[str, Any]) -> str:
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
+OOC_SCENARIO_START = "<OOC>\nBegin the scenario.\n</OOC>"
+
 def prepare_chat_request(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Runs every model-agnostic transform on the incoming OpenAI-style payload
@@ -925,7 +959,12 @@ def prepare_chat_request(payload: Dict[str, Any]) -> Dict[str, Any]:
     # JanitorAI sends '.' as the first fake user message (because all chats start with a user message).
     # We're replacing it with the <OOC>\nBegin the scenario.\n</OOC> version since it seems more natural.
     if chat_messages and chat_messages[0].get("role") == "user" and chat_messages[0].get("content", "").strip() == ".":
-        chat_messages = [{"role": "user", "content": "<OOC>\nBegin the scenario.\n</OOC>"}] + chat_messages[1:]
+        chat_messages = [{"role": "user", "content": OOC_SCENARIO_START}] + chat_messages[1:]
+
+    # Summary substitutions can leave the chat starting with an assistant message (or empty);
+    # ensure the conversation always opens with a user message.
+    if not chat_messages or chat_messages[0].get("role") != "user":
+        chat_messages = [{"role": "user", "content": OOC_SCENARIO_START}] + chat_messages
 
     system_segments, lorebook_at_end_text = split_system_text(system_prompt)
 
@@ -1130,10 +1169,16 @@ def chat_snapshot():
     if not snapshot:
         return Response(json.dumps({"error": "No chat snapshot captured yet."}), status=404, content_type="application/json")
 
+    raw_arg  = request.args.get("raw")
+    raw_dump = raw_arg is not None and raw_arg.strip().lower() not in DISABLE_VALUES
+    if not raw_dump:
+        snapshot = postprocess_chat_snapshot(snapshot)
+
+    filename = "mini-chat-latest-raw.json" if raw_dump else "mini-chat-latest.json"
     return Response(
         json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n",
         content_type="application/json; charset=utf-8",
-        headers={"Content-Disposition": 'attachment; filename="mini-chat-latest.json"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
