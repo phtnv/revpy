@@ -6,7 +6,7 @@ import threading
 
 from flask             import abort, request
 from packaging.version import Version
-from typing            import Any, Dict, List
+from typing            import Any, Dict, List, Optional
 
 ENABLE_VALUES  = {"1", "y", "true" , "yes", "enable" , "on" }
 DISABLE_VALUES = {"0", "n", "false", "no" , "disable", "off"}
@@ -56,6 +56,10 @@ def getenv_cache_ttl(name: str, default: str) -> str:
     print(f"WARNING: {name} must be '5m' or '1h'. Defaulting to {default}.")
     return default
 
+# Unique sentinel for deep_get. A fresh object() per lookup would never compare
+# `is`-equal, making every missing path return truthy garbage instead of default.
+_MISSING = object()
+
 def deep_get(obj: Any, path: str, default: Any = None) -> Any:
     """
     Safe lookup for nested dict/list JSON.
@@ -67,14 +71,14 @@ def deep_get(obj: Any, path: str, default: Any = None) -> Any:
 
     for part in path.split("."):
         if isinstance(cur, dict):
-            cur = cur.get(part, object())
+            cur = cur.get(part, _MISSING)
         elif isinstance(cur, list) and part.isdigit():
             idx = int(part)
-            cur = cur[idx] if 0 <= idx < len(cur) else object()
+            cur = cur[idx] if 0 <= idx < len(cur) else _MISSING
         else:
-            cur = object()
+            cur = _MISSING
 
-        if cur is object():
+        if cur is _MISSING:
             return default
 
     return cur
@@ -97,6 +101,28 @@ def extract_claude_version(value: Any) -> Version:
         except Exception: pass
 
     return Version("0.0")
+
+
+GLM_MODEL_ID_RE = re.compile(r"^glm-(\d+(?:\.\d+)?)")
+
+def glm_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[Dict[str, Any]]:
+    """
+    Maps the shared thinking settings onto the GLM request dialect. Returns None
+    when model_id is not a GLM model (no passthrough; EXTRA_BODY is the escape
+    hatch there). GLM models think by default, so 'thinking' is always sent
+    explicitly. reasoning_effort exists from glm-5.2 on (assumed to stay for
+    later models); older GLM models only get the on/off switch.
+    """
+    match = GLM_MODEL_ID_RE.match(model_id)
+    if match is None:
+        return None
+    if not thinking_enabled:
+        return {"thinking": {"type": "disabled"}}
+
+    params: Dict[str, Any] = {"thinking": {"type": "enabled"}}
+    if Version(match.group(1)) >= Version("5.2"):
+        params["reasoning_effort"] = thinking_effort
+    return params
 
 
 PREFILL_MODES = {"none", "assistant", "instruction"}
@@ -362,6 +388,17 @@ class RuntimeConfig:
         else                          : print(f"  Anthropic auto  ❌  {self.cache_anthropic_ttl}")
 
     def print_think_status(self) -> None:
+        if self.backend != "anthropic":
+            probe = glm_thinking_params(self.model, True, self.thinking_effort)
+            if probe is None:
+                print(f"  No thinking passthrough for '{self.model}'. Configure thinking through EXTRA_BODY.")
+                return
+            if self.thinking_enabled       : print( "  Thinking enabled    ✅")
+            else                           : print( "  Thinking enabled    ❌")
+            if "reasoning_effort" in probe : print(f"  Thinking effort     ✅  {self.thinking_effort}")
+            else                           : print(f"  Thinking effort     ❌  {self.thinking_effort} (reasoning_effort needs glm-5.2+)")
+            return
+
         if self.preserve_thinking_blocks == UINT64_MAX : preserve_str = "inf"
         else                                           : preserve_str = str(self.preserve_thinking_blocks)
 
@@ -446,6 +483,17 @@ class RuntimeConfig:
     def resolve_thinking(self) -> None:
         if not self.thinking_enabled:
             return
+
+        # OpenAI-style backends: no Anthropic capability metadata and none of the
+        # Anthropic parameter constraints. GLM models get the settings passed
+        # through in the provider dialect (see glm_thinking_params).
+        if self.backend != "anthropic":
+            params = glm_thinking_params(self.model, True, self.thinking_effort)
+            if   params is None               : print(f"Backend '{self.backend}' has no thinking passthrough for '{self.model}'. Configure thinking through EXTRA_BODY.")
+            elif "reasoning_effort" in params : print(f"GLM thinking passthrough: enabled with effort '{self.thinking_effort}'.")
+            else                              : print(f"GLM thinking passthrough: on/off only ('{self.model}' predates reasoning_effort, glm-5.2+).")
+            return
+
         name = deep_get(self.info, "id")
         print(f"Name is {name}")
 

@@ -8,6 +8,7 @@ from typing            import Any, Dict, Iterator, List, Tuple
 from common import (
     append_prefill_instruction_to_last_user_message,
     cfg,
+    glm_thinking_params,
     resolve_api_key,
     track_usage,
     trim_to_end_sentence,
@@ -179,6 +180,7 @@ def apply_openai_model(entry: Dict[str, Any]) -> None:
     # input so any stray write tokens net to zero in the cache-cost accounting.
     cfg.cache_write_5m_cost_usd = cost_source["input_cost"]
     cfg.cache_write_1h_cost_usd = cost_source["input_cost"]
+    cfg.resolve_thinking()
     print(f"=== Switching to {entry['provider']}/{entry['id']} complete ===")
 
 
@@ -257,6 +259,12 @@ def build_openai_body(prepared: Dict[str, Any]) -> Dict[str, Any]:
     if cfg.send_temperature : body["temperature"] = cfg.temperature
     if cfg.send_top_p       : body["top_p"      ] = cfg.top_p
     # top_k is not part of the OpenAI chat schema; providers that accept it can get it via EXTRA_BODY.
+
+    # GLM models get the shared thinking settings in the GLM dialect. EXTRA_BODY
+    # is merged afterwards, so an explicit provider override still wins.
+    thinking_params = glm_thinking_params(cfg.model, cfg.thinking_enabled, cfg.thinking_effort)
+    if thinking_params is not None:
+        body.update(thinking_params)
 
     body.update(provider["extra_body"])
 

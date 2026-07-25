@@ -212,9 +212,6 @@ def admin_cli_loop() -> None:
                 continue
 
             if cmd in {"t", "think", "thinking"}:
-                if cfg.backend != "anthropic":
-                    print(f"Thinking controls are Anthropic-only. For backend '{cfg.backend}', configure thinking through the provider's EXTRA_BODY.")
-                    continue
                 if parts_l < 2:
                     cfg.print_think_status()
                     continue
