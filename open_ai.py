@@ -3,8 +3,9 @@ import json
 import re
 import threading
 
-from packaging.version import Version
-from typing            import Any, Dict, Iterator, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from packaging.version  import Version
+from typing             import Any, Dict, Iterator, List, Optional, Tuple
 
 from common import (
     append_prefill_instruction_to_last_user_message,
@@ -170,48 +171,65 @@ def error_from_response(provider_name: str, response: Any) -> OpenAIBackendError
     return OpenAIBackendError(status_code, body, f"{provider_name}: {message}")
 
 
+def fetch_provider_models(name: str, provider: Dict[str, Any], timeout_s: float) -> List[Dict[str, Any]]:
+    """
+    Fetches one provider's /models list. Runs in a worker thread during refresh;
+    failures raise and are reported by the caller.
+    """
+    headers = {}
+    if provider["api_key"]:
+        headers["Authorization"] = f"Bearer {provider['api_key']}"
+
+    response = httpx.get(f"{provider['base_url']}/models", headers=headers, timeout=timeout_s)
+    if response.status_code != 200:
+        raise error_from_response(name, response)
+
+    data = response.json()
+    # OpenAI-style APIs return {"data": [...]}, but not everyone follows the
+    # spec: Aion returns {"models": [...]}, and some providers a bare list.
+    if   isinstance(data, dict)  : entries = data.get("data") or data.get("models")
+    elif isinstance(data, list)  : entries = data
+    else                         : entries = None
+
+    got = []
+    for entry in entries or []:
+        if isinstance(entry, dict) and entry.get("id"):
+            got.append({**entry, "id": str(entry["id"]), "provider": name})
+    return got
+
+
 def refresh_openai_models(timeout_s: float) -> None:
     """
     Fetches the model list of every configured provider and stores them for CLI use.
 
     Providers with a <NAME>_MODELS override skip the /models request entirely.
     A failing provider is skipped with a warning; it does not block the others.
+    The requests run in parallel, but results are collected in OPENAI_PROVIDERS
+    declaration order, so the aggregated list (and the CLI numbering) does not
+    depend on response order.
     """
     global OPENAI_MODELS
 
     models: List[Dict[str, Any]] = []
 
-    for name, provider in cfg.openai_providers.items():
-        if provider["models"]:
-            models.extend({"id": model_id, "provider": name} for model_id in provider["models"])
-            print(f"Using {len(provider['models'])} configured model(s) for provider '{name}'.")
-            continue
+    if cfg.openai_providers:
+        with ThreadPoolExecutor(max_workers=len(cfg.openai_providers)) as pool:
+            fetches = [
+                (name, provider, None if provider["models"] else pool.submit(fetch_provider_models, name, provider, timeout_s))
+                for name, provider in cfg.openai_providers.items()
+            ]
 
-        try:
-            headers = {}
-            if provider["api_key"]:
-                headers["Authorization"] = f"Bearer {provider['api_key']}"
-
-            response = httpx.get(f"{provider['base_url']}/models", headers=headers, timeout=timeout_s)
-            if response.status_code != 200:
-                raise error_from_response(name, response)
-
-            data = response.json()
-            # OpenAI-style APIs return {"data": [...]}, but not everyone follows the
-            # spec: Aion returns {"models": [...]}, and some providers a bare list.
-            if   isinstance(data, dict)  : entries = data.get("data") or data.get("models")
-            elif isinstance(data, list)  : entries = data
-            else                         : entries = None
-            got = []
-            for entry in entries or []:
-                if isinstance(entry, dict) and entry.get("id"):
-                    got.append({**entry, "id": str(entry["id"]), "provider": name})
-
-            models.extend(got)
-            print(f"Retrieved {len(got)} model(s) from provider '{name}'.")
-
-        except Exception as exc:
-            print(f"WARNING: Could not retrieve a model list from provider '{name}'. {exc}")
+            for name, provider, future in fetches:
+                if future is None:
+                    models.extend({"id": model_id, "provider": name} for model_id in provider["models"])
+                    print(f"Using {len(provider['models'])} configured model(s) for provider '{name}'.")
+                    continue
+                try:
+                    got = future.result()
+                    models.extend(got)
+                    print(f"Retrieved {len(got)} model(s) from provider '{name}'.")
+                except Exception as exc:
+                    print(f"WARNING: Could not retrieve a model list from provider '{name}'. {exc}")
 
     with MODEL_LOCK:
         OPENAI_MODELS = models

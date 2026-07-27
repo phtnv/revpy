@@ -54,6 +54,23 @@ def model_label() -> str:
 app = Flask(__name__)
 CORS(app)
 
+def refresh_model_lists() -> None:
+    """
+    Fetches the Anthropic and OpenAI-style provider model lists in parallel.
+
+    List order is unaffected by response order: each backend fills its own list
+    (Anthropic's is always numbered first in the CLI), and the provider list
+    keeps the OPENAI_PROVIDERS declaration order (see open_ai.refresh_openai_models).
+    """
+    anthropic_thread = threading.Thread(
+        target = refresh_anthropic_models,
+        args   = (cfg.anthropic_api_key, cfg.model_list_timeout_seconds),
+    )
+    anthropic_thread.start()
+    open_ai.refresh_openai_models(cfg.model_list_timeout_seconds)
+    anthropic_thread.join()
+
+
 # Runtime CLI config
 def reload_runtime_env() -> None:
     """
@@ -71,8 +88,7 @@ def reload_runtime_env() -> None:
     cfg.host = bound_host
     cfg.port = bound_port
 
-    refresh_anthropic_models(cfg.anthropic_api_key, cfg.model_list_timeout_seconds)
-    open_ai.refresh_openai_models(cfg.model_list_timeout_seconds)
+    refresh_model_lists()
 
     print("Reloaded runtime configuration from .env.")
     print("HOST and PORT were not changed; restart the process to change bind address.")
@@ -96,8 +112,7 @@ def cli_print_model_info(number: int) -> None:
 
 
 def cli_refresh_models() -> None:
-    refresh_anthropic_models(cfg.anthropic_api_key, cfg.model_list_timeout_seconds)
-    open_ai.refresh_openai_models(cfg.model_list_timeout_seconds)
+    refresh_model_lists()
     if cfg.backend == "anthropic":
         claude.find_cfg(claude.ANTHROPIC_MODELS)
     elif not open_ai.apply_model_by_id(f"{cfg.backend}/{cfg.model}"):
@@ -1193,8 +1208,7 @@ def v1_baseurl()    : return handle_chat_completion()
 if __name__ == "__main__":
     load_dotenv()
     cfg.reload_from_env()
-    refresh_anthropic_models(cfg.anthropic_api_key, cfg.model_list_timeout_seconds)
-    open_ai.refresh_openai_models(cfg.model_list_timeout_seconds)
+    refresh_model_lists()
     # MODEL may name either an Anthropic model or a provider model ("glm-4.7" or "glm/glm-4.7").
     if not open_ai.apply_model_by_id(cfg.model):
         claude.find_cfg(claude.ANTHROPIC_MODELS)
