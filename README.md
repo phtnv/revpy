@@ -1,7 +1,7 @@
 # OpenAI to Anthropic compatibility adapter
 Compatibility adapter for interfacing OpenAI-style chat requests with Antrhopic Message API requests. Typical usage would be using it as an intermediary server between JanitorAI and Claude (with your own Antropic API key).
 
-Besides Claude, the proxy can also route to OpenAI-style API providers (GLM, Aion Labs, ...) configured through `OPENAI_PROVIDERS` in `.env` (see `env_example.ini`). Their models appear in the CLI `model` list after the Anthropic ones; selecting one switches the active backend. Model-agnostic features (summary blocks, lorebook handling, cost tracking, instruction prefill, auto-trim, dumps) work for every backend; Claude-only features (explicit cache markers, signed thinking-block preservation, assistant prefill) apply only to Claude. The shared thinking settings are translated into the provider's own dialect for Aion, GLM and Kimi models (see [Thinking on OpenAI-style backends](#thinking-on-openai-style-backends)). Any other provider-specific request option is passed through verbatim via `<NAME>_EXTRA_BODY`.
+Besides Claude, the proxy can also route to OpenAI-style API providers (OpenAI itself, GLM, Aion Labs, ...) configured through `OPENAI_PROVIDERS` in `.env` (see `env_example.ini`). Their models appear in the CLI `model` list after the Anthropic ones; selecting one switches the active backend. Model-agnostic features (summary blocks, lorebook handling, cost tracking, instruction prefill, auto-trim, dumps) work for every backend; Claude-only features (explicit cache markers, signed thinking-block preservation, assistant prefill) apply only to Claude. The shared thinking settings are translated into the provider's own dialect for GPT, Aion, GLM and Kimi models (see [Thinking on OpenAI-style backends](#thinking-on-openai-style-backends)). Any other provider-specific request option is passed through verbatim via `<NAME>_EXTRA_BODY`.
 
 ## Requirements
 - Anthropic API key from Claude Console. https://platform.claude.com/settings/workspaces/default/keys
@@ -185,6 +185,12 @@ For reasons described above, the system message is split into the core definitio
 
 For lorebook-heavy bots, you can consider disabling all except the system cache markers.
 
+### Caching on OpenAI-style backends
+
+None of the above applies to the OpenAI-style providers: they cache automatically, with no markers to place and no TTL to choose, so the `c` commands do nothing while one of them is selected. OpenAI caches prompts from 1024 tokens up, and bills a cache hit at the `cache_read` rate. From `gpt-5.6` on it also charges for the write, at 1.25x the input rate, which the proxy reports in the usual cache-cost line — configure it per model with `cache_write` in `<NAME>_MODEL_<FAMILY>_COST`. Providers that write for free simply leave `cache_write` at the input price, which nets those tokens to zero.
+
+Since the cache still keys on a stable prefix, the big gotcha above is unchanged: a lorebook that shuffles its entries invalidates everything after it.
+
 ## Thinking (reasoning, `<think></think>` blocks in Janitor)
 
 Thinking can be enabled/disabled from the CLI. Some parameters (prefill, temperature) are incompatible with thinking, they are automatically disabled when thinking is enabled.
@@ -209,19 +215,58 @@ Thinking will contribute to output tokens (increasing cost), but the thoughts ar
 
 The same `t 0` / `t 1` / `t effort <level>` commands drive the OpenAI-style providers, but every provider spells thinking differently, so the proxy translates the shared settings into that provider's dialect. What actually reaches the API depends on the selected model — `t` prints the current mapping, and so does switching models.
 
-| Model | On/off | Effort |
-| --- | --- | --- |
-| `aion-2.0` | yes (`reasoning_effort: none`) | `none\|low\|medium\|high`, default medium. `xhigh`/`max` map to `high`. |
-| `aion-2.5`, `aion-3.0`, `aion-3.0-mini` | no, always thinks | none — these reject `reasoning_effort` with an HTTP 400 |
-| `aion-rp-*` | does not think at all | — |
-| `glm-*` | yes | `reasoning_effort` from glm-5.2 on |
-| `kimi-k3` | no, always thinks | `low\|high\|max`. `medium` maps down to `low`, `xhigh` up to `max`. |
-| `kimi-k2.7-*` | no, always thinks | none |
-| `kimi-k2.5`, `kimi-k2.6` | yes | none |
+| Model                                   | On/off                         | Effort                                                                  |
+| --------------------------------------- | ------------------------------ | ----------------------------------------------------------------------- |
+| `gpt-5.6-sol\|terra\|luna`              | yes (effort `none`)            | `none\|low\|medium\|high\|xhigh`, plus `max` on `responses` only        |
+| `gpt-5.2` … `gpt-5.5`                   | yes (effort `none`)            | `none\|low\|medium\|high\|xhigh`. `max` maps to `xhigh`.                |
+| `gpt-5.1`                               | yes (effort `none`)            | `none\|low\|medium\|high`. `xhigh`/`max` map to `high`.                 |
+| `gpt-5`                                 | no, `minimal` is the floor     | `minimal\|low\|medium\|high`. `xhigh`/`max` map to `high`.              |
+| `o1`, `o3`, `o4-mini`                   | no, always thinks              | `low\|medium\|high`, plus `xhigh` on `chat` only                        |
+| `*-chat-latest`                         | does not think at all          | —                                                                       |
+| `gpt-4.1`, `gpt-4o` and older           | does not think at all          | — these reject the parameter outright                                   |
+| `aion-2.0`                              | yes (`reasoning_effort: none`) | `none\|low\|medium\|high`, default medium. `xhigh`/`max` map to `high`. |
+| `aion-2.5`, `aion-3.0`, `aion-3.0-mini` | no, always thinks              | none — these reject `reasoning_effort` with an HTTP 400                 |
+| `aion-rp-*`                             | does not think at all          | —                                                                       |
+| `glm-*`                                 | yes                            | `reasoning_effort` from glm-5.2 on                                      |
+| `kimi-k3`                               | no, always thinks              | `low\|high\|max`. `medium` maps down to `low`, `xhigh` up to `max`.     |
+| `kimi-k2.7-*`                           | no, always thinks              | none                                                                    |
+| `kimi-k2.5`, `kimi-k2.6`                | yes                            | none                                                                    |
 
-Models with no dialect (OpenAI, DeepSeek, ...) ignore the CLI thinking settings entirely; use `<NAME>_EXTRA_BODY` for those. `EXTRA_BODY` is merged after the dialect, so it also overrides it if you want to force a specific parameter.
+An effort above what a model offers folds down to its highest, so `max` becomes `xhigh` almost everywhere. When a model cannot be told to stop reasoning, `t 0` sends the weakest level it does offer instead, and the CLI says so.
+
+Models with no dialect (DeepSeek, ...) ignore the CLI thinking settings entirely; use `<NAME>_EXTRA_BODY` for those. `EXTRA_BODY` is merged after the dialect, so it also overrides it if you want to force a specific parameter.
 
 Thinking preservation is Anthropic-only. On these backends the thoughts are simply wrapped in a `<think>` block for Janitor, and are not sent back.
+
+On every backend the thinking is billed as output whether or not you can read it, so the usage report splits the output tokens into reasoning and visible text with a cost for each:
+
+```log
+    Output tokens      =  reasoning +    visible
+                  3019 =       2588 +        431
+             $0.018114 =  $0.015528 +  $0.002586
+```
+
+OpenAI, GLM and Kimi report that count. Anthropic and Aion do not, and rather than print a zero for thinking that demonstrably happened, those backends keep the plain `Output tokens = N` line.
+
+Because reasoning tokens also count against the output limit, a small `max_tokens` can be consumed entirely by thinking and leave an empty message; the proxy warns when it sees that, but the fix is to raise `max_tokens` in Janitor or lower the effort.
+
+### Seeing GPT's reasoning
+
+`/chat/completions` never returns the reasoning text — not as a field, not as an option. OpenAI exposes it only on its own `/responses` endpoint, so that is what `GPT_API=responses` selects:
+
+```ini
+GPT_API=responses
+GPT_REASONING_SUMMARY=auto   # none|auto|concise|detailed
+GPT_STORE=false              # /responses otherwise retains your chats for 30 days
+```
+
+With it on, the thoughts arrive in a `<think>` block exactly like the other backends, streaming as they are generated. It also unlocks the `max` effort level on `gpt-5.6`. `GPT_API=chat` keeps the plain endpoint, where reasoning is invisible no matter what.
+
+Three things to expect:
+
+- **What you get is a summary,** not the raw chain of thought. OpenAI does not release the latter.
+- **A `<think>` block is not guaranteed on any given turn.** The `gpt-5.6` family reasons adaptively, so an easy turn may not think at all; and even when it does, the summary is occasionally omitted — most often on very long chains, which is exactly when you wanted it. `concise` and `detailed` are no more reliable than `auto` here, so there is nothing to tune.
+- **Some models need a verified organization** before OpenAI will produce summaries (the o-series does; the `gpt-5` family does not). The proxy prints a warning and retries without the summary rather than failing the turn, so you get a reply either way.
 
 ### Thinking preservation
 

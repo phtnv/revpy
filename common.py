@@ -14,6 +14,16 @@ THINK_EFFORTS  = {"low", "medium", "high", "xhigh", "max"}
 INF_VALUES     = {"inf", "all", "infinite", "infinity", "*", "∞"}
 UINT64_MAX     = 2**64 - 1
 
+# The same thinking efforts, weakest first. Provider dialects fold this ladder onto
+# their own supported subset by walking it downwards from the requested level.
+THINK_EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
+MAX_TOKENS_PARAMS  = {"auto", "max_tokens", "max_completion_tokens"}
+# Which OpenAI-style endpoint a provider speaks. 'chat' is /chat/completions, which every
+# OpenAI-compatible provider implements. 'responses' is OpenAI's own /responses endpoint,
+# the only one that can return reasoning text (see open_ai.build_responses_body).
+OPENAI_API_STYLES    = {"chat", "responses"}
+REASONING_SUMMARIES  = {"none", "auto", "concise", "detailed"}
+
 def getenv_float(name: str, default: float) -> float:
     raw = os.getenv(name, str(default)).strip()
     try: return float(raw)
@@ -122,12 +132,20 @@ class RuntimeConfig:
         # from OPENAI_PROVIDERS. Switched by selecting a model in the CLI.
         self.backend = "anthropic"
 
-        # OpenAI-style providers (GLM, Aion, ...). Each name in OPENAI_PROVIDERS
+        # OpenAI-style providers (GPT, GLM, Aion, ...). Each name in OPENAI_PROVIDERS
         # is configured through <NAME>_BASE_URL, <NAME>_API_KEY, and optionally:
         #   <NAME>_MODELS                 comma-separated model ids; skips the /models request
+        #   <NAME>_MODELS_REGEX           keeps only matching ids from the fetched /models list
+        #                                 (providers like OpenAI also serve tts/image/embedding models)
+        #   <NAME>_MAX_TOKENS_PARAM       'auto' (default), 'max_tokens' or 'max_completion_tokens'
+        #   <NAME>_API                    'chat' (default) or 'responses'; the latter is OpenAI-only
+        #                                 and is the only way to see the model's reasoning
+        #   <NAME>_REASONING_SUMMARY      none|auto|concise|detailed for <NAME>_API=responses
+        #   <NAME>_STORE                  let the provider retain the response (default false)
         #   <NAME>_EXTRA_BODY             json5 object merged verbatim into every request
         #                                 (the escape hatch for provider thinking/caching dialects)
-        #   <NAME>_INPUT_TOKEN_COST_USD, <NAME>_OUTPUT_TOKEN_COST_USD, <NAME>_CACHE_READ_COST_USD
+        #   <NAME>_INPUT_TOKEN_COST_USD, <NAME>_OUTPUT_TOKEN_COST_USD,
+        #   <NAME>_CACHE_READ_COST_USD, <NAME>_CACHE_WRITE_COST_USD
         self.openai_providers: Dict[str, Dict[str, Any]] = {}
         for name in [p.strip().lower() for p in os.getenv("OPENAI_PROVIDERS", "").split(",") if p.strip()]:
             prefix = re.sub(r"[^A-Z0-9]", "_", name.upper())
@@ -150,8 +168,10 @@ class RuntimeConfig:
             # Per-model cost families: <PREFIX>_MODEL_<FAMILY>_REGEX is matched (re.search)
             # against the selected model id; the first declared match wins. The costs live in
             # <PREFIX>_MODEL_<FAMILY>_COST as a json5 object, USD per 1 million tokens:
-            #   {input: 0.80, output: 1.60, cache_read: 0.20}
-            # Missing cost keys default to 0. Models matching no family use the provider-level costs.
+            #   {input: 0.80, output: 1.60, cache_read: 0.20, cache_write: 1.00}
+            # Missing cost keys default to 0, except cache_write which defaults to the input
+            # cost (i.e. writes are free, which is what providers without a write fee do).
+            # Models matching no family use the provider-level costs.
             cost_families: List[Dict[str, Any]] = []
             family_var_re = re.compile(rf"^{re.escape(prefix)}_MODEL_([A-Za-z0-9]+)_REGEX$")
             for env_name in os.environ:
@@ -171,26 +191,59 @@ class RuntimeConfig:
                     costs = json5.loads(os.getenv(cost_var, "").strip() or "null")
                     if not isinstance(costs, dict):
                         raise ValueError("must be a json5 object like {input: 0.8, output: 1.6, cache_read: 0.2}")
+                    input_cost = float(costs.get("input", 0.0) or 0.0)
                     cost_families.append({
-                        "name"            : family.lower(),
-                        "regex"           : pattern,
-                        "input_cost"      : float(costs.get("input"     , 0.0) or 0.0),
-                        "output_cost"     : float(costs.get("output"    , 0.0) or 0.0),
-                        "cache_read_cost" : float(costs.get("cache_read", 0.0) or 0.0),
+                        "name"             : family.lower(),
+                        "regex"            : pattern,
+                        "input_cost"       : input_cost,
+                        "output_cost"      : float(costs.get("output"    , 0.0) or 0.0),
+                        "cache_read_cost"  : float(costs.get("cache_read", 0.0) or 0.0),
+                        "cache_write_cost" : float(costs.get("cache_write", input_cost) or input_cost),
                     })
                 except Exception as exc:
                     print(f"WARNING: {cost_var}: {exc}. Skipping cost family.")
 
+            models_regex = None
+            models_regex_raw = os.getenv(f"{prefix}_MODELS_REGEX", "").strip()
+            if models_regex_raw:
+                try: models_regex = re.compile(models_regex_raw)
+                except re.error as exc:
+                    print(f"WARNING: {prefix}_MODELS_REGEX is not a valid regex ({exc}). Ignoring.")
+
+            max_tokens_param = os.getenv(f"{prefix}_MAX_TOKENS_PARAM", "auto").strip().lower()
+            if max_tokens_param not in MAX_TOKENS_PARAMS:
+                print(f"WARNING: {prefix}_MAX_TOKENS_PARAM must be in {MAX_TOKENS_PARAMS}. Defaulting to 'auto'.")
+                max_tokens_param = "auto"
+
+            api_style = os.getenv(f"{prefix}_API", "chat").strip().lower()
+            if api_style not in OPENAI_API_STYLES:
+                print(f"WARNING: {prefix}_API must be in {OPENAI_API_STYLES}. Defaulting to 'chat'.")
+                api_style = "chat"
+
+            reasoning_summary = os.getenv(f"{prefix}_REASONING_SUMMARY", "auto").strip().lower()
+            if reasoning_summary not in REASONING_SUMMARIES:
+                print(f"WARNING: {prefix}_REASONING_SUMMARY must be in {REASONING_SUMMARIES}. Defaulting to 'auto'.")
+                reasoning_summary = "auto"
+
+            input_cost = getenv_float(f"{prefix}_INPUT_TOKEN_COST_USD", 0.0)
             self.openai_providers[name] = {
-                "base_url"        : base_url,
-                "api_key"         : os.getenv(f"{prefix}_API_KEY", "").strip(),
-                "api_key_name"    : f"{prefix}_API_KEY",
-                "models"          : [m.strip() for m in os.getenv(f"{prefix}_MODELS", "").split(",") if m.strip()],
-                "extra_body"      : extra_body,
-                "cost_families"   : cost_families,
-                "input_cost"      : getenv_float(f"{prefix}_INPUT_TOKEN_COST_USD" , 0.0),
-                "output_cost"     : getenv_float(f"{prefix}_OUTPUT_TOKEN_COST_USD", 0.0),
-                "cache_read_cost" : getenv_float(f"{prefix}_CACHE_READ_COST_USD"  , 0.0),
+                "base_url"         : base_url,
+                "api_key"          : os.getenv(f"{prefix}_API_KEY", "").strip(),
+                "api_key_name"     : f"{prefix}_API_KEY",
+                "models"           : [m.strip() for m in os.getenv(f"{prefix}_MODELS", "").split(",") if m.strip()],
+                "models_regex"     : models_regex,
+                "max_tokens_param" : max_tokens_param,
+                "api"              : api_style,
+                "reasoning_summary": reasoning_summary,
+                # The /responses endpoint retains responses for 30 days by default. Chat
+                # content is nobody else's business, so the proxy opts out unless asked.
+                "store"            : getenv_bool(f"{prefix}_STORE", False),
+                "extra_body"       : extra_body,
+                "cost_families"    : cost_families,
+                "input_cost"       : input_cost,
+                "output_cost"      : getenv_float(f"{prefix}_OUTPUT_TOKEN_COST_USD", 0.0),
+                "cache_read_cost"  : getenv_float(f"{prefix}_CACHE_READ_COST_USD"  , 0.0),
+                "cache_write_cost" : getenv_float(f"{prefix}_CACHE_WRITE_COST_USD" , input_cost),
             }
 
         self.openai_request_timeout_seconds = getenv_float("OPENAI_REQUEST_TIMEOUT_SECONDS", 600.0)
@@ -652,12 +705,17 @@ def append_prefill_instruction_to_last_user_message(formatted: List[Dict[str, An
     formatted.append({"role": "user", "content": instruction})
 
 
-def track_usage(tokens: Dict[str, int]) -> None:
+def track_usage(tokens: Dict[str, Any]) -> None:
     """
     Model-agnostic cost accounting over a normalized token-count dict:
         uncached_input, cache_read, cache_write_1h, cache_write_5m, output
     Backends are responsible for mapping their provider's usage payload to this
     shape (for providers without cache writes, the write counts are simply 0).
+
+    The optional 'reasoning' key splits the output tokens into thinking and visible
+    text, both billed at the output rate. Leave it out (or None) when the provider
+    does not report the count -- Anthropic and Aion reason without ever saying how
+    much, and printing a zero there would be a lie rather than a measurement.
     """
     def tok_usd(tokens: int, usd_per_million_tokens: float) -> float:
         return (tokens*usd_per_million_tokens)/1_000_000.0
@@ -676,6 +734,11 @@ def track_usage(tokens: Dict[str, int]) -> None:
     output_tok           = tokens["output"]
     cache_creation_input = ephemeral_1h + ephemeral_5m
     ttl_tokens           = input_tok + cache_read + cache_creation_input
+
+    # None when the backend cannot report it; see the docstring.
+    reasoning_tok = tokens.get("reasoning")
+    if reasoning_tok is not None:
+        reasoning_tok = min(max(0, int(reasoning_tok)), output_tok)
 
     input_cost          = tok_usd(input_tok, cfg.input_token_cost_usd)
     cache_read_cost     = tok_usd(cache_read, cfg.cache_read_cost_usd)
@@ -712,7 +775,15 @@ def track_usage(tokens: Dict[str, int]) -> None:
     print("    Input tokens       =   uncached + cache read + cache write (        1h +         5m)")
     print("    {:18d} = {:10d} + {:10d} + {:11d} ({:10d} + {:10d})".format(ttl_tokens, input_tok, cache_read, cache_creation_input, ephemeral_1h, ephemeral_5m))
     print("    {:>18s} = {:>10s} + {:>10s} + {:>11s} ({:>10s} + {:>10s})".format(fmt_usd(total_input_cost), fmt_usd(input_cost), fmt_usd(cache_read_cost), fmt_usd(cache_write_cost), fmt_usd(cache_write_1h_cost), fmt_usd(cache_write_5m_cost)))
-    print("    Output tokens      = {:d} ({})".format(output_tok, fmt_usd(output_cost)))
+    if reasoning_tok is None:
+        print("    Output tokens      = {:d} ({})".format(output_tok, fmt_usd(output_cost)))
+    else:
+        visible_tok    = output_tok - reasoning_tok
+        reasoning_cost = tok_usd(reasoning_tok, cfg.output_token_cost_usd)
+        visible_cost   = tok_usd(visible_tok  , cfg.output_token_cost_usd)
+        print("    Output tokens      =  reasoning +    visible")
+        print("    {:18d} = {:10d} + {:10d}".format(output_tok, reasoning_tok, visible_tok))
+        print("    {:>18s} = {:>10s} + {:>10s}".format(fmt_usd(output_cost), fmt_usd(reasoning_cost), fmt_usd(visible_cost)))
     print("    Cache cost         = {} ({})".format(fmt_usd(request_cache_net_cost), cache_lbl(request_cache_net_cost)))
     print("    Total cost         = {}".format(fmt_usd(request_total_cost)))
     print("Session:")

@@ -244,7 +244,10 @@ def admin_cli_loop() -> None:
                     continue
                 arg2 = parts[2].lower()
                 if arg1 in {"e", "effort"}:
-                    cfg.set_think_effort(arg2)
+                    # Report the new effort in the active backend's own terms: providers
+                    # support different subsets, so the level sent is often not the one asked for.
+                    if cfg.set_think_effort(arg2):
+                        active_backend().resolve_thinking()
                     continue
                 if arg1 in {"b", "budget"}:
                     try: budget = int(arg2)
