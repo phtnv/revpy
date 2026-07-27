@@ -1,18 +1,87 @@
 import httpx
 import json
+import re
 import threading
 
 from packaging.version import Version
-from typing            import Any, Dict, Iterator, List, Tuple
+from typing            import Any, Dict, Iterator, List, Optional, Tuple
 
 from common import (
     append_prefill_instruction_to_last_user_message,
     cfg,
-    glm_thinking_params,
     resolve_api_key,
     track_usage,
     trim_to_end_sentence,
 )
+
+
+# Provider thinking dialects.
+# Each dialect maps the shared proxy thinking settings (on/off + effort) onto one
+# provider's request parameters. A dialect returns None for model ids it does not
+# recognize; models with no dialect fall back to the provider's EXTRA_BODY.
+GLM_MODEL_ID_RE = re.compile(r"^glm-(\d+(?:\.\d+)?)")
+
+def glm_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[Dict[str, Any]]:
+    """
+    Maps the shared thinking settings onto the GLM request dialect. Returns None
+    when model_id is not a GLM model (no passthrough; EXTRA_BODY is the escape
+    hatch there). GLM models think by default, so 'thinking' is always sent
+    explicitly. reasoning_effort exists from glm-5.2 on (assumed to stay for
+    later models); older GLM models only get the on/off switch.
+    """
+    match = GLM_MODEL_ID_RE.match(model_id)
+    if match is None:
+        return None
+    if not thinking_enabled:
+        return {"thinking": {"type": "disabled"}}
+
+    params: Dict[str, Any] = {"thinking": {"type": "enabled"}}
+    if Version(match.group(1)) >= Version("5.2"):
+        params["reasoning_effort"] = thinking_effort
+    return params
+
+
+KIMI_MODEL_ID_RE = re.compile(r"^kimi-k(\d+(?:\.\d+)?)")
+
+# kimi-k3 accepts only low|high|max for reasoning_effort; fold the five shared
+# proxy efforts onto that scale (medium rounds down, xhigh rounds up).
+KIMI_EFFORT_MAP = {"low": "low", "medium": "low", "high": "high", "xhigh": "max", "max": "max"}
+
+def kimi_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[Dict[str, Any]]:
+    """
+    Maps the shared thinking settings onto the Kimi (Moonshot) request dialect.
+    Returns None when model_id is not a kimi-k* model (kimi-latest/moonshot-v1
+    have no thinking dialect; EXTRA_BODY is the escape hatch there).
+    Control is model-dependent:
+        kimi-k3+        thinking always on; depth via reasoning_effort (low|high|max, default max)
+        kimi-k2.7-*     thinking always on; thinking.type "enabled" is mandatory
+        kimi-k2.5/k2.6  thinking on by default; only an on/off switch, no effort control
+    A disable request on an always-on model sends the closest thing the API
+    offers: minimal reasoning_effort on k3+, plain enabled on k2.7.
+    """
+    match = KIMI_MODEL_ID_RE.match(model_id)
+    if match is None:
+        return None
+    version = Version(match.group(1))
+
+    if version >= Version("3"):
+        effort = KIMI_EFFORT_MAP.get(thinking_effort, "max") if thinking_enabled else "low"
+        return {"reasoning_effort": effort}
+    if version >= Version("2.7") or thinking_enabled:
+        return {"thinking": {"type": "enabled"}}
+    return {"thinking": {"type": "disabled"}}
+
+
+def provider_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[Dict[str, Any]]:
+    """
+    Provider-dialect thinking passthrough for OpenAI-style backends. Returns the
+    params of the first dialect that recognizes model_id, or None when no dialect
+    matches (no passthrough; EXTRA_BODY is the escape hatch).
+    """
+    params = glm_thinking_params(model_id, thinking_enabled, thinking_effort)
+    if params is None:
+        params = kimi_thinking_params(model_id, thinking_enabled, thinking_effort)
+    return params
 
 
 # Aggregated model list across every configured OpenAI-style provider.
@@ -260,9 +329,9 @@ def build_openai_body(prepared: Dict[str, Any]) -> Dict[str, Any]:
     if cfg.send_top_p       : body["top_p"      ] = cfg.top_p
     # top_k is not part of the OpenAI chat schema; providers that accept it can get it via EXTRA_BODY.
 
-    # GLM models get the shared thinking settings in the GLM dialect. EXTRA_BODY
-    # is merged afterwards, so an explicit provider override still wins.
-    thinking_params = glm_thinking_params(cfg.model, cfg.thinking_enabled, cfg.thinking_effort)
+    # GLM and Kimi models get the shared thinking settings in their provider
+    # dialect. EXTRA_BODY is merged afterwards, so an explicit override still wins.
+    thinking_params = provider_thinking_params(cfg.model, cfg.thinking_enabled, cfg.thinking_effort)
     if thinking_params is not None:
         body.update(thinking_params)
 
@@ -422,6 +491,11 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
                 if not choices or not isinstance(choices[0], dict):
                     continue
                 choice = choices[0]
+
+                # Kimi sends the final-chunk usage inside the choice instead of at the
+                # top level of the chunk (where OpenAI's stream_options puts it).
+                if isinstance(choice.get("usage"), dict):
+                    usage = choice["usage"]
 
                 if choice.get("finish_reason"):
                     finish_reason = str(choice["finish_reason"])
