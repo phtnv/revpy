@@ -99,9 +99,10 @@ def cli_refresh_models() -> None:
     refresh_anthropic_models(cfg.anthropic_api_key, cfg.model_list_timeout_seconds)
     open_ai.refresh_openai_models(cfg.model_list_timeout_seconds)
     if cfg.backend == "anthropic":
-        cfg.find_cfg(claude.ANTHROPIC_MODELS)
+        claude.find_cfg(claude.ANTHROPIC_MODELS)
     elif not open_ai.apply_model_by_id(f"{cfg.backend}/{cfg.model}"):
         print(f"Model {cfg.backend}/{cfg.model} is no longer in the refreshed provider list.")
+
 
 
 CLI_CMD_MODEL_INFO = """\
@@ -213,13 +214,15 @@ def admin_cli_loop() -> None:
 
             if cmd in {"t", "think", "thinking"}:
                 if parts_l < 2:
-                    cfg.print_think_status()
+                    active_backend().print_think_status()
                     continue
 
                 arg1 = parts[1].lower()
-                if arg1 in {"?", "help"}  : print(CLI_CMD_THINK_INFO) ; continue
-                if arg1 in DISABLE_VALUES : cfg.enable_thinking(False); continue
-                if arg1 in ENABLE_VALUES  : cfg.enable_thinking(True) ; continue
+                if arg1 in {"?", "help"} : print(CLI_CMD_THINK_INFO); continue
+                if arg1 in DISABLE_VALUES | ENABLE_VALUES:
+                    cfg.thinking_enabled = arg1 in ENABLE_VALUES
+                    active_backend().resolve_thinking()
+                    continue
 
                 if parts_l < 3:
                     print(CLI_CMD_THINK_INFO)
@@ -1194,7 +1197,7 @@ if __name__ == "__main__":
     open_ai.refresh_openai_models(cfg.model_list_timeout_seconds)
     # MODEL may name either an Anthropic model or a provider model ("glm-4.7" or "glm/glm-4.7").
     if not open_ai.apply_model_by_id(cfg.model):
-        cfg.find_cfg(claude.ANTHROPIC_MODELS)
+        claude.find_cfg(claude.ANTHROPIC_MODELS)
 
     print("Starting Claude proxy")
     print(f"Local URL: http://{cfg.host}:{cfg.port}")

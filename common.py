@@ -113,8 +113,9 @@ class RuntimeConfig:
         self.model = os.getenv("MODEL", "claude-sonnet-4-6")
         self.version = extract_claude_version(self.model)
         self.model_info = {}
-        # Full model record from the provider model list. Empty until apply_model()
-        # runs, so capability checks (resolve_thinking) fail closed instead of crashing.
+        # Full model record from the provider model list. Empty until a backend's
+        # apply_model runs, so capability checks (claude.resolve_thinking) fail
+        # closed instead of crashing.
         self.info = {}
 
         # Active backend: "anthropic", or the name of an OpenAI-style provider
@@ -320,10 +321,6 @@ class RuntimeConfig:
     def set_prefill(self, prefill: str) -> None:
         self.assistant_prefill = prefill
 
-    def enable_thinking(self, en: bool):
-        self.thinking_enabled = en
-        self.resolve_thinking()
-
     def set_think_effort(self, effort: str) -> bool:
         if not effort in THINK_EFFORTS:
             print(f"Allowed thinking efforts: {THINK_EFFORTS}.")
@@ -364,44 +361,6 @@ class RuntimeConfig:
         else                          : print(f"  Auto   cache   {self.cache_auto_msg:3d}  {self.cache_auto_ttl} | 1 is the last user message")
         if self.cache_anthropic_auto  : print(f"  Anthropic auto  ✅  {self.cache_anthropic_ttl}")
         else                          : print(f"  Anthropic auto  ❌  {self.cache_anthropic_ttl}")
-
-    def print_think_status(self) -> None:
-        if self.backend != "anthropic":
-            # Deferred import: open_ai imports common at module load, so the provider
-            # dialects can only be reached from here at call time.
-            from open_ai import provider_thinking_params
-            probe = provider_thinking_params(self.model, True, self.thinking_effort)
-            if probe is None:
-                print(f"  No thinking passthrough for '{self.model}'. Configure thinking through EXTRA_BODY.")
-                return
-            # What the current settings actually send. A dialect that keeps thinking
-            # on even when asked to disable it marks an always-on model.
-            actual      = provider_thinking_params(self.model, self.thinking_enabled, self.thinking_effort) or {}
-            off_probe   = provider_thinking_params(self.model, False, self.thinking_effort)
-            can_disable = deep_get(off_probe, "thinking.type") == "disabled"
-            if   self.thinking_enabled : print( "  Thinking enabled    ✅")
-            elif can_disable           : print( "  Thinking enabled    ❌")
-            else                       : print(f"  Thinking enabled    ❌  (always on for '{self.model}')")
-            if "reasoning_effort" in probe:
-                if "reasoning_effort" in actual : print(f"  Thinking effort     ✅  {self.thinking_effort} (sent as '{actual['reasoning_effort']}')")
-                else                            : print(f"  Thinking effort     ✅  {self.thinking_effort} (not sent while thinking is off)")
-            else:
-                print(f"  Thinking effort     ❌  {self.thinking_effort} (model has no effort control)")
-            return
-
-        if self.preserve_thinking_blocks == UINT64_MAX : preserve_str = "inf"
-        else                                           : preserve_str = str(self.preserve_thinking_blocks)
-
-        if self.thinking_enabled              : print( "  Thinking enabled    ✅")
-        else                                  : print( "  Thinking enabled    ❌")
-        if self.use_adaptive                  :
-                                                print(f"  Thinking effort     ✅  {self.thinking_effort}")
-                                                print(f"  Thinking budget     ❌  {self.thinking_budget}")
-        else                                  :
-                                                print(f"  Thinking effort     ❌  {self.thinking_effort}")
-                                                print(f"  Thinking budget     ✅  {self.thinking_budget}")
-        if self.preserve_thinking_blocks <= 0 : print( "  Thinking preserved  ❌")
-        else                                  : print(f"  Thinking preserved  {preserve_str}")
 
     def check_cache_block_num(self) -> None:
         cache_blocks_active : int = 0
@@ -469,87 +428,6 @@ class RuntimeConfig:
             return False
         self.preserve_thinking_blocks = block_num
         return True
-
-    def resolve_thinking(self) -> None:
-        if not self.thinking_enabled:
-            return
-
-        # OpenAI-style backends: no Anthropic capability metadata and none of the Anthropic parameter constraints.
-        # GLM and Kimi models get the settings passed through in their provider dialect (see
-        # open_ai.provider_thinking_params; imported deferred because open_ai imports common at module load).
-        if self.backend != "anthropic":
-            from open_ai import provider_thinking_params
-            params = provider_thinking_params(self.model, True, self.thinking_effort)
-            if   params is None               : print(f"Backend '{self.backend}' has no thinking passthrough for '{self.model}'. Configure thinking through EXTRA_BODY.")
-            elif "reasoning_effort" in params : print(f"Thinking passthrough: enabled with effort '{params['reasoning_effort']}' (from '{self.thinking_effort}').")
-            else                              : print(f"Thinking passthrough: on/off only ('{self.model}' has no effort control).")
-            return
-
-        name = deep_get(self.info, "id")
-        print(f"Name is {name}")
-
-        if not deep_get(self.info, "capabilities.thinking.supported"):
-            print(f"Model {name} does not support thinking. Disabling.")
-            self.thinking_enabled = False;
-            return
-        if deep_get(self.info, "capabilities.thinking.types.adaptive.supported"):
-            print(f"Models supports adaptive thinking. Using with effort '{self.thinking_effort}'.")
-            self.use_adaptive = True
-        elif deep_get(self.info, "capabilities.thinking.types.enabled.supported"):
-            print(f"Using thinking with a budget of {self.thinking_budget} tokens")
-            self.use_adaptive = False
-        else:
-            print("Neither adaptive nor budget thinking are supported. Disabling.")
-            self.thinking_enabled = False
-            return
-
-        if (self.assistant_prefill_mode == "assistant") and (self.assistant_prefill != ""):
-            print("When thinking is enabled, only instruction mode prefill is supported. Switching.")
-            self.assistant_prefill_mode = "instruction"
-        if self.send_temperature:
-            print("Temperature is not compatible with thinking. Disabling.")
-            self.send_temperature = False
-        if self.send_top_k:
-            print("top_k is not compatible with thinking. Disabling.")
-            self.send_top_k = False
-        if self.send_top_p:
-            if (self.top_p < 0.95) or (self.top_p > 1.00) :
-                print("Thinking supports top_p in the range [0.95:1]. Clamping.")
-            if   self.top_p < 0.95 : self.top_p = 0.95
-            elif self.top_p > 1.00 : self.top_p = 1.00
-
-
-    def apply_model(self, i_info: Dict[str, Any]) -> None:
-        self.backend = "anthropic"
-        self.info  = i_info
-        self.model = deep_get(self.info, "id")
-        print(f"=== Switching to {self.model} ===")
-        self.model_info  = self.info
-        display_name_str = deep_get(self.info, "display_name")
-        self.version     = extract_claude_version(display_name_str)
-        if self.version == Version("0.0"):
-            self.version = extract_claude_version(self.model)
-        self.sync_active_costs()
-        # Validate the configured prefill mode against the selected model.
-        # Do not call set_prefill() here: that would overwrite ASSISTANT_PREFILL
-        # with the mode string (for example "none", "assistant", or "instruction").
-        self.set_prefill_mode(self.assistant_prefill_mode)
-        self.resolve_thinking()
-        print(f"=== Switching to {self.model} complete ===")
-
-
-    def find_cfg(self, models: List[Dict[str, Any]]) -> str:
-        for model in models:
-            model_id = deep_get(model, "id")
-            if model_id != self.model:
-                continue
-            self.apply_model(model)
-            return model_id
-        print(f"Requested model {self.model} not found in model list from Anthropic.")
-        print("Unless you know what you're doing, it is recommended to do 'model list' followed by 'models select <number>'.")
-        print("Otherwise payload correctness cannot be guaranteed.")
-        return ""
-
 
     def print_status(self) -> None:
         preserve_str = "inf" if self.preserve_thinking_blocks == UINT64_MAX else str(self.preserve_thinking_blocks)

@@ -9,9 +9,12 @@ from packaging.version import Version
 from typing            import Any, Dict, Iterator, List, Optional, Tuple
 
 from common import (
+    UINT64_MAX,
     append_prefill_instruction_to_last_user_message,
     append_text_to_content,
     cfg,
+    deep_get,
+    extract_claude_version,
     resolve_api_key,
     track_usage,
     trim_to_end_sentence,
@@ -200,7 +203,7 @@ def select_model_by_number(index: int) -> None:
         if not model_id:
             print(f"Model {index} does not have an id and cannot be selected.")
             return
-        cfg.apply_model(model_info)
+        apply_model(model_info)
 
 
 def print_model_info(index: int) -> None:
@@ -214,6 +217,101 @@ def print_model_info(index: int) -> None:
         model_info = dict(ANTHROPIC_MODELS[index - 1])
 
     print(json.dumps(model_info, indent=2, ensure_ascii=False, default=str))
+
+
+def resolve_thinking() -> None:
+    """
+    Anthropic thinking resolution: capability checks against the selected model
+    record and the Anthropic parameter constraints
+    (open_ai.resolve_thinking() is the OpenAI-style counterpart).
+    """
+    if not cfg.thinking_enabled:
+        return
+
+    name = deep_get(cfg.info, "id")
+    print(f"Name is {name}")
+
+    if not deep_get(cfg.info, "capabilities.thinking.supported"):
+        print(f"Model {name} does not support thinking. Disabling.")
+        cfg.thinking_enabled = False
+        return
+    if deep_get(cfg.info, "capabilities.thinking.types.adaptive.supported"):
+        print(f"Models supports adaptive thinking. Using with effort '{cfg.thinking_effort}'.")
+        cfg.use_adaptive = True
+    elif deep_get(cfg.info, "capabilities.thinking.types.enabled.supported"):
+        print(f"Using thinking with a budget of {cfg.thinking_budget} tokens")
+        cfg.use_adaptive = False
+    else:
+        print("Neither adaptive nor budget thinking are supported. Disabling.")
+        cfg.thinking_enabled = False
+        return
+
+    if (cfg.assistant_prefill_mode == "assistant") and (cfg.assistant_prefill != ""):
+        print("When thinking is enabled, only instruction mode prefill is supported. Switching.")
+        cfg.assistant_prefill_mode = "instruction"
+    if cfg.send_temperature:
+        print("Temperature is not compatible with thinking. Disabling.")
+        cfg.send_temperature = False
+    if cfg.send_top_k:
+        print("top_k is not compatible with thinking. Disabling.")
+        cfg.send_top_k = False
+    if cfg.send_top_p:
+        if (cfg.top_p < 0.95) or (cfg.top_p > 1.00) :
+            print("Thinking supports top_p in the range [0.95:1]. Clamping.")
+        if   cfg.top_p < 0.95 : cfg.top_p = 0.95
+        elif cfg.top_p > 1.00 : cfg.top_p = 1.00
+
+
+def print_think_status() -> None:
+    """
+    CLI 'think' status for the Anthropic backend
+    (open_ai.print_think_status() is the OpenAI-style counterpart).
+    """
+    if cfg.preserve_thinking_blocks == UINT64_MAX : preserve_str = "inf"
+    else                                          : preserve_str = str(cfg.preserve_thinking_blocks)
+
+    if cfg.thinking_enabled              : print( "  Thinking enabled    ✅")
+    else                                 : print( "  Thinking enabled    ❌")
+    if cfg.use_adaptive                  :
+                                           print(f"  Thinking effort     ✅  {cfg.thinking_effort}")
+                                           print(f"  Thinking budget     ❌  {cfg.thinking_budget}")
+    else                                 :
+                                           print(f"  Thinking effort     ❌  {cfg.thinking_effort}")
+                                           print(f"  Thinking budget     ✅  {cfg.thinking_budget}")
+    if cfg.preserve_thinking_blocks <= 0 : print( "  Thinking preserved  ❌")
+    else                                 : print(f"  Thinking preserved  {preserve_str}")
+
+
+def apply_model(model_info: Dict[str, Any]) -> None:
+    cfg.backend = "anthropic"
+    cfg.info  = model_info
+    cfg.model = deep_get(cfg.info, "id")
+    print(f"=== Switching to {cfg.model} ===")
+    cfg.model_info   = cfg.info
+    display_name_str = deep_get(cfg.info, "display_name")
+    cfg.version      = extract_claude_version(display_name_str)
+    if cfg.version == Version("0.0"):
+        cfg.version = extract_claude_version(cfg.model)
+    cfg.sync_active_costs()
+    # Validate the configured prefill mode against the selected model.
+    # Do not call set_prefill() here: that would overwrite ASSISTANT_PREFILL
+    # with the mode string (for example "none", "assistant", or "instruction").
+    cfg.set_prefill_mode(cfg.assistant_prefill_mode)
+    resolve_thinking()
+    print(f"=== Switching to {cfg.model} complete ===")
+
+
+def find_cfg(models: List[Dict[str, Any]]) -> str:
+    for model in models:
+        model_id = deep_get(model, "id")
+        if model_id != cfg.model:
+            continue
+        apply_model(model)
+        return model_id
+    print(f"Requested model {cfg.model} not found in model list from Anthropic.")
+    print("Unless you know what you're doing, it is recommended to do 'model list' followed by 'models select <number>'.")
+    print("Otherwise payload correctness cannot be guaranteed.")
+    return ""
 
 
 def get_anthropic_client() -> anthropic.Anthropic:

@@ -9,6 +9,7 @@ from typing            import Any, Dict, Iterator, List, Optional, Tuple
 from common import (
     append_prefill_instruction_to_last_user_message,
     cfg,
+    deep_get,
     resolve_api_key,
     track_usage,
     trim_to_end_sentence,
@@ -82,6 +83,47 @@ def provider_thinking_params(model_id: str, thinking_enabled: bool, thinking_eff
     if params is None:
         params = kimi_thinking_params(model_id, thinking_enabled, thinking_effort)
     return params
+
+
+def resolve_thinking() -> None:
+    """
+    OpenAI-style counterpart of claude.resolve_thinking(): there is no Anthropic
+    capability metadata to check and none of the Anthropic parameter constraints
+    apply, so this only reports how the shared thinking settings map onto the
+    selected provider model's dialect (if any).
+    """
+    if not cfg.thinking_enabled:
+        return
+
+    params = provider_thinking_params(cfg.model, True, cfg.thinking_effort)
+    if   params is None               : print(f"Backend '{cfg.backend}' has no thinking passthrough for '{cfg.model}'. Configure thinking through EXTRA_BODY.")
+    elif "reasoning_effort" in params : print(f"Thinking passthrough: enabled with effort '{params['reasoning_effort']}' (from '{cfg.thinking_effort}').")
+    else                              : print(f"Thinking passthrough: on/off only ('{cfg.model}' has no effort control).")
+
+
+def print_think_status() -> None:
+    """
+    CLI 'think' status for OpenAI-style backends
+    (claude.print_think_status() is the Anthropic counterpart).
+    """
+    probe = provider_thinking_params(cfg.model, True, cfg.thinking_effort)
+    if probe is None:
+        print(f"  No thinking passthrough for '{cfg.model}'. Configure thinking through EXTRA_BODY.")
+        return
+
+    # What the current settings actually send. A dialect that keeps thinking
+    # on even when asked to disable it marks an always-on model.
+    actual      = provider_thinking_params(cfg.model, cfg.thinking_enabled, cfg.thinking_effort) or {}
+    off_probe   = provider_thinking_params(cfg.model, False, cfg.thinking_effort)
+    can_disable = deep_get(off_probe, "thinking.type") == "disabled"
+    if   cfg.thinking_enabled : print( "  Thinking enabled    ✅")
+    elif can_disable          : print( "  Thinking enabled    ❌")
+    else                      : print(f"  Thinking enabled    ❌  (always on for '{cfg.model}')")
+    if "reasoning_effort" in probe:
+        if "reasoning_effort" in actual : print(f"  Thinking effort     ✅  {cfg.thinking_effort} (sent as '{actual['reasoning_effort']}')")
+        else                            : print(f"  Thinking effort     ✅  {cfg.thinking_effort} (not sent while thinking is off)")
+    else:
+        print(f"  Thinking effort     ❌  {cfg.thinking_effort} (model has no effort control)")
 
 
 # Aggregated model list across every configured OpenAI-style provider.
@@ -249,7 +291,7 @@ def apply_openai_model(entry: Dict[str, Any]) -> None:
     # input so any stray write tokens net to zero in the cache-cost accounting.
     cfg.cache_write_5m_cost_usd = cost_source["input_cost"]
     cfg.cache_write_1h_cost_usd = cost_source["input_cost"]
-    cfg.resolve_thinking()
+    resolve_thinking()
     print(f"=== Switching to {entry['provider']}/{entry['id']} complete ===")
 
 
