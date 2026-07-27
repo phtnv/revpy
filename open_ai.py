@@ -21,6 +21,39 @@ from common import (
 # Each dialect maps the shared proxy thinking settings (on/off + effort) onto one
 # provider's request parameters. A dialect returns None for model ids it does not
 # recognize; models with no dialect fall back to the provider's EXTRA_BODY.
+AION_MODEL_ID_RE = re.compile(r"^(?:aion-labs/)?aion-(\d+(?:\.\d+)?)")
+
+# Aion accepts only low|medium|high for reasoning_effort; fold the five shared
+# proxy efforts onto that scale (xhigh and max round down to high).
+AION_EFFORT_MAP = {"low": "low", "medium": "medium", "high": "high", "xhigh": "high", "max": "high"}
+
+def aion_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[Dict[str, Any]]:
+    """
+    Maps the shared thinking settings onto the Aion (AionLabs) request dialect.
+    Returns None when model_id is not a numbered aion model (aion-rp-* does not
+    reason at all; EXTRA_BODY is the escape hatch there).
+
+    Aion's only thinking parameter is reasoning_effort (none|low|medium|high,
+    default medium), and aion-2.0 is the sole model that takes it. Every other
+    model rejects the parameter outright with HTTP 400 and reasons
+    unconditionally, so they get an empty dialect: recognized, nothing to send.
+    Effort was dropped after 2.0 rather than added, hence the exact version test
+    -- guessing wrong here is a failed request, not a silently ignored field.
+
+    Aion also has reasoning_split (default true on reasoning models), which
+    already puts the thoughts in the separate 'reasoning' field this proxy
+    reads, so it is left at its default.
+    """
+    match = AION_MODEL_ID_RE.match(model_id)
+    if match is None:
+        return None
+    if Version(match.group(1)) != Version("2.0"):
+        return {}
+
+    effort = AION_EFFORT_MAP.get(thinking_effort, "medium") if thinking_enabled else "none"
+    return {"reasoning_effort": effort}
+
+
 GLM_MODEL_ID_RE = re.compile(r"^glm-(\d+(?:\.\d+)?)")
 
 def glm_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[Dict[str, Any]]:
@@ -74,16 +107,21 @@ def kimi_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort:
     return {"thinking": {"type": "disabled"}}
 
 
+THINKING_DIALECTS = (aion_thinking_params, glm_thinking_params, kimi_thinking_params)
+
+
 def provider_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[Dict[str, Any]]:
     """
     Provider-dialect thinking passthrough for OpenAI-style backends. Returns the
     params of the first dialect that recognizes model_id, or None when no dialect
-    matches (no passthrough; EXTRA_BODY is the escape hatch).
+    matches (no passthrough; EXTRA_BODY is the escape hatch). An empty dict means
+    the model is recognized but offers no thinking controls at all.
     """
-    params = glm_thinking_params(model_id, thinking_enabled, thinking_effort)
-    if params is None:
-        params = kimi_thinking_params(model_id, thinking_enabled, thinking_effort)
-    return params
+    for dialect in THINKING_DIALECTS:
+        params = dialect(model_id, thinking_enabled, thinking_effort)
+        if params is not None:
+            return params
+    return None
 
 
 def resolve_thinking() -> None:
@@ -99,7 +137,8 @@ def resolve_thinking() -> None:
     params = provider_thinking_params(cfg.model, True, cfg.thinking_effort)
     if   params is None               : print(f"Backend '{cfg.backend}' has no thinking passthrough for '{cfg.model}'. Configure thinking through EXTRA_BODY.")
     elif "reasoning_effort" in params : print(f"Thinking passthrough: enabled with effort '{params['reasoning_effort']}' (from '{cfg.thinking_effort}').")
-    else                              : print(f"Thinking passthrough: on/off only ('{cfg.model}' has no effort control).")
+    elif params                       : print(f"Thinking passthrough: on/off only ('{cfg.model}' has no effort control).")
+    else                              : print(f"Thinking passthrough: nothing to send ('{cfg.model}' always thinks and has no controls).")
 
 
 def print_think_status() -> None:
@@ -113,10 +152,12 @@ def print_think_status() -> None:
         return
 
     # What the current settings actually send. A dialect that keeps thinking
-    # on even when asked to disable it marks an always-on model.
+    # on even when asked to disable it marks an always-on model. Each dialect
+    # spells "off" in its own way: a disabled thinking block (GLM), or the
+    # 'none' effort level (Aion).
     actual      = provider_thinking_params(cfg.model, cfg.thinking_enabled, cfg.thinking_effort) or {}
-    off_probe   = provider_thinking_params(cfg.model, False, cfg.thinking_effort)
-    can_disable = deep_get(off_probe, "thinking.type") == "disabled"
+    off_probe   = provider_thinking_params(cfg.model, False, cfg.thinking_effort) or {}
+    can_disable = deep_get(off_probe, "thinking.type") == "disabled" or off_probe.get("reasoning_effort") == "none"
     if   cfg.thinking_enabled : print( "  Thinking enabled    ✅")
     elif can_disable          : print( "  Thinking enabled    ❌")
     else                      : print(f"  Thinking enabled    ❌  (always on for '{cfg.model}')")
@@ -389,7 +430,7 @@ def build_openai_body(prepared: Dict[str, Any]) -> Dict[str, Any]:
     if cfg.send_top_p       : body["top_p"      ] = cfg.top_p
     # top_k is not part of the OpenAI chat schema; providers that accept it can get it via EXTRA_BODY.
 
-    # GLM and Kimi models get the shared thinking settings in their provider
+    # Aion, GLM and Kimi models get the shared thinking settings in their provider
     # dialect. EXTRA_BODY is merged afterwards, so an explicit override still wins.
     thinking_params = provider_thinking_params(cfg.model, cfg.thinking_enabled, cfg.thinking_effort)
     if thinking_params is not None:

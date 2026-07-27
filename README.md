@@ -1,7 +1,7 @@
 # OpenAI to Anthropic compatibility adapter
 Compatibility adapter for interfacing OpenAI-style chat requests with Antrhopic Message API requests. Typical usage would be using it as an intermediary server between JanitorAI and Claude (with your own Antropic API key).
 
-Besides Claude, the proxy can also route to OpenAI-style API providers (GLM, Aion Labs, ...) configured through `OPENAI_PROVIDERS` in `.env` (see `env_example.ini`). Their models appear in the CLI `model` list after the Anthropic ones; selecting one switches the active backend. Model-agnostic features (summary blocks, lorebook handling, cost tracking, instruction prefill, auto-trim, dumps) work for every backend; Claude-only features (explicit cache markers, thinking controls, signed thinking-block preservation, assistant prefill) apply only to Claude. Provider-specific request options (for example GLM's `thinking` flag) are passed through verbatim via `<NAME>_EXTRA_BODY`.
+Besides Claude, the proxy can also route to OpenAI-style API providers (GLM, Aion Labs, ...) configured through `OPENAI_PROVIDERS` in `.env` (see `env_example.ini`). Their models appear in the CLI `model` list after the Anthropic ones; selecting one switches the active backend. Model-agnostic features (summary blocks, lorebook handling, cost tracking, instruction prefill, auto-trim, dumps) work for every backend; Claude-only features (explicit cache markers, signed thinking-block preservation, assistant prefill) apply only to Claude. The shared thinking settings are translated into the provider's own dialect for Aion, GLM and Kimi models (see [Thinking on OpenAI-style backends](#thinking-on-openai-style-backends)). Any other provider-specific request option is passed through verbatim via `<NAME>_EXTRA_BODY`.
 
 ## Requirements
 - Anthropic API key from Claude Console. https://platform.claude.com/settings/workspaces/default/keys
@@ -204,6 +204,24 @@ Newer models use effort. Some of them support a budget too, but this proxy defau
 The proxy will automatically select the appropriate parameter based on the model selected from CLI.
 
 Thinking will contribute to output tokens (increasing cost), but the thoughts are generally not preserved (unless you enable `PRESERVE_THINKING_BLOCKS` in this proxy), so only the final output will be a part of the input tokens for the next message.
+
+### Thinking on OpenAI-style backends
+
+The same `t 0` / `t 1` / `t effort <level>` commands drive the OpenAI-style providers, but every provider spells thinking differently, so the proxy translates the shared settings into that provider's dialect. What actually reaches the API depends on the selected model — `t` prints the current mapping, and so does switching models.
+
+| Model | On/off | Effort |
+| --- | --- | --- |
+| `aion-2.0` | yes (`reasoning_effort: none`) | `none\|low\|medium\|high`, default medium. `xhigh`/`max` map to `high`. |
+| `aion-2.5`, `aion-3.0`, `aion-3.0-mini` | no, always thinks | none — these reject `reasoning_effort` with an HTTP 400 |
+| `aion-rp-*` | does not think at all | — |
+| `glm-*` | yes | `reasoning_effort` from glm-5.2 on |
+| `kimi-k3` | no, always thinks | `low\|high\|max`. `medium` maps down to `low`, `xhigh` up to `max`. |
+| `kimi-k2.7-*` | no, always thinks | none |
+| `kimi-k2.5`, `kimi-k2.6` | yes | none |
+
+Models with no dialect (OpenAI, DeepSeek, ...) ignore the CLI thinking settings entirely; use `<NAME>_EXTRA_BODY` for those. `EXTRA_BODY` is merged after the dialect, so it also overrides it if you want to force a specific parameter.
+
+Thinking preservation is Anthropic-only. On these backends the thoughts are simply wrapped in a `<think>` block for Janitor, and are not sent back.
 
 ### Thinking preservation
 
