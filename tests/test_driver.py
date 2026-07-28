@@ -417,6 +417,89 @@ def test_usage_normalization(case: tuple) -> bool:
     return passed
 
 
+class FakeStream:
+    """A /responses SSE body, replayed from a list of already-encoded 'data:' lines."""
+    def __init__(self, lines: list[str]) -> None:
+        self.status_code = 200
+        self._lines      = lines
+
+    def iter_lines(self): return iter(self._lines)
+    def __enter__(self): return self
+    def __exit__(self, *exc): return False
+
+
+class FakeStreamClient:
+    def __init__(self, lines: list[str]) -> None: self._lines = lines
+    def __enter__(self): return self
+    def __exit__(self, *exc): return False
+    def stream(self, *args: Any, **kwargs: Any): return FakeStream(self._lines)
+
+
+def sse(*events: dict[str, Any]) -> list[str]:
+    return [f"data: {json.dumps(e)}" for e in events]
+
+
+CREATED_EVENT   = {"type": "response.created",  "response": {"id": "resp_1", "status": "in_progress"}}
+TEXT_EVENT      = {"type": "response.output_text.delta", "delta": "Hello."}
+REASONING_EVENT = {"type": "response.reasoning_summary_text.delta", "delta": "Thinking..."}
+COMPLETED_EVENT = {"type": "response.completed", "response": {
+    "id": "resp_1", "status": "completed",
+    "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}}}
+
+# A /responses stream is only finished when the response reports a terminal status.
+# Running out of body without one means the connection was cut mid-response; relaying
+# that as a clean stop hands the client an empty message and no reason for it, which
+# is indistinguishable from the model choosing to say nothing.
+STREAM_CASES = [
+    ("completed stream is relayed",            sse(CREATED_EVENT, TEXT_EVENT, COMPLETED_EVENT), False),
+    ("truncated after reasoning raises",       sse(CREATED_EVENT, REASONING_EVENT)            , True ),
+    ("truncated after text raises",            sse(CREATED_EVENT, TEXT_EVENT)                 , True ),
+    ("truncated before any content raises",    sse(CREATED_EVENT)                             , True ),
+]
+
+
+def test_responses_stream_termination(case: tuple) -> bool:
+    global tests_ttl
+    tests_ttl += 1
+    label, lines, expect_error = case
+    print(f"Testing /responses stream: {label}... ", end="")
+
+    cfg = make_config()
+    cfg.backend          = "gpt"
+    cfg.model            = "gpt-5.6-sol"
+    cfg.openai_providers = {"gpt": make_provider(api="responses")}
+
+    prepared = {"messages": [{"role": "user", "content": "hi"}], "system_segments": [],
+                "system_summary_text": "", "lorebook_at_end_text": "", "max_tokens": 64}
+
+    original_httpx, original_headers = resp_api.httpx, resp_api.request_headers
+    resp_api.httpx = SimpleNamespace(Client=lambda **kw: FakeStreamClient(lines))
+    resp_api.request_headers = lambda provider: {}
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            raised, final = None, None
+            try:
+                for kind, data in resp_api.generate_stream(prepared):
+                    if kind == "final": final = data
+            except Exception as exc:
+                raised = exc
+    finally:
+        resp_api.httpx, resp_api.request_headers = original_httpx, original_headers
+
+    if expect_error:
+        passed = raised is not None and final is None
+        if not passed:
+            print(f"expected an error, got final={final!r} raised={raised!r} ", end="")
+    else:
+        passed = raised is None and final is not None and final["stop_reason"] == "stop"
+        if not passed:
+            print(f"expected a clean final, got final={final!r} raised={raised!r} ", end="")
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
 def load_body_cases(name: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     fixture = json5.loads((FIXTURES / name).read_text(encoding="utf-8"))
     return fixture["inputs"], fixture["cases"]
@@ -475,6 +558,9 @@ if __name__ == "__main__":
 
     for usage_case in USAGE_CASES:
         tests_passed += test_usage_normalization(usage_case)
+
+    for stream_case in STREAM_CASES:
+        tests_passed += test_responses_stream_termination(stream_case)
 
     body_inputs, body_cases = load_body_cases("provider_bodies.json5")
     for body_case in body_cases:

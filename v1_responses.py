@@ -279,6 +279,33 @@ def parse_usage(usage: Any) -> Dict[str, Any]:
 # produce several of each, and on adaptive models the reasoning items may be absent.
 STOP_REASONS = {"completed": "stop", "incomplete": "length", "failed": "error"}
 
+# The response statuses that end a turn. A stream that runs out of body without
+# reporting one of these was cut mid-response -- see generate_stream(). A mid-stream
+# 'error' event ends it too, but that path raises where it is read.
+TERMINAL_STATUSES = frozenset(STOP_REASONS)
+
+
+def truncated_stream_message(text_chars: int, reasoning_chars: int) -> str:
+    """
+    Explains a stream that stopped without OpenAI ever finishing the response.
+
+    Seen when the model reasons for a long stretch over a large prompt: /responses
+    sends nothing at all while reasoning (summary text only arrives once the reasoning
+    item closes), and the silent connection gets closed with no error and no terminal
+    event. It is not a time limit -- runs that stream output for minutes are fine,
+    while ones that sit in reasoning for under a minute are cut.
+
+    What arrived before the cut has already gone to the client, so say how much.
+    """
+    got = f"{text_chars} characters of reply and {reasoning_chars} of reasoning"
+    return (
+        f"The response stream ended before the model finished ({got}). OpenAI closed "
+        "the connection without completing the response, and did not say why. This "
+        "happens while the model is reasoning silently on a long prompt; retrying, "
+        "shortening the prompt, or lowering the thinking effort ('t effort low') "
+        "usually gets through."
+    )
+
 
 def output_text(data: Dict[str, Any]) -> Tuple[str, str]:
     """
@@ -335,6 +362,12 @@ def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
     counts = parse_usage(data.get("usage"))
     print_usage(counts)
 
+    # A failed response still arrives as HTTP 200 with the reason in the body. Without
+    # this it would be relayed as an ordinary reply, which is usually an empty one.
+    if str(data.get("status") or "") == "failed":
+        message = deep_get(data, "error.message") or "the model failed to produce a response."
+        raise ProviderError(502, {"error": {"message": str(message)}}, f"{cfg.backend}: {message}")
+
     reply_text, reasoning_text = output_text(data)
     finish_reason = STOP_REASONS.get(str(data.get("status") or ""), "stop")
 
@@ -374,6 +407,7 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
         print_payload(body)
 
         retry_without_summary = False
+        stream_completed      = False
 
         with httpx.Client(timeout=request_timeout()) as client:
             with client.stream(
@@ -417,7 +451,10 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
                         if finished.get("id")    : message_id = str(finished["id"])
                         if finished.get("usage") : usage      = finished["usage"]
                         if finished.get("status"):
-                            finish_reason = STOP_REASONS.get(str(finished["status"]), finish_reason)
+                            status = str(finished["status"])
+                            finish_reason = STOP_REASONS.get(status, finish_reason)
+                            if status in TERMINAL_STATUSES:
+                                stream_completed = True
 
                     # The model can emit several summary blocks per turn; keep them apart.
                     if event_type == "response.reasoning_summary_part.added" and reasoning_parts:
@@ -435,6 +472,15 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
                         if delta:
                             response_parts.append(delta)
                             yield ("text", delta)
+
+                # Running out of body without a terminal event means the connection was
+                # cut mid-response. Falling through here would report a clean stop with
+                # an empty message and zero usage -- a silent failure that looks to the
+                # client exactly like the model choosing to say nothing.
+                if not stream_completed:
+                    raise ProviderError(502, {"error": {"message": truncated_stream_message(
+                        len("".join(response_parts)), len("".join(reasoning_parts)))}},
+                        f"{cfg.backend}: the response stream ended before the model finished.")
 
         break
 
