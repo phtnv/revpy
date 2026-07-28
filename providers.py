@@ -55,7 +55,7 @@ class ProviderError(Exception):
     """
     Provider HTTP error. Carries status_code and a response body dict in the
     same attribute shape the Anthropic SDK errors use, so server.build_error_body
-    and claude.anthropic_error_body handle it without special cases.
+    and common.error_body handle it without special cases.
     """
     def __init__(self, status_code: int, body: Dict[str, Any], message: str):
         super().__init__(message)

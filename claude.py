@@ -14,6 +14,8 @@ from common import (
     append_text_to_content,
     cfg,
     deep_get,
+    error_body,
+    error_message,
     extract_claude_version,
     resolve_api_key,
     track_usage,
@@ -44,61 +46,6 @@ def anthropic_object_to_dict(obj: Any) -> Dict[str, Any]:
         }
 
     return {"value": str(obj)}
-
-
-def anthropic_error_body(exc: Exception) -> Optional[Dict[str, Any]]:
-    body = getattr(exc, "body", None)
-    if isinstance(body, dict):
-        return body
-
-    response = getattr(exc, "response", None)
-    if response is not None:
-        try:
-            response_body = response.json()
-            if isinstance(response_body, dict):
-                return response_body
-        except Exception:
-            pass
-
-    return None
-
-
-def anthropic_error_message(body: Optional[Dict[str, Any]], fallback: str) -> str:
-    if isinstance(body, dict):
-        error_obj = body.get("error", {})
-        if isinstance(error_obj, dict):
-            message = error_obj.get("message")
-            if message:
-                return str(message)
-
-        return json.dumps(body, ensure_ascii=False, default=str)
-
-    return fallback
-
-
-def print_anthropic_error(exc: Exception) -> bool:
-    ANSI_RED   : str = "\033[31m"
-    ANSI_RESET : str = "\033[0m"
-    body   = anthropic_error_body(exc)
-    module = exc.__class__.__module__.split(".", 1)[0]
-    if module != "anthropic" and body is None:
-        return False
-
-    fallback = str(exc) or exc.__class__.__name__
-
-    if body is None:
-        body = {
-            "type"  : "error",
-            "error" : {
-                "type"    : exc.__class__.__name__,
-                "message" : fallback,
-            },
-        }
-
-    message = anthropic_error_message(body, fallback)
-    print(json.dumps(body, indent=2, ensure_ascii=False, default=str))
-    print(f"{ANSI_RED}{message}{ANSI_RESET}")
-    return True
 
 
 def model_id_from_info(model_info: Dict[str, Any]) -> str:
@@ -142,7 +89,7 @@ def refresh_anthropic_models(key: str, timeout_s: float) -> bool:
         return False
 
     except Exception as exc:
-        anthropic_exception_msg : str = anthropic_error_message(anthropic_error_body(exc), str(exc) or exc.__class__.__name__)
+        anthropic_exception_msg : str = error_message(error_body(exc), str(exc) or exc.__class__.__name__)
         with MODEL_LOCK:
             ANTHROPIC_MODELS        = []
             MODEL_LIST_LAST_ERROR   = anthropic_exception_msg

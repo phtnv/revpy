@@ -6,7 +6,7 @@ import threading
 
 from flask             import abort, request
 from packaging.version import Version
-from typing            import Any, Dict, List
+from typing            import Any, Dict, List, Optional
 
 ENABLE_VALUES  = {"1", "y", "true" , "yes", "enable" , "on" }
 DISABLE_VALUES = {"0", "n", "false", "no" , "disable", "off"}
@@ -612,6 +612,70 @@ def resolve_api_key(configured_key: str, key_name: str) -> str:
         return provided_key
     abort(500, description=(f"{key_name} is not configured. Either set {key_name} and PROXY_KEY in .env, or set ALLOW_KEY_PASSTHROUGH=true."))
     raise RuntimeError("unreachable")
+
+
+# Backend error rendering. Every backend raises errors carrying the same two things:
+# a status code and a JSON body with an 'error' object -- the Anthropic SDK does it
+# natively, and providers.ProviderError is built to match. So these are shared rather
+# than Anthropic-only, despite having started out that way.
+def error_body(exc: Exception) -> Optional[Dict[str, Any]]:
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        return body
+
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            response_body = response.json()
+            if isinstance(response_body, dict):
+                return response_body
+        except Exception:
+            pass
+
+    return None
+
+
+def error_message(body: Optional[Dict[str, Any]], fallback: str) -> str:
+    if isinstance(body, dict):
+        error_obj = body.get("error", {})
+        if isinstance(error_obj, dict):
+            message = error_obj.get("message")
+            if message:
+                return str(message)
+
+        return json.dumps(body, ensure_ascii=False, default=str)
+
+    return fallback
+
+
+def print_error(exc: Exception) -> bool:
+    """
+    Prints an API error body plus its message in red. Returns False without printing
+    for exceptions that are not API errors at all (a bug in the proxy rather than a
+    refusal from upstream), which have no body to show.
+    """
+    ANSI_RED   : str = "\033[31m"
+    ANSI_RESET : str = "\033[0m"
+    body   = error_body(exc)
+    module = exc.__class__.__module__.split(".", 1)[0]
+    if module != "anthropic" and body is None:
+        return False
+
+    fallback = str(exc) or exc.__class__.__name__
+
+    if body is None:
+        body = {
+            "type"  : "error",
+            "error" : {
+                "type"    : exc.__class__.__name__,
+                "message" : fallback,
+            },
+        }
+
+    message = error_message(body, fallback)
+    print(json.dumps(body, indent=2, ensure_ascii=False, default=str))
+    print(f"{ANSI_RED}{message}{ANSI_RESET}")
+    return True
 
 
 def content_to_plain_text(content: Any) -> str:

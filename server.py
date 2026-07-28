@@ -16,9 +16,7 @@ import open_ai
 import providers
 
 from claude import (
-    anthropic_error_body,
     extract_hidden_thinking_envelopes,
-    print_anthropic_error,
     print_model_info,
     print_model_list,
     refresh_anthropic_models,
@@ -33,6 +31,8 @@ from common import (
     UINT64_MAX,
     cfg,
     content_to_plain_text,
+    error_body,
+    print_error,
     session_cost_snapshot,
 )
 
@@ -1053,25 +1053,25 @@ def build_error_body(exc: Exception) -> Tuple[int, Dict[str, Any]]:
     if hasattr(exc, "status_code"):
         status_code = getattr(exc, "status_code", status_code)
 
-    body = anthropic_error_body(exc)
-    if isinstance(body, dict):
-        error_obj = body.get("error", {})
+    upstream_body = error_body(exc)
+    if isinstance(upstream_body, dict):
+        error_obj = upstream_body.get("error", {})
         if isinstance(error_obj, dict):
             message    = error_obj.get("message", message)
             error_type = error_obj.get("type", error_type)
 
-    error_body = { "error": { "message": message, "type": error_type, "code": status_code } }
-    return status_code, error_body
+    client_body = { "error": { "message": message, "type": error_type, "code": status_code } }
+    return status_code, client_body
 
 
 def make_error_response(exc: Exception, payload: Optional[Dict[str, Any]] = None) -> Response:
-    status_code, error_body = build_error_body(exc)
-    print_anthropic_error(exc)
+    status_code, client_body = build_error_body(exc)
+    print_error(exc)
 
-    log_body   = { "error": error_body, "request": payload, "traceback": traceback.format_exc() }
+    log_body   = { "error": client_body, "request": payload, "traceback": traceback.format_exc() }
     write_error_log(log_body)
 
-    return Response(json.dumps(error_body, ensure_ascii=False), status=status_code, content_type="application/json")
+    return Response(json.dumps(client_body, ensure_ascii=False), status=status_code, content_type="application/json")
 
 
 # Generation
@@ -1112,11 +1112,11 @@ def generate_stream(payload: Dict[str, Any]):
                 )
 
     except Exception as exc:
-        _, error_body = build_error_body(exc)
-        print_anthropic_error(exc)
-        log_body = { "error": error_body, "request": payload, "traceback": traceback.format_exc() }
+        _, client_body = build_error_body(exc)
+        print_error(exc)
+        log_body = { "error": client_body, "request": payload, "traceback": traceback.format_exc() }
         write_error_log(log_body)
-        yield "data: " + json.dumps(error_body, ensure_ascii=False) + "\n\n"
+        yield "data: " + json.dumps(client_body, ensure_ascii=False) + "\n\n"
         yield "data: [DONE]\n\n"
         return
 
