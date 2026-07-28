@@ -31,11 +31,11 @@ USAGE      = {
 }
 
 sys.path.insert(0, str(ROOT))
-common    : Any = importlib.import_module("common")
-v1_messages: Any = importlib.import_module("v1_messages")
-chat_api  : Any = importlib.import_module("v1_chat_completions")
-resp_api  : Any = importlib.import_module("v1_responses")
-server    : Any = importlib.import_module("server")
+common      : Any = importlib.import_module("common")
+v1_messages : Any = importlib.import_module("v1_messages")
+chat_api    : Any = importlib.import_module("v1_chat_completions")
+resp_api    : Any = importlib.import_module("v1_responses")
+server      : Any = importlib.import_module("server")
 
 # The two OpenAI-style request builders, keyed by the wire protocol they speak.
 BUILDERS = {
@@ -212,8 +212,8 @@ def test_basic_non_streaming_roundtrip(name: str) -> bool:
     rx_msg  = FakeAnthropic(ref_msg["reply"])
 
     v1_messages.get_anthropic_client = lambda: rx_msg
-    server.time.time            = lambda: CREATED
-    v1_messages.print_usage          = lambda usage: None
+    v1_messages.print_usage          = lambda counts: None
+    server.time.time                 = lambda: CREATED
     response = server.app.test_client().post("/v1/chat/completions", json=ref_msg["request"])
 
     rx_msg = received_from(response, rx_msg)
@@ -233,8 +233,8 @@ def test_chat_dump_formats(name: str) -> bool:
     fake    = FakeAnthropic(ref_msg["reply"])
 
     v1_messages.get_anthropic_client = lambda: fake
-    server.time.time            = lambda: CREATED
-    v1_messages.print_usage          = lambda usage: None
+    v1_messages.print_usage          = lambda counts: None
+    server.time.time                 = lambda: CREATED
     server.app.test_client().post("/v1/chat/completions", json=ref_msg["request"])
 
     expected_snapshot = fixture["expected_snapshot"]
@@ -300,6 +300,123 @@ def test_wire_protocol_derivation() -> bool:
     return passed
 
 
+def anthropic_usage(inp=0, out=0, read=0, creation=0, e1h=None, e5m=None) -> Any:
+    """An Anthropic SDK usage object, in the attribute shape parse_usage() reads."""
+    cache_creation = SimpleNamespace()
+    if e1h is not None: cache_creation.ephemeral_1h_input_tokens = e1h
+    if e5m is not None: cache_creation.ephemeral_5m_input_tokens = e5m
+    return SimpleNamespace(
+        input_tokens                = inp,
+        output_tokens               = out,
+        cache_read_input_tokens     = read,
+        cache_creation_input_tokens = creation,
+        cache_creation              = cache_creation,
+    )
+
+
+# Every backend's parse_usage() feeds the same two consumers, so both are pinned here:
+# what the cost tracker bills from, and what the client is told. These are the numbers
+# the per-request cost report is computed from, so they are asserted exactly.
+#   (label, backend, raw usage, expected cost, expected client[, cfg overrides])
+USAGE_CASES: list[tuple] = [
+    ("messages: cache read", "messages",
+     anthropic_usage(inp=10, out=50, read=90),
+     {"uncached_input": 10, "cache_read": 90, "cache_write_1h": 0, "cache_write_5m": 0, "output": 50, "reasoning": None},
+     {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150,
+      "input_tokens_uncached": 10, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 90}),
+
+    # Anthropic is the only backend that splits cache writes by TTL.
+    ("messages: 1h/5m write split", "messages",
+     anthropic_usage(inp=10, out=50, creation=100, e1h=60, e5m=40),
+     {"uncached_input": 10, "cache_read": 0, "cache_write_1h": 60, "cache_write_5m": 40, "output": 50, "reasoning": None},
+     {"prompt_tokens": 110, "completion_tokens": 50, "total_tokens": 160,
+      "input_tokens_uncached": 10, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 0}),
+
+    # A legacy payload reports only a total cache write, with no 5m/1h split to read.
+    # fallback_cache_write_ttl() then guesses from the configured markers, so the same
+    # payload is billed differently depending on them. Both directions are pinned.
+    ("messages: legacy write, 1h marker active", "messages",
+     anthropic_usage(inp=10, out=50, creation=100),
+     {"uncached_input": 10, "cache_read": 0, "cache_write_1h": 100, "cache_write_5m": 0, "output": 50, "reasoning": None},
+     {"prompt_tokens": 110, "completion_tokens": 50, "total_tokens": 160,
+      "input_tokens_uncached": 10, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 0},
+     {"cache_en": True, "cache_system": True, "cache_system_ttl": "1h",
+      "cache_manual_msg": 0, "cache_auto_msg": 0}),
+
+    # Caching off: nothing was written on purpose, so the cheaper bucket is assumed.
+    ("messages: legacy write, caching off", "messages",
+     anthropic_usage(inp=10, out=50, creation=100),
+     {"uncached_input": 10, "cache_read": 0, "cache_write_1h": 0, "cache_write_5m": 100, "output": 50, "reasoning": None},
+     {"prompt_tokens": 110, "completion_tokens": 50, "total_tokens": 160,
+      "input_tokens_uncached": 10, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 0},
+     {"cache_en": False}),
+
+    ("chat: cached + write", "chat",
+     {"prompt_tokens": 100, "completion_tokens": 50,
+      "prompt_tokens_details": {"cached_tokens": 50, "cache_write_tokens": 30}},
+     {"uncached_input": 20, "cache_read": 50, "cache_write_1h": 0, "cache_write_5m": 30, "output": 50, "reasoning": None},
+     {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150,
+      "input_tokens_uncached": 20, "cache_creation_input_tokens": 30, "cache_read_input_tokens": 50}),
+
+    # A payload claiming more cached/written tokens than there were input tokens must
+    # not drive uncached input negative.
+    ("chat: overclaimed cache clamps", "chat",
+     {"prompt_tokens": 10, "completion_tokens": 5,
+      "prompt_tokens_details": {"cached_tokens": 999, "cache_write_tokens": 999}},
+     {"uncached_input": 0, "cache_read": 10, "cache_write_1h": 0, "cache_write_5m": 0, "output": 5, "reasoning": None},
+     {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
+      "input_tokens_uncached": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 10}),
+
+    # A reported zero is a measurement and must survive as 0, not become None.
+    ("chat: reported zero reasoning", "chat",
+     {"prompt_tokens": 40, "completion_tokens": 90,
+      "completion_tokens_details": {"reasoning_tokens": 0}},
+     {"uncached_input": 40, "cache_read": 0, "cache_write_1h": 0, "cache_write_5m": 0, "output": 90, "reasoning": 0},
+     {"prompt_tokens": 40, "completion_tokens": 90, "total_tokens": 130,
+      "input_tokens_uncached": 40, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}),
+
+    ("responses: cached + write", "responses",
+     {"input_tokens": 100, "output_tokens": 50,
+      "input_tokens_details": {"cached_tokens": 50, "cache_write_tokens": 30}},
+     {"uncached_input": 20, "cache_read": 50, "cache_write_1h": 0, "cache_write_5m": 30, "output": 50, "reasoning": None},
+     {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150,
+      "input_tokens_uncached": 20, "cache_creation_input_tokens": 30, "cache_read_input_tokens": 50}),
+
+    ("responses: reasoning tokens", "responses",
+     {"input_tokens": 40, "output_tokens": 90,
+      "output_tokens_details": {"reasoning_tokens": 70}},
+     {"uncached_input": 40, "cache_read": 0, "cache_write_1h": 0, "cache_write_5m": 0, "output": 90, "reasoning": 70},
+     {"prompt_tokens": 40, "completion_tokens": 90, "total_tokens": 130,
+      "input_tokens_uncached": 40, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}),
+]
+
+USAGE_BACKENDS = {"messages": v1_messages, "chat": chat_api, "responses": resp_api}
+
+
+def test_usage_normalization(case: tuple) -> bool:
+    """
+    One backend's parse_usage() plus the two shared consumers in common.py.
+    All three backends normalize to one counts shape; this pins what comes out of it.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    label, backend, raw, expected_cost, expected_client = case[:5]
+    overrides = case[5] if len(case) > 5 else {}
+    print(f"Testing usage normalization for {label}... ", end="")
+
+    cfg = make_config()
+    for key, value in overrides.items():
+        setattr(cfg, key, value)
+    counts = USAGE_BACKENDS[backend].parse_usage(raw)
+
+    passed  = check_equal(expected_cost  , common.usage_to_cost_tokens(counts))
+    passed &= check_equal(expected_client, common.usage_to_openai_dict(counts))
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
 def load_body_cases(name: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     fixture = json5.loads((FIXTURES / name).read_text(encoding="utf-8"))
     return fixture["inputs"], fixture["cases"]
@@ -355,6 +472,9 @@ if __name__ == "__main__":
     tests_passed += test_chat_dump_formats("dump_chat.json5")
 
     tests_passed += test_wire_protocol_derivation()
+
+    for usage_case in USAGE_CASES:
+        tests_passed += test_usage_normalization(usage_case)
 
     body_inputs, body_cases = load_body_cases("provider_bodies.json5")
     for body_case in body_cases:

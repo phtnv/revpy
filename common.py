@@ -791,6 +791,61 @@ def append_prefill_instruction_to_last_user_message(formatted: List[Dict[str, An
     formatted.append({"role": "user", "content": instruction})
 
 
+# Normalized token counts. Every backend's parse_usage() returns this shape, whatever
+# its provider called the fields, and everything downstream reads only this:
+#   prompt      all input tokens, including the cached and newly written ones
+#   completion  output tokens, reasoning included
+#   total       prompt + completion
+#   uncached    input tokens billed at the full input rate
+#   cached      input tokens served from cache (a cache read)
+#   write_1h    input tokens written to a 1h cache; Anthropic only, 0 elsewhere
+#   write_5m    input tokens written to cache at the 5m rate, and the single rate
+#               charged by providers that offer no TTL choice
+#   reasoning   reasoning tokens, or None when the provider does not report a count
+#               (see track_usage: a zero there would be a claim, not a measurement)
+def print_payload(body: Dict[str, Any]) -> None:
+    if not cfg.debug_log:
+        return
+    print()
+    print(f"=== {cfg.backend} payload start ===")
+    print(json.dumps(body, indent=2, ensure_ascii=False, default=str))
+    print(f"=== {cfg.backend} payload end ===")
+
+
+def usage_to_cost_tokens(counts: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Maps normalized counts to the dict track_usage() bills from.
+    """
+    return {
+        "uncached_input" : counts["uncached"],
+        "cache_read"     : counts["cached"],
+        "cache_write_1h" : counts["write_1h"],
+        "cache_write_5m" : counts["write_5m"],
+        "output"         : counts["completion"],
+        # Splits the output line into thinking and visible text; None when unreported.
+        "reasoning"      : counts["reasoning"],
+    }
+
+
+def print_usage(counts: Dict[str, Any]) -> None:
+    track_usage(usage_to_cost_tokens(counts))
+
+
+def usage_to_openai_dict(counts: Dict[str, Any]) -> Dict[str, int]:
+    """
+    Maps normalized counts to the usage object returned to the client, so it sees one
+    consistent shape regardless of which backend served the request.
+    """
+    return {
+        "prompt_tokens"               : counts["prompt"],
+        "completion_tokens"           : counts["completion"],
+        "total_tokens"                : counts["total"],
+        "input_tokens_uncached"       : counts["uncached"],
+        "cache_creation_input_tokens" : counts["write_1h"] + counts["write_5m"],
+        "cache_read_input_tokens"     : counts["cached"],
+    }
+
+
 def track_usage(tokens: Dict[str, Any]) -> None:
     """
     Model-agnostic cost accounting over a normalized token-count dict:

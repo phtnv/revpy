@@ -25,7 +25,6 @@ from common import (
     append_prefill_instruction_to_last_user_message,
     cfg,
     resolve_api_key,
-    track_usage,
 )
 
 
@@ -307,15 +306,6 @@ def request_timeout() -> httpx.Timeout:
     return httpx.Timeout(cfg.openai_request_timeout_seconds, connect=10.0)
 
 
-def print_payload(body: Dict[str, Any]) -> None:
-    if not cfg.debug_log:
-        return
-    print()
-    print(f"=== {cfg.backend} payload start ===")
-    print(json.dumps(body, indent=2, ensure_ascii=False))
-    print(f"=== {cfg.backend} payload end ===")
-
-
 def build_message_list(prepared: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Turns a prepared chat request into the role/content message list both OpenAI
@@ -360,42 +350,6 @@ def reported_reasoning(details: Dict[str, Any]) -> Optional[int]:
     """
     raw = details.get("reasoning_tokens")
     return None if raw is None else max(0, int(raw or 0))
-
-
-def usage_to_cost_tokens(counts: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Maps parsed usage counts to the normalized dict common.track_usage() expects.
-    OpenAI-style caching has one rate and no TTL choice, so writes all land in the
-    5m bucket (apply_model prices both buckets identically).
-    """
-    return {
-        "uncached_input" : counts["uncached"],
-        "cache_read"     : counts["cached"],
-        "cache_write_1h" : 0,
-        "cache_write_5m" : counts["write"],
-        "output"         : counts["completion"],
-        # Splits the output line into thinking and visible text; None when unreported.
-        "reasoning"      : counts["reasoning"],
-    }
-
-
-def print_usage(counts: Dict[str, Any]) -> None:
-    track_usage(usage_to_cost_tokens(counts))
-
-
-def usage_to_openai_dict(counts: Dict[str, Any]) -> Dict[str, int]:
-    """
-    Normalizes parsed usage counts to the same shape the Claude backend emits, so
-    clients see one consistent usage format regardless of backend.
-    """
-    return {
-        "prompt_tokens"               : counts["prompt"],
-        "completion_tokens"           : counts["completion"],
-        "total_tokens"                : counts["total"],
-        "input_tokens_uncached"       : counts["uncached"],
-        "cache_creation_input_tokens" : counts["write"],
-        "cache_read_input_tokens"     : counts["cached"],
-    }
 
 
 def warn_truncated_by_reasoning(finish_reason: str, output_text: str, counts: Dict[str, Any]) -> None:

@@ -19,19 +19,19 @@ from typing            import Any, Dict, Iterator, List, Optional, Tuple
 from common import (
     cfg,
     deep_get,
+    print_payload,
+    print_usage,
     trim_to_end_sentence,
+    usage_to_openai_dict,
 )
 from providers import (
     OFF_EFFORTS,
     build_message_list,
     error_from_response,
     is_openai_model,
-    print_payload,
-    print_usage,
     reported_reasoning,
     request_headers,
     request_timeout,
-    usage_to_openai_dict,
     warn_truncated_by_reasoning,
     wrap_think,
 )
@@ -290,7 +290,10 @@ def parse_usage(usage: Any) -> Dict[str, Any]:
         "completion" : completion_tokens,
         "total"      : max(0, int(usage.get("total_tokens", prompt_tokens + completion_tokens) or 0)),
         "cached"     : cached_tokens,
-        "write"      : write_tokens,
+        # One cache rate and no TTL choice here, so every write is a 5m write
+        # (providers.apply_model prices both buckets identically).
+        "write_1h"   : 0,
+        "write_5m"   : write_tokens,
         "uncached"   : prompt_tokens - cached_tokens - write_tokens,
         "reasoning"  : reported_reasoning(completion_details),
     }

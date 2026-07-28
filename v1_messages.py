@@ -17,9 +17,11 @@ from common import (
     error_body,
     error_message,
     extract_claude_version,
+    print_payload,
+    print_usage,
     resolve_api_key,
-    track_usage,
     trim_to_end_sentence,
+    usage_to_openai_dict,
 )
 
 
@@ -565,10 +567,14 @@ def fallback_cache_write_ttl() -> str:
     return "1h" if "1h" in active_ttl else "5m"
 
 
-def usage_to_cost_tokens(usage: Any) -> Dict[str, int]:
+def parse_usage(usage: Any) -> Dict[str, Any]:
     """
-    Maps an Anthropic usage payload to the normalized token-count dict that
-    common.track_usage() expects.
+    Pulls the token counts the proxy tracks out of an Anthropic usage payload.
+
+    Anthropic reports input_tokens net of caching -- cache reads and cache writes are
+    counted separately rather than included -- so the normalized 'prompt' total has to
+    be summed back up. Anthropic never reports a reasoning count, so 'reasoning' stays
+    None rather than claiming zero for thinking that demonstrably happened.
     """
     cache_creation       = getattr(usage, "cache_creation", {}) or {}
     ephemeral_1h         = int(getattr(cache_creation, "ephemeral_1h_input_tokens", 0) or 0)
@@ -586,62 +592,24 @@ def usage_to_cost_tokens(usage: Any) -> Dict[str, int]:
         if fallback_cache_write_ttl() == "1h" : ephemeral_1h += unknown_cache_write
         else                                  : ephemeral_5m += unknown_cache_write
 
-    return {
-        "uncached_input" : input_tok,
-        "cache_read"     : cache_read,
-        "cache_write_1h" : ephemeral_1h,
-        "cache_write_5m" : ephemeral_5m,
-        "output"         : output_tok,
-    }
-
-
-def print_usage(usage: Any) -> None:
-    track_usage(usage_to_cost_tokens(usage))
-
-
-def usage_to_openai_dict(usage: Any) -> Dict[str, int]:
-    """
-    Anthropic separates cache usage into:
-      input_tokens
-      cache_creation_input_tokens
-      cache_read_input_tokens
-      output_tokens
-
-    OpenAI-compatible clients usually expect:
-      prompt_tokens
-      completion_tokens
-      total_tokens
-
-    This preserves both.
-    """
-    input_tokens   = int(getattr(usage, "input_tokens"               , 0) or 0)
-    output_tokens  = int(getattr(usage, "output_tokens"              , 0) or 0)
-    cache_read     = int(getattr(usage, "cache_read_input_tokens"    , 0) or 0)
-    cache_creation = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
-
-    prompt_tokens = input_tokens + cache_read + cache_creation
+    prompt_tokens = input_tok + cache_read + ephemeral_1h + ephemeral_5m
 
     return {
-        "prompt_tokens"               : prompt_tokens,
-        "completion_tokens"           : output_tokens,
-        "total_tokens"                : prompt_tokens + output_tokens,
-        "input_tokens_uncached"       : input_tokens,
-        "cache_creation_input_tokens" : cache_creation,
-        "cache_read_input_tokens"     : cache_read,
+        "prompt"     : prompt_tokens,
+        "completion" : output_tok,
+        "total"      : prompt_tokens + output_tok,
+        "cached"     : cache_read,
+        "write_1h"   : ephemeral_1h,
+        "write_5m"   : ephemeral_5m,
+        "uncached"   : input_tok,
+        "reasoning"  : None,
     }
 
 
 # Generation
-def print_payload(kwargs: Dict[str, Any]) -> None:
-    if not cfg.debug_log:
-        return
-    print()
-    print("=== Claude payload start ===")
-    print(json.dumps(kwargs, indent=2, ensure_ascii=False))
-    print("=== Claude payload end ===")
 
 
-def build_kwargs(prepared: Dict[str, Any]) -> Dict[str, Any]:
+def build_body(prepared: Dict[str, Any]) -> Dict[str, Any]:
     """
     Builds the Anthropic Messages API request from a prepared chat request
     (see server.prepare_chat_request for the dict shape).
@@ -684,13 +652,14 @@ def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
         id, stop_reason, text, usage, message_extra
     """
     client = get_anthropic_client()
-    kwargs = build_kwargs(prepared)
+    kwargs = build_body(prepared)
 
     print_payload(kwargs)
 
     message = client.messages.create(**kwargs)
 
-    print_usage(getattr(message, "usage", None))
+    counts = parse_usage(getattr(message, "usage", None))
+    print_usage(counts)
 
     output_text = extract_text_from_anthropic_message(message)
     if cfg.auto_trim:
@@ -716,7 +685,7 @@ def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
         "id"            : getattr(message, "id", "claude"),
         "stop_reason"   : getattr(message, "stop_reason", "stop"),
         "text"          : output_text,
-        "usage"         : usage_to_openai_dict(getattr(message, "usage", None)),
+        "usage"         : usage_to_openai_dict(counts),
         "message_extra" : {
             "anthropic_content"            : anthropic_content,
             "anthropic_thinking_preserved" : bool(thinking_preservation_enabled() and thinking_blocks),
@@ -734,7 +703,7 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
     Errors propagate to the caller, which owns SSE error formatting and logging.
     """
     client = get_anthropic_client()
-    kwargs = build_kwargs(prepared)
+    kwargs = build_body(prepared)
 
     print_payload(kwargs)
 
@@ -764,12 +733,13 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
             response_parts.append(thinking_envelope)
             yield ("text", thinking_envelope)
 
-        print_usage(getattr(final_message, "usage", None))
+        counts = parse_usage(getattr(final_message, "usage", None))
+        print_usage(counts)
 
         yield ("final", {
             "id"                 : getattr(final_message, "id", "claude"),
             "stop_reason"        : getattr(final_message, "stop_reason", "stop"),
-            "usage"              : usage_to_openai_dict(getattr(final_message, "usage", None)),
+            "usage"              : usage_to_openai_dict(counts),
             "snapshot_text"      : "".join(response_parts),
             "snapshot_reasoning" : "".join(reasoning_parts),
         })
