@@ -175,7 +175,7 @@ def resolve_thinking() -> None:
     """
     Anthropic thinking resolution: capability checks against the selected model
     record and the Anthropic parameter constraints
-    (open_ai.resolve_thinking() is the OpenAI-style counterpart).
+    (v1_chat_completions and v1_responses have their own counterparts).
     """
     if not cfg.thinking_enabled:
         return
@@ -217,7 +217,7 @@ def resolve_thinking() -> None:
 def print_think_status() -> None:
     """
     CLI 'think' status for the Anthropic backend
-    (open_ai.print_think_status() is the OpenAI-style counterpart).
+    (v1_chat_completions and v1_responses have their own counterparts).
     """
     if cfg.preserve_thinking_blocks == UINT64_MAX : preserve_str = "inf"
     else                                          : preserve_str = str(cfg.preserve_thinking_blocks)

@@ -12,8 +12,9 @@ from typing     import Any, Dict, List, Optional, Tuple
 from waitress   import serve
 
 import claude
-import open_ai
 import providers
+import v1_chat_completions
+import v1_responses
 
 from claude import (
     extract_hidden_thinking_envelopes,
@@ -42,10 +43,14 @@ LATEST_CHAT_LOCK                      = threading.Lock()
 
 def active_backend():
     """
-    The backend module serving requests: claude, or open_ai for any provider
-    configured through OPENAI_PROVIDERS. Both expose the same generate functions.
+    The backend module serving requests, picked by the wire protocol the selected
+    model's provider speaks. All three expose the four entry points dispatched
+    through here: generate_non_stream, generate_stream, resolve_thinking and
+    print_think_status. How each builds its request is its own business.
     """
-    return claude if cfg.backend == "anthropic" else open_ai
+    if cfg.backend == "anthropic":
+        return claude
+    return v1_responses if providers.api_style() == "responses" else v1_chat_completions
 
 
 def model_label() -> str:

@@ -7,6 +7,7 @@ import threading
 from flask             import abort, request
 from packaging.version import Version
 from typing            import Any, Dict, List, Optional
+from urllib.parse      import urlsplit
 
 ENABLE_VALUES  = {"1", "y", "true" , "yes", "enable" , "on" }
 DISABLE_VALUES = {"0", "n", "false", "no" , "disable", "off"}
@@ -18,11 +19,27 @@ UINT64_MAX     = 2**64 - 1
 # their own supported subset by walking it downwards from the requested level.
 THINK_EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
 MAX_TOKENS_PARAMS  = {"auto", "max_tokens", "max_completion_tokens"}
-# Which OpenAI-style endpoint a provider speaks. 'chat' is /chat/completions, which every
-# OpenAI-compatible provider implements. 'responses' is OpenAI's own /responses endpoint,
-# the only one that can return reasoning text (see open_ai.build_responses_body).
-OPENAI_API_STYLES    = {"chat", "responses"}
 REASONING_SUMMARIES  = {"none", "auto", "concise", "detailed"}
+
+# Which wire protocol a provider speaks. This is derived from its endpoint rather than
+# configured, because there is only ever one right answer: OpenAI's own API serves
+# /responses, which covers the full feature set and is the only endpoint that returns
+# reasoning text (see v1_responses). Everyone else implements /chat/completions and not
+# /responses (see v1_chat_completions).
+#
+# api.openai.com is OpenAI's own host. The Azure suffix is its v1 surface, where
+# {base_url}/responses resolves the same way -- inferred from Microsoft's documented
+# layout rather than tested here, so treat it as best-effort.
+OPENAI_HOSTS         = ("api.openai.com",)
+OPENAI_HOST_SUFFIXES = (".openai.azure.com",)
+
+def openai_native_endpoint(base_url: str) -> bool:
+    """
+    Whether base_url is one of OpenAI's own API endpoints, which are served over
+    /responses. Everything else speaks /chat/completions.
+    """
+    host = (urlsplit(base_url).hostname or "").lower()
+    return host in OPENAI_HOSTS or host.endswith(OPENAI_HOST_SUFFIXES)
 
 def getenv_float(name: str, default: float) -> float:
     raw = os.getenv(name, str(default)).strip()
@@ -138,10 +155,11 @@ class RuntimeConfig:
         #   <NAME>_MODELS_REGEX           keeps only matching ids from the fetched /models list
         #                                 (providers like OpenAI also serve tts/image/embedding models)
         #   <NAME>_MAX_TOKENS_PARAM       'auto' (default), 'max_tokens' or 'max_completion_tokens'
-        #   <NAME>_API                    'chat' (default) or 'responses'; the latter is OpenAI-only
-        #                                 and is the only way to see the model's reasoning
-        #   <NAME>_REASONING_SUMMARY      none|auto|concise|detailed for <NAME>_API=responses
-        #   <NAME>_STORE                  let the provider retain the response (default false)
+        #   <NAME>_REASONING_SUMMARY      none|auto|concise|detailed; OpenAI endpoints only
+        #   <NAME>_STORE                  let the provider retain the response (default false);
+        #                                 OpenAI endpoints only
+        # The wire protocol is not configurable: it follows the endpoint, since only
+        # OpenAI serves /responses. See openai_native_endpoint().
         #   <NAME>_EXTRA_BODY             json5 object merged verbatim into every request
         #                                 (the escape hatch for provider thinking/caching dialects)
         #   <NAME>_INPUT_TOKEN_COST_USD, <NAME>_OUTPUT_TOKEN_COST_USD,
@@ -215,10 +233,7 @@ class RuntimeConfig:
                 print(f"WARNING: {prefix}_MAX_TOKENS_PARAM must be in {MAX_TOKENS_PARAMS}. Defaulting to 'auto'.")
                 max_tokens_param = "auto"
 
-            api_style = os.getenv(f"{prefix}_API", "chat").strip().lower()
-            if api_style not in OPENAI_API_STYLES:
-                print(f"WARNING: {prefix}_API must be in {OPENAI_API_STYLES}. Defaulting to 'chat'.")
-                api_style = "chat"
+            api_style = "responses" if openai_native_endpoint(base_url) else "chat"
 
             reasoning_summary = os.getenv(f"{prefix}_REASONING_SUMMARY", "auto").strip().lower()
             if reasoning_summary not in REASONING_SUMMARIES:
@@ -648,20 +663,28 @@ def error_message(body: Optional[Dict[str, Any]], fallback: str) -> str:
     return fallback
 
 
-def print_error(exc: Exception) -> bool:
+def print_error(exc: Exception) -> None:
     """
-    Prints an API error body plus its message in red. Returns False without printing
-    for exceptions that are not API errors at all (a bug in the proxy rather than a
-    refusal from upstream), which have no body to show.
+    Prints an error to the console in red.
+
+    An upstream refusal arrives with a JSON body, which is printed above the message.
+    Anything else is a fault in this proxy rather than an answer from a provider, and
+    says so plainly: the two mean very different things to whoever is reading the
+    terminal. The full traceback for those goes to the error log, not here.
     """
     ANSI_RED   : str = "\033[31m"
     ANSI_RESET : str = "\033[0m"
-    body   = error_body(exc)
-    module = exc.__class__.__module__.split(".", 1)[0]
-    if module != "anthropic" and body is None:
-        return False
 
+    body     = error_body(exc)
     fallback = str(exc) or exc.__class__.__name__
+    # The Anthropic SDK does not always populate a body, so anything it raises counts
+    # as an API error regardless; every other backend carries one (providers.ProviderError).
+    from_api = body is not None or exc.__class__.__module__.split(".", 1)[0] == "anthropic"
+
+    if not from_api:
+        print(f"{ANSI_RED}Proxy error (not an API response): {exc.__class__.__name__}: {fallback}{ANSI_RESET}")
+        print(f"{ANSI_RED}This is a bug in the proxy. See the error log for the traceback.{ANSI_RESET}")
+        return
 
     if body is None:
         body = {
@@ -675,7 +698,6 @@ def print_error(exc: Exception) -> bool:
     message = error_message(body, fallback)
     print(json.dumps(body, indent=2, ensure_ascii=False, default=str))
     print(f"{ANSI_RED}{message}{ANSI_RESET}")
-    return True
 
 
 def content_to_plain_text(content: Any) -> str:

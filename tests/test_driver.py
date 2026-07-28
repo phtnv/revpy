@@ -31,17 +31,16 @@ USAGE      = {
 }
 
 sys.path.insert(0, str(ROOT))
-common : Any = importlib.import_module("common")
-claude : Any = importlib.import_module("claude")
-open_ai: Any = importlib.import_module("open_ai")
-server : Any = importlib.import_module("server")
+common    : Any = importlib.import_module("common")
+claude    : Any = importlib.import_module("claude")
+chat_api  : Any = importlib.import_module("v1_chat_completions")
+resp_api  : Any = importlib.import_module("v1_responses")
+server    : Any = importlib.import_module("server")
 
 # The two OpenAI-style request builders, keyed by the wire protocol they speak.
-# When open_ai.py is split into v1_chat_completions.py and v1_responses.py, this
-# table is the only place the test needs to follow them to.
 BUILDERS = {
-    "chat"      : lambda prepared: open_ai.build_openai_body(prepared),
-    "responses" : lambda prepared: open_ai.build_responses_body(prepared),
+    "chat"      : lambda prepared: chat_api.build_body(prepared),
+    "responses" : lambda prepared: resp_api.build_body(prepared),
 }
 
 # Where each endpoint carries the message list build_message_list() produces.
@@ -264,6 +263,43 @@ def test_chat_dump_formats(name: str) -> bool:
     return passed
 
 
+WIRE_PROTOCOL_CASES = [
+    # (base_url, expected protocol)
+    ("https://api.openai.com/v1"                  , "responses"),
+    ("https://API.OpenAI.com/v1"                  , "responses"),
+    ("https://my-resource.openai.azure.com/openai/v1", "responses"),
+    ("https://api.z.ai/api/paas/v4"               , "chat"),
+    ("https://api.moonshot.ai/v1"                 , "chat"),
+    ("https://api.aionlabs.ai/v1"                 , "chat"),
+    ("https://openrouter.ai/api/v1"               , "chat"),
+    # Must key on the host, not a substring: these are not OpenAI.
+    ("https://api.openai.com.evil.test/v1"        , "chat"),
+    ("https://not-openai.example.com/v1"          , "chat"),
+]
+
+
+def test_wire_protocol_derivation() -> bool:
+    """
+    The wire protocol is derived from the provider endpoint rather than configured,
+    so the derivation is the only thing deciding which backend module serves a
+    provider. Anything but an OpenAI host must land on /chat/completions.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing wire protocol derivation from base_url... ", end="")
+
+    passed = True
+    for base_url, expected in WIRE_PROTOCOL_CASES:
+        received = "responses" if common.openai_native_endpoint(base_url) else "chat"
+        if received != expected:
+            print(f"\n  {base_url}: exp={expected} rec={received}", end="")
+            passed = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
 def load_body_cases(name: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     fixture = json5.loads((FIXTURES / name).read_text(encoding="utf-8"))
     return fixture["inputs"], fixture["cases"]
@@ -317,6 +353,8 @@ if __name__ == "__main__":
     tests_passed += test_basic_non_streaming_roundtrip("basic_no_ooc.json5")
     tests_passed += test_basic_non_streaming_roundtrip("basic_with_ooc.json5")
     tests_passed += test_chat_dump_formats("dump_chat.json5")
+
+    tests_passed += test_wire_protocol_derivation()
 
     body_inputs, body_cases = load_body_cases("provider_bodies.json5")
     for body_case in body_cases:

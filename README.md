@@ -217,11 +217,11 @@ The same `t 0` / `t 1` / `t effort <level>` commands drive the OpenAI-style prov
 
 | Model                                   | On/off                         | Effort                                                                  |
 | --------------------------------------- | ------------------------------ | ----------------------------------------------------------------------- |
-| `gpt-5.6-sol\|terra\|luna`              | yes (effort `none`)            | `none\|low\|medium\|high\|xhigh`, plus `max` on `responses` only        |
+| `gpt-5.6-sol\|terra\|luna`              | yes (effort `none`)            | `none\|low\|medium\|high\|xhigh\|max`                                   |
 | `gpt-5.2` … `gpt-5.5`                   | yes (effort `none`)            | `none\|low\|medium\|high\|xhigh`. `max` maps to `xhigh`.                |
 | `gpt-5.1`                               | yes (effort `none`)            | `none\|low\|medium\|high`. `xhigh`/`max` map to `high`.                 |
 | `gpt-5`                                 | no, `minimal` is the floor     | `minimal\|low\|medium\|high`. `xhigh`/`max` map to `high`.              |
-| `o1`, `o3`, `o4-mini`                   | no, always thinks              | `low\|medium\|high`, plus `xhigh` on `chat` only                        |
+| `o1`, `o3`, `o4-mini`                   | no, always thinks              | `low\|medium\|high`. `xhigh`/`max` map to `high`.                       |
 | `*-chat-latest`                         | does not think at all          | —                                                                       |
 | `gpt-4.1`, `gpt-4o` and older           | does not think at all          | — these reject the parameter outright                                   |
 | `aion-2.0`                              | yes (`reasoning_effort: none`) | `none\|low\|medium\|high`, default medium. `xhigh`/`max` map to `high`. |
@@ -252,15 +252,14 @@ Because reasoning tokens also count against the output limit, a small `max_token
 
 ### Seeing GPT's reasoning
 
-`/chat/completions` never returns the reasoning text — not as a field, not as an option. OpenAI exposes it only on its own `/responses` endpoint, so that is what `GPT_API=responses` selects:
+`/chat/completions` never returns the reasoning text — not as a field, not as an option. OpenAI exposes it only on its own `/responses` endpoint, which is why this proxy always calls OpenAI there. Nothing needs configuring: any provider whose `<NAME>_BASE_URL` is an OpenAI endpoint is served over `/responses`, and every other provider over `/chat/completions`, which is the only endpoint they implement.
+
+The thoughts arrive in a `<think>` block exactly like the other backends, streaming as they are generated. Two optional settings go with it:
 
 ```ini
-GPT_API=responses
 GPT_REASONING_SUMMARY=auto   # none|auto|concise|detailed
 GPT_STORE=false              # /responses otherwise retains your chats for 30 days
 ```
-
-With it on, the thoughts arrive in a `<think>` block exactly like the other backends, streaming as they are generated. It also unlocks the `max` effort level on `gpt-5.6`. `GPT_API=chat` keeps the plain endpoint, where reasoning is invisible no matter what.
 
 Three things to expect:
 

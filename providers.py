@@ -13,6 +13,7 @@ SDK and keeps its own model list.
 
 import httpx
 import json
+import re
 import threading
 
 from concurrent.futures import ThreadPoolExecutor
@@ -43,6 +44,37 @@ def fold_effort(effort: str, ladder: Tuple[str, ...]) -> str:
             return name
     # The request is weaker than anything the model offers; give it the weakest level.
     return ladder[0]
+
+
+# Effort levels that mean "do not reason", weakest first. Not thinking depths, so they
+# are excluded when folding an effort and are used only to answer a disable request.
+# OpenAI spells its floor 'minimal' on gpt-5; Aion and later OpenAI models use 'none'.
+OFF_EFFORTS = ("none", "minimal")
+
+OPENAI_MODEL_RE = re.compile(r"^(?:gpt-|o\d+(?:-|$)|chat-latest$)")
+
+
+def is_openai_model(model_id: str) -> bool:
+    """
+    True for OpenAI's own model ids (gpt-*, o-series, chat-latest). Used for the
+    request-shape rules that hold across the whole OpenAI catalogue rather than
+    just its reasoning models.
+    """
+    return OPENAI_MODEL_RE.match(model_id) is not None
+
+
+def api_style(backend: str = "") -> str:
+    """
+    Which wire protocol the active (or named) provider speaks: 'chat' or 'responses'.
+    This is what picks the backend module (see server.active_backend). It is derived
+    from the provider's endpoint when the config is parsed, not configured -- only
+    OpenAI serves /responses (see common.openai_native_endpoint).
+
+    Falls back to 'chat' for the Anthropic backend and unknown provider names, so
+    callers can ask about any backend without guarding.
+    """
+    provider = cfg.openai_providers.get(backend or cfg.backend) or {}
+    return provider.get("api", "chat")
 
 
 # Aggregated model list across every configured OpenAI-style provider.

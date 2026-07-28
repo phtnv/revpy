@@ -1,9 +1,9 @@
 {
     // Golden request bodies for the OpenAI-style backends.
     //
-    // These pin the exact dict build_openai_body() and build_responses_body() produce,
-    // so the split of open_ai.py into v1_chat_completions.py / v1_responses.py can be
-    // verified as a pure move: every body here must come out byte-identical afterwards.
+    // These pin the exact dict each backend's build_body() produces, so a change to
+    // the request builders has to be deliberate: every body here must come out
+    // byte-identical, or the test says which key moved.
     // No network is involved; only the request builders run.
     //
     // 'inputs' holds prepared chat requests (what server.prepare_chat_request returns)
