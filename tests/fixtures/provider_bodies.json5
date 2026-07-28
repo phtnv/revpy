@@ -1,0 +1,222 @@
+{
+    // Golden request bodies for the OpenAI-style backends.
+    //
+    // These pin the exact dict build_openai_body() and build_responses_body() produce,
+    // so the split of open_ai.py into v1_chat_completions.py / v1_responses.py can be
+    // verified as a pure move: every body here must come out byte-identical afterwards.
+    // No network is involved; only the request builders run.
+    //
+    // 'inputs' holds prepared chat requests (what server.prepare_chat_request returns)
+    // together with the message list build_message_list() must produce from them. The
+    // two endpoints carry that list under different keys -- 'messages' on chat,
+    // 'input' on responses -- so the test injects it under the right one rather than
+    // repeating it in every expected body.
+    //
+    // In a case, 'provider' overrides the defaults in make_provider() and 'cfg'
+    // overrides the test config.
+
+    inputs: {
+        basic: {
+            prepared: {
+                messages: [
+                    { role: "user"     , content: "Hello."    },
+                    { role: "assistant", content: "Hi there." },
+                    { role: "user"     , content: "Continue." },
+                ],
+                system_segments      : ["Core definitions.", "Advanced prompt."],
+                system_summary_text  : "",
+                lorebook_at_end_text : "",
+                max_tokens           : 256,
+            },
+            messages: [
+                { role: "system"   , content: "Core definitions.\n\nAdvanced prompt." },
+                { role: "user"     , content: "Hello."    },
+                { role: "assistant", content: "Hi there." },
+                { role: "user"     , content: "Continue." },
+            ],
+        },
+
+        // Exercises the rest of build_message_list(): blank system segments are dropped,
+        // the summary is appended to the system message, and the moved lorebook becomes
+        // a trailing system message. All three are stripped.
+        full: {
+            prepared: {
+                messages: [
+                    { role: "user"     , content: "Hello."    },
+                    { role: "assistant", content: "Hi there." },
+                ],
+                system_segments      : ["Core definitions.", "   ", "Advanced prompt."],
+                system_summary_text  : "  Previously: they met.  ",
+                lorebook_at_end_text : "  <lorebook>Entry.</lorebook>  ",
+                max_tokens           : 512,
+            },
+            messages: [
+                { role: "system"   , content: "Core definitions.\n\nAdvanced prompt.\n\nPreviously: they met." },
+                { role: "user"     , content: "Hello."    },
+                { role: "assistant", content: "Hi there." },
+                { role: "system"   , content: "<lorebook>Entry.</lorebook>" },
+            ],
+        },
+    },
+
+    cases: [
+        {
+            name    : "glm-5.2 chat: thinking dialect + sampling",
+            builder : "chat",
+            backend : "glm",
+            model   : "glm-5.2",
+            input   : "basic",
+            cfg     : {
+                thinking_enabled : true,
+                thinking_effort  : "high",
+                send_temperature : true,
+                temperature      : 0.7,
+                send_top_p       : true,
+                top_p            : 0.9,
+            },
+            expected: {
+                model            : "glm-5.2",
+                max_tokens       : 256,
+                temperature      : 0.7,
+                top_p            : 0.9,
+                thinking         : { type: "enabled" },
+                reasoning_effort : "high",
+            },
+        },
+
+        {
+            // EXTRA_BODY is merged after the dialect, so it overrides it. kimi-k3 would
+            // send reasoning_effort 'max' for the xhigh setting; the override wins.
+            name    : "kimi-k3 chat: EXTRA_BODY overrides the dialect",
+            builder : "chat",
+            backend : "kimi",
+            model   : "kimi-k3",
+            input   : "full",
+            provider: {
+                extra_body: { reasoning_effort: "low", custom_field: 1 },
+            },
+            cfg     : {
+                thinking_enabled : true,
+                thinking_effort  : "xhigh",
+            },
+            expected: {
+                model            : "kimi-k3",
+                max_tokens       : 512,
+                reasoning_effort : "low",
+                custom_field     : 1,
+            },
+        },
+
+        {
+            // aion-2.0 is the only Aion model taking reasoning_effort, and 'none' is
+            // how its dialect spells thinking off.
+            name    : "aion-2.0 chat: thinking disabled",
+            builder : "chat",
+            backend : "aion",
+            model   : "aion-2.0",
+            input   : "basic",
+            cfg     : {
+                thinking_enabled : false,
+                thinking_effort  : "high",
+            },
+            expected: {
+                model            : "aion-2.0",
+                max_tokens       : 256,
+                reasoning_effort : "none",
+            },
+        },
+
+        {
+            // Recognized by the dialect but offering no thinking controls: the empty
+            // dialect must add nothing at all, rather than sending a default effort.
+            name    : "aion-3.0 chat: recognized, no thinking params",
+            builder : "chat",
+            backend : "aion",
+            model   : "aion-3.0",
+            input   : "basic",
+            cfg     : {
+                thinking_enabled : true,
+                thinking_effort  : "high",
+            },
+            expected: {
+                model      : "aion-3.0",
+                max_tokens : 256,
+            },
+        },
+
+        {
+            // Reasoning models refuse temperature/top_p, so sampling must be dropped
+            // even though both are enabled here.
+            name    : "gpt-5.6 responses: max effort, summary, sampling refused",
+            builder : "responses",
+            backend : "gpt",
+            model   : "gpt-5.6",
+            input   : "basic",
+            provider: {
+                api: "responses",
+            },
+            cfg     : {
+                thinking_enabled : true,
+                thinking_effort  : "max",
+                send_temperature : true,
+                temperature      : 0.7,
+                send_top_p       : true,
+                top_p            : 0.9,
+            },
+            expected: {
+                model             : "gpt-5.6",
+                max_output_tokens : 256,
+                store             : false,
+                reasoning         : { effort: "max", summary: "auto" },
+            },
+        },
+
+        {
+            // gpt-5.1 tops out at 'high' and takes 'none' as its off switch. No summary
+            // is asked for while thinking is off.
+            name    : "gpt-5.1 responses: thinking off, store on",
+            builder : "responses",
+            backend : "gpt",
+            model   : "gpt-5.1",
+            input   : "basic",
+            provider: {
+                api   : "responses",
+                store : true,
+            },
+            cfg     : {
+                thinking_enabled : false,
+                thinking_effort  : "high",
+            },
+            expected: {
+                model             : "gpt-5.1",
+                max_output_tokens : 256,
+                store             : true,
+                reasoning         : { effort: "none" },
+            },
+        },
+
+        {
+            // The o-series ladder on /responses stops at 'high', so xhigh folds down to
+            // it. REASONING_SUMMARY=none drops the summary while thinking stays on.
+            name    : "o3 responses: xhigh folds to high, summary off",
+            builder : "responses",
+            backend : "gpt",
+            model   : "o3",
+            input   : "basic",
+            provider: {
+                api               : "responses",
+                reasoning_summary : "none",
+            },
+            cfg     : {
+                thinking_enabled : true,
+                thinking_effort  : "xhigh",
+            },
+            expected: {
+                model             : "o3",
+                max_output_tokens : 256,
+                store             : false,
+                reasoning         : { effort: "high" },
+            },
+        },
+    ],
+}

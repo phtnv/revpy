@@ -31,9 +31,21 @@ USAGE      = {
 }
 
 sys.path.insert(0, str(ROOT))
-common: Any = importlib.import_module("common")
-claude: Any = importlib.import_module("claude")
-server: Any = importlib.import_module("server")
+common : Any = importlib.import_module("common")
+claude : Any = importlib.import_module("claude")
+open_ai: Any = importlib.import_module("open_ai")
+server : Any = importlib.import_module("server")
+
+# The two OpenAI-style request builders, keyed by the wire protocol they speak.
+# When open_ai.py is split into v1_chat_completions.py and v1_responses.py, this
+# table is the only place the test needs to follow them to.
+BUILDERS = {
+    "chat"      : lambda prepared: open_ai.build_openai_body(prepared),
+    "responses" : lambda prepared: open_ai.build_responses_body(prepared),
+}
+
+# Where each endpoint carries the message list build_message_list() produces.
+BUILDER_MESSAGE_KEY = {"chat": "messages", "responses": "input"}
 
 
 class FakeMessages:
@@ -80,6 +92,33 @@ def make_config() -> Any:
     cfg.preserve_thinking_blocks = 0
     cfg.error_log_path           = str(ROOT / "test_error_log.txt")
     return cfg
+
+
+def make_provider(**overrides: Any) -> dict[str, Any]:
+    """
+    A synthetic OPENAI_PROVIDERS entry, in the shape RuntimeConfig builds them.
+    Defaults are the ones a provider gets with only BASE_URL and API_KEY set, so a
+    case only has to name what it actually exercises.
+    """
+    provider = {
+        "base_url"          : "https://provider.test/v1",
+        "api_key"           : "test-key",
+        "api_key_name"      : "TEST_API_KEY",
+        "models"            : [],
+        "models_regex"      : None,
+        "max_tokens_param"  : "auto",
+        "api"               : "chat",
+        "reasoning_summary" : "auto",
+        "store"             : False,
+        "extra_body"        : {},
+        "cost_families"     : [],
+        "input_cost"        : 0.0,
+        "output_cost"       : 0.0,
+        "cache_read_cost"   : 0.0,
+        "cache_write_cost"  : 0.0,
+    }
+    provider.update(overrides)
+    return provider
 
 
 def reference_from_fixture(name) -> dict[str, Any]:
@@ -225,6 +264,52 @@ def test_chat_dump_formats(name: str) -> bool:
     return passed
 
 
+def load_body_cases(name: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    fixture = json5.loads((FIXTURES / name).read_text(encoding="utf-8"))
+    return fixture["inputs"], fixture["cases"]
+
+
+def test_provider_request_body(inputs: dict[str, Any], case: dict[str, Any]) -> bool:
+    """
+    Builds one OpenAI-style request body and compares it to the golden dict.
+
+    Each case re-runs make_config() so it is isolated from the last one: cfg is a
+    shared singleton and these cases leave a provider backend selected on it.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    print(f"Testing request body for {case['name']}... ", end="")
+
+    entry = inputs[case["input"]]
+
+    # Config warnings from .env, and the sampling-refused warning, are not under test.
+    with contextlib.redirect_stdout(io.StringIO()):
+        cfg = make_config()
+        cfg.backend          = case["backend"]
+        cfg.model            = case["model"]
+        cfg.openai_providers = {case["backend"]: make_provider(**case.get("provider", {}))}
+        cfg.thinking_enabled = False
+        cfg.thinking_effort  = "medium"
+        for key, value in case.get("cfg", {}).items():
+            setattr(cfg, key, value)
+
+        received = BUILDERS[case["builder"]](entry["prepared"])
+
+    expected = {**case["expected"], BUILDER_MESSAGE_KEY[case["builder"]]: entry["messages"]}
+
+    passed = check_equal(expected, received)
+    # check_equal only walks the keys it was given, so a field the builder should not
+    # have sent at all would slip past it. For a golden body that is a failure too.
+    for key in received:
+        if key not in expected:
+            print(f"unexpected key={key} rec={received[key]!r}")
+            passed = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
 if __name__ == "__main__":
     make_config()
 
@@ -232,6 +317,10 @@ if __name__ == "__main__":
     tests_passed += test_basic_non_streaming_roundtrip("basic_no_ooc.json5")
     tests_passed += test_basic_non_streaming_roundtrip("basic_with_ooc.json5")
     tests_passed += test_chat_dump_formats("dump_chat.json5")
+
+    body_inputs, body_cases = load_body_cases("provider_bodies.json5")
+    for body_case in body_cases:
+        tests_passed += test_provider_request_body(body_inputs, body_case)
 
     tests_failed : int = tests_ttl - tests_passed
 
