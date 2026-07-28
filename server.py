@@ -13,6 +13,7 @@ from waitress   import serve
 
 import claude
 import open_ai
+import providers
 
 from claude import (
     anthropic_error_body,
@@ -60,14 +61,14 @@ def refresh_model_lists() -> None:
 
     List order is unaffected by response order: each backend fills its own list
     (Anthropic's is always numbered first in the CLI), and the provider list
-    keeps the OPENAI_PROVIDERS declaration order (see open_ai.refresh_openai_models).
+    keeps the OPENAI_PROVIDERS declaration order (see providers.refresh_models).
     """
     anthropic_thread = threading.Thread(
         target = refresh_anthropic_models,
         args   = (cfg.anthropic_api_key, cfg.model_list_timeout_seconds),
     )
     anthropic_thread.start()
-    open_ai.refresh_openai_models(cfg.model_list_timeout_seconds)
+    providers.refresh_models(cfg.model_list_timeout_seconds)
     anthropic_thread.join()
 
 
@@ -94,29 +95,46 @@ def reload_runtime_env() -> None:
     print("HOST and PORT were not changed; restart the process to change bind address.")
 
 
+def finish_model_switch(switched: bool) -> None:
+    """
+    Resolves the shared thinking settings against the model that was just selected.
+
+    Neither backend does this inside its own apply_model(): the provider registry
+    serves the OpenAI-style wire modules and cannot import one to ask without a
+    cycle, so the caller owns it and both backends stay symmetric. Nothing is
+    resolved when no switch happened, which would report against a stale model.
+    """
+    if switched:
+        active_backend().resolve_thinking()
+
+
 def cli_print_model_list() -> None:
     print_model_list()
-    open_ai.print_model_list(number_offset=len(claude.ANTHROPIC_MODELS))
+    providers.print_model_list(number_offset=len(claude.ANTHROPIC_MODELS))
 
 
 def cli_select_model(number: int) -> None:
     anthropic_count = len(claude.ANTHROPIC_MODELS)
-    if number <= anthropic_count : select_model_by_number(number)
-    else                         : open_ai.select_model_by_number(number - anthropic_count)
+    if number <= anthropic_count : switched = select_model_by_number(number)
+    else                         : switched = providers.select_model_by_number(number - anthropic_count)
+    finish_model_switch(switched)
 
 
 def cli_print_model_info(number: int) -> None:
     anthropic_count = len(claude.ANTHROPIC_MODELS)
     if number <= anthropic_count : print_model_info(number)
-    else                         : open_ai.print_model_info(number - anthropic_count)
+    else                         : providers.print_model_info(number - anthropic_count)
 
 
 def cli_refresh_models() -> None:
     refresh_model_lists()
     if cfg.backend == "anthropic":
-        claude.find_cfg(claude.ANTHROPIC_MODELS)
-    elif not open_ai.apply_model_by_id(f"{cfg.backend}/{cfg.model}"):
-        print(f"Model {cfg.backend}/{cfg.model} is no longer in the refreshed provider list.")
+        switched = bool(claude.find_cfg(claude.ANTHROPIC_MODELS))
+    else:
+        switched = providers.apply_model_by_id(f"{cfg.backend}/{cfg.model}")
+        if not switched:
+            print(f"Model {cfg.backend}/{cfg.model} is no longer in the refreshed provider list.")
+    finish_model_switch(switched)
 
 
 
@@ -1213,8 +1231,9 @@ if __name__ == "__main__":
     cfg.reload_from_env()
     refresh_model_lists()
     # MODEL may name either an Anthropic model or a provider model ("glm-4.7" or "glm/glm-4.7").
-    if not open_ai.apply_model_by_id(cfg.model):
-        claude.find_cfg(claude.ANTHROPIC_MODELS)
+    finish_model_switch(
+        providers.apply_model_by_id(cfg.model) or bool(claude.find_cfg(claude.ANTHROPIC_MODELS))
+    )
 
     print("Starting Claude proxy")
     print(f"Local URL: http://{cfg.host}:{cfg.port}")

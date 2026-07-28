@@ -190,20 +190,25 @@ def print_model_list() -> None:
         print(f"{number_cell}  {model_id:<42}{suffix}")
 
 
-def select_model_by_number(index: int) -> None:
+def select_model_by_number(index: int) -> bool:
+    """
+    Selects an Anthropic model by its number in the CLI list. Returns False when
+    nothing was selected, so the caller knows not to re-resolve thinking.
+    """
     with MODEL_LOCK:
         if not ANTHROPIC_MODELS:
             print_no_model_list_available()
-            return
+            return False
         if index < 1 or index > len(ANTHROPIC_MODELS):
             print(f"Model number out of range [1:{len(ANTHROPIC_MODELS)}].")
-            return
+            return False
         model_info = ANTHROPIC_MODELS[index - 1]
         model_id   = model_id_from_info(model_info)
         if not model_id:
             print(f"Model {index} does not have an id and cannot be selected.")
-            return
+            return False
         apply_model(model_info)
+        return True
 
 
 def print_model_info(index: int) -> None:
@@ -283,6 +288,12 @@ def print_think_status() -> None:
 
 
 def apply_model(model_info: Dict[str, Any]) -> None:
+    """
+    Points cfg at an Anthropic model and its costs.
+
+    Thinking is deliberately not resolved here; the caller does it once the switch
+    is done, the same way the provider registry works (see providers.apply_model).
+    """
     cfg.backend = "anthropic"
     cfg.info  = model_info
     cfg.model = deep_get(cfg.info, "id")
@@ -297,7 +308,6 @@ def apply_model(model_info: Dict[str, Any]) -> None:
     # Do not call set_prefill() here: that would overwrite ASSISTANT_PREFILL
     # with the mode string (for example "none", "assistant", or "instruction").
     cfg.set_prefill_mode(cfg.assistant_prefill_mode)
-    resolve_thinking()
     print(f"=== Switching to {cfg.model} complete ===")
 
 
