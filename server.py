@@ -11,19 +11,11 @@ from flask_cors import CORS
 from typing     import Any, Dict, List, Optional, Tuple
 from waitress   import serve
 
-import claude
-import open_ai
+import v1_messages
+import providers
+import v1_chat_completions
+import v1_responses
 
-from claude import (
-    anthropic_error_body,
-    extract_hidden_thinking_envelopes,
-    print_anthropic_error,
-    print_model_info,
-    print_model_list,
-    refresh_anthropic_models,
-    select_model_by_number,
-    thinking_preservation_enabled,
-)
 from common import (
     DISABLE_VALUES,
     ENABLE_VALUES,
@@ -32,6 +24,8 @@ from common import (
     UINT64_MAX,
     cfg,
     content_to_plain_text,
+    error_body,
+    print_error,
     session_cost_snapshot,
 )
 
@@ -41,10 +35,14 @@ LATEST_CHAT_LOCK                      = threading.Lock()
 
 def active_backend():
     """
-    The backend module serving requests: claude, or open_ai for any provider
-    configured through OPENAI_PROVIDERS. Both expose the same generate functions.
+    The backend module serving requests, picked by the wire protocol the selected
+    model's provider speaks. All three expose the four entry points dispatched
+    through here: generate_non_stream, generate_stream, resolve_thinking and
+    print_think_status. How each builds its request is its own business.
     """
-    return claude if cfg.backend == "anthropic" else open_ai
+    if cfg.backend == "anthropic":
+        return v1_messages
+    return v1_responses if providers.api_style() == "responses" else v1_chat_completions
 
 
 def model_label() -> str:
@@ -60,14 +58,14 @@ def refresh_model_lists() -> None:
 
     List order is unaffected by response order: each backend fills its own list
     (Anthropic's is always numbered first in the CLI), and the provider list
-    keeps the OPENAI_PROVIDERS declaration order (see open_ai.refresh_openai_models).
+    keeps the OPENAI_PROVIDERS declaration order (see providers.refresh_models).
     """
     anthropic_thread = threading.Thread(
-        target = refresh_anthropic_models,
+        target = v1_messages.refresh_models,
         args   = (cfg.anthropic_api_key, cfg.model_list_timeout_seconds),
     )
     anthropic_thread.start()
-    open_ai.refresh_openai_models(cfg.model_list_timeout_seconds)
+    providers.refresh_models(cfg.model_list_timeout_seconds)
     anthropic_thread.join()
 
 
@@ -94,29 +92,46 @@ def reload_runtime_env() -> None:
     print("HOST and PORT were not changed; restart the process to change bind address.")
 
 
+def finish_model_switch(switched: bool) -> None:
+    """
+    Resolves the shared thinking settings against the model that was just selected.
+
+    Neither backend does this inside its own apply_model(): the provider registry
+    serves the OpenAI-style wire modules and cannot import one to ask without a
+    cycle, so the caller owns it and both backends stay symmetric. Nothing is
+    resolved when no switch happened, which would report against a stale model.
+    """
+    if switched:
+        active_backend().resolve_thinking()
+
+
 def cli_print_model_list() -> None:
-    print_model_list()
-    open_ai.print_model_list(number_offset=len(claude.ANTHROPIC_MODELS))
+    v1_messages.print_model_list()
+    providers.print_model_list(number_offset=len(v1_messages.MODELS))
 
 
 def cli_select_model(number: int) -> None:
-    anthropic_count = len(claude.ANTHROPIC_MODELS)
-    if number <= anthropic_count : select_model_by_number(number)
-    else                         : open_ai.select_model_by_number(number - anthropic_count)
+    anthropic_count = len(v1_messages.MODELS)
+    if number <= anthropic_count : switched = v1_messages.select_model_by_number(number)
+    else                         : switched = providers.select_model_by_number(number - anthropic_count)
+    finish_model_switch(switched)
 
 
 def cli_print_model_info(number: int) -> None:
-    anthropic_count = len(claude.ANTHROPIC_MODELS)
-    if number <= anthropic_count : print_model_info(number)
-    else                         : open_ai.print_model_info(number - anthropic_count)
+    anthropic_count = len(v1_messages.MODELS)
+    if number <= anthropic_count : v1_messages.print_model_info(number)
+    else                         : providers.print_model_info(number - anthropic_count)
 
 
 def cli_refresh_models() -> None:
     refresh_model_lists()
     if cfg.backend == "anthropic":
-        claude.find_cfg(claude.ANTHROPIC_MODELS)
-    elif not open_ai.apply_model_by_id(f"{cfg.backend}/{cfg.model}"):
-        print(f"Model {cfg.backend}/{cfg.model} is no longer in the refreshed provider list.")
+        switched = bool(v1_messages.find_cfg(v1_messages.MODELS))
+    else:
+        switched = providers.apply_model_by_id(f"{cfg.backend}/{cfg.model}")
+        if not switched:
+            print(f"Model {cfg.backend}/{cfg.model} is no longer in the refreshed provider list.")
+    finish_model_switch(switched)
 
 
 
@@ -822,16 +837,16 @@ def split_system_and_messages(raw_messages: Any) -> Tuple[str, List[Dict[str, An
             role = "user"
 
         # Strip every preservation envelope, but keep assistant envelopes only when preservation is enabled.
-        content, thinking_blocks = extract_hidden_thinking_envelopes(content)
+        content, thinking_blocks = v1_messages.extract_hidden_thinking_envelopes(content)
 
         msg_obj: Dict[str, Any] = {"role": role, "content": content}
-        if role == "assistant" and thinking_preservation_enabled() and thinking_blocks:
+        if role == "assistant" and v1_messages.thinking_preservation_enabled() and thinking_blocks:
             msg_obj["anthropic_thinking_blocks"] = thinking_blocks
         chat_messages.append(msg_obj)
 
     chat_messages, system_summary_text = apply_summary_blocks(chat_messages)
 
-    if thinking_preservation_enabled():
+    if v1_messages.thinking_preservation_enabled():
         # Mark only the last N assistant messages for signed-block rehydration.
         remaining = cfg.preserve_thinking_blocks
         for i in range(len(chat_messages) - 1, -1, -1):
@@ -1035,25 +1050,25 @@ def build_error_body(exc: Exception) -> Tuple[int, Dict[str, Any]]:
     if hasattr(exc, "status_code"):
         status_code = getattr(exc, "status_code", status_code)
 
-    body = anthropic_error_body(exc)
-    if isinstance(body, dict):
-        error_obj = body.get("error", {})
+    upstream_body = error_body(exc)
+    if isinstance(upstream_body, dict):
+        error_obj = upstream_body.get("error", {})
         if isinstance(error_obj, dict):
             message    = error_obj.get("message", message)
             error_type = error_obj.get("type", error_type)
 
-    error_body = { "error": { "message": message, "type": error_type, "code": status_code } }
-    return status_code, error_body
+    client_body = { "error": { "message": message, "type": error_type, "code": status_code } }
+    return status_code, client_body
 
 
 def make_error_response(exc: Exception, payload: Optional[Dict[str, Any]] = None) -> Response:
-    status_code, error_body = build_error_body(exc)
-    print_anthropic_error(exc)
+    status_code, client_body = build_error_body(exc)
+    print_error(exc)
 
-    log_body   = { "error": error_body, "request": payload, "traceback": traceback.format_exc() }
+    log_body   = { "error": client_body, "request": payload, "traceback": traceback.format_exc() }
     write_error_log(log_body)
 
-    return Response(json.dumps(error_body, ensure_ascii=False), status=status_code, content_type="application/json")
+    return Response(json.dumps(client_body, ensure_ascii=False), status=status_code, content_type="application/json")
 
 
 # Generation
@@ -1094,11 +1109,11 @@ def generate_stream(payload: Dict[str, Any]):
                 )
 
     except Exception as exc:
-        _, error_body = build_error_body(exc)
-        print_anthropic_error(exc)
-        log_body = { "error": error_body, "request": payload, "traceback": traceback.format_exc() }
+        _, client_body = build_error_body(exc)
+        print_error(exc)
+        log_body = { "error": client_body, "request": payload, "traceback": traceback.format_exc() }
         write_error_log(log_body)
-        yield "data: " + json.dumps(error_body, ensure_ascii=False) + "\n\n"
+        yield "data: " + json.dumps(client_body, ensure_ascii=False) + "\n\n"
         yield "data: [DONE]\n\n"
         return
 
@@ -1213,8 +1228,9 @@ if __name__ == "__main__":
     cfg.reload_from_env()
     refresh_model_lists()
     # MODEL may name either an Anthropic model or a provider model ("glm-4.7" or "glm/glm-4.7").
-    if not open_ai.apply_model_by_id(cfg.model):
-        claude.find_cfg(claude.ANTHROPIC_MODELS)
+    finish_model_switch(
+        providers.apply_model_by_id(cfg.model) or bool(v1_messages.find_cfg(v1_messages.MODELS))
+    )
 
     print("Starting Claude proxy")
     print(f"Local URL: http://{cfg.host}:{cfg.port}")

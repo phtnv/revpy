@@ -31,9 +31,20 @@ USAGE      = {
 }
 
 sys.path.insert(0, str(ROOT))
-common: Any = importlib.import_module("common")
-claude: Any = importlib.import_module("claude")
-server: Any = importlib.import_module("server")
+common      : Any = importlib.import_module("common")
+v1_messages : Any = importlib.import_module("v1_messages")
+chat_api    : Any = importlib.import_module("v1_chat_completions")
+resp_api    : Any = importlib.import_module("v1_responses")
+server      : Any = importlib.import_module("server")
+
+# The two OpenAI-style request builders, keyed by the wire protocol they speak.
+BUILDERS = {
+    "chat"      : lambda prepared: chat_api.build_body(prepared),
+    "responses" : lambda prepared: resp_api.build_body(prepared),
+}
+
+# Where each endpoint carries the message list build_message_list() produces.
+BUILDER_MESSAGE_KEY = {"chat": "messages", "responses": "input"}
 
 
 class FakeMessages:
@@ -80,6 +91,33 @@ def make_config() -> Any:
     cfg.preserve_thinking_blocks = 0
     cfg.error_log_path           = str(ROOT / "test_error_log.txt")
     return cfg
+
+
+def make_provider(**overrides: Any) -> dict[str, Any]:
+    """
+    A synthetic OPENAI_PROVIDERS entry, in the shape RuntimeConfig builds them.
+    Defaults are the ones a provider gets with only BASE_URL and API_KEY set, so a
+    case only has to name what it actually exercises.
+    """
+    provider = {
+        "base_url"          : "https://provider.test/v1",
+        "api_key"           : "test-key",
+        "api_key_name"      : "TEST_API_KEY",
+        "models"            : [],
+        "models_regex"      : None,
+        "max_tokens_param"  : "auto",
+        "api"               : "chat",
+        "reasoning_summary" : "auto",
+        "store"             : False,
+        "extra_body"        : {},
+        "cost_families"     : [],
+        "input_cost"        : 0.0,
+        "output_cost"       : 0.0,
+        "cache_read_cost"   : 0.0,
+        "cache_write_cost"  : 0.0,
+    }
+    provider.update(overrides)
+    return provider
 
 
 def reference_from_fixture(name) -> dict[str, Any]:
@@ -173,9 +211,9 @@ def test_basic_non_streaming_roundtrip(name: str) -> bool:
     ref_msg = reference_from_fixture(name)
     rx_msg  = FakeAnthropic(ref_msg["reply"])
 
-    claude.get_anthropic_client = lambda: rx_msg
-    server.time.time            = lambda: CREATED
-    claude.print_usage          = lambda usage: None
+    v1_messages.get_anthropic_client = lambda: rx_msg
+    v1_messages.print_usage          = lambda counts: None
+    server.time.time                 = lambda: CREATED
     response = server.app.test_client().post("/v1/chat/completions", json=ref_msg["request"])
 
     rx_msg = received_from(response, rx_msg)
@@ -194,9 +232,9 @@ def test_chat_dump_formats(name: str) -> bool:
     ref_msg = reference_from_fixture(name)
     fake    = FakeAnthropic(ref_msg["reply"])
 
-    claude.get_anthropic_client = lambda: fake
-    server.time.time            = lambda: CREATED
-    claude.print_usage          = lambda usage: None
+    v1_messages.get_anthropic_client = lambda: fake
+    v1_messages.print_usage          = lambda counts: None
+    server.time.time                 = lambda: CREATED
     server.app.test_client().post("/v1/chat/completions", json=ref_msg["request"])
 
     expected_snapshot = fixture["expected_snapshot"]
@@ -225,6 +263,289 @@ def test_chat_dump_formats(name: str) -> bool:
     return passed
 
 
+WIRE_PROTOCOL_CASES = [
+    # (base_url, expected protocol)
+    ("https://api.openai.com/v1"                  , "responses"),
+    ("https://API.OpenAI.com/v1"                  , "responses"),
+    ("https://my-resource.openai.azure.com/openai/v1", "responses"),
+    ("https://api.z.ai/api/paas/v4"               , "chat"),
+    ("https://api.moonshot.ai/v1"                 , "chat"),
+    ("https://api.aionlabs.ai/v1"                 , "chat"),
+    ("https://openrouter.ai/api/v1"               , "chat"),
+    # Must key on the host, not a substring: these are not OpenAI.
+    ("https://api.openai.com.evil.test/v1"        , "chat"),
+    ("https://not-openai.example.com/v1"          , "chat"),
+]
+
+
+def test_wire_protocol_derivation() -> bool:
+    """
+    The wire protocol is derived from the provider endpoint rather than configured,
+    so the derivation is the only thing deciding which backend module serves a
+    provider. Anything but an OpenAI host must land on /chat/completions.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing wire protocol derivation from base_url... ", end="")
+
+    passed = True
+    for base_url, expected in WIRE_PROTOCOL_CASES:
+        received = "responses" if common.openai_native_endpoint(base_url) else "chat"
+        if received != expected:
+            print(f"\n  {base_url}: exp={expected} rec={received}", end="")
+            passed = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def anthropic_usage(inp=0, out=0, read=0, creation=0, e1h=None, e5m=None) -> Any:
+    """An Anthropic SDK usage object, in the attribute shape parse_usage() reads."""
+    cache_creation = SimpleNamespace()
+    if e1h is not None: cache_creation.ephemeral_1h_input_tokens = e1h
+    if e5m is not None: cache_creation.ephemeral_5m_input_tokens = e5m
+    return SimpleNamespace(
+        input_tokens                = inp,
+        output_tokens               = out,
+        cache_read_input_tokens     = read,
+        cache_creation_input_tokens = creation,
+        cache_creation              = cache_creation,
+    )
+
+
+# Every backend's parse_usage() feeds the same two consumers, so both are pinned here:
+# what the cost tracker bills from, and what the client is told. These are the numbers
+# the per-request cost report is computed from, so they are asserted exactly.
+#   (label, backend, raw usage, expected cost, expected client[, cfg overrides])
+USAGE_CASES: list[tuple] = [
+    ("messages: cache read", "messages",
+     anthropic_usage(inp=10, out=50, read=90),
+     {"uncached_input": 10, "cache_read": 90, "cache_write_1h": 0, "cache_write_5m": 0, "output": 50, "reasoning": None},
+     {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150,
+      "input_tokens_uncached": 10, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 90}),
+
+    # Anthropic is the only backend that splits cache writes by TTL.
+    ("messages: 1h/5m write split", "messages",
+     anthropic_usage(inp=10, out=50, creation=100, e1h=60, e5m=40),
+     {"uncached_input": 10, "cache_read": 0, "cache_write_1h": 60, "cache_write_5m": 40, "output": 50, "reasoning": None},
+     {"prompt_tokens": 110, "completion_tokens": 50, "total_tokens": 160,
+      "input_tokens_uncached": 10, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 0}),
+
+    # A legacy payload reports only a total cache write, with no 5m/1h split to read.
+    # fallback_cache_write_ttl() then guesses from the configured markers, so the same
+    # payload is billed differently depending on them. Both directions are pinned.
+    ("messages: legacy write, 1h marker active", "messages",
+     anthropic_usage(inp=10, out=50, creation=100),
+     {"uncached_input": 10, "cache_read": 0, "cache_write_1h": 100, "cache_write_5m": 0, "output": 50, "reasoning": None},
+     {"prompt_tokens": 110, "completion_tokens": 50, "total_tokens": 160,
+      "input_tokens_uncached": 10, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 0},
+     {"cache_en": True, "cache_system": True, "cache_system_ttl": "1h",
+      "cache_manual_msg": 0, "cache_auto_msg": 0}),
+
+    # Caching off: nothing was written on purpose, so the cheaper bucket is assumed.
+    ("messages: legacy write, caching off", "messages",
+     anthropic_usage(inp=10, out=50, creation=100),
+     {"uncached_input": 10, "cache_read": 0, "cache_write_1h": 0, "cache_write_5m": 100, "output": 50, "reasoning": None},
+     {"prompt_tokens": 110, "completion_tokens": 50, "total_tokens": 160,
+      "input_tokens_uncached": 10, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 0},
+     {"cache_en": False}),
+
+    ("chat: cached + write", "chat",
+     {"prompt_tokens": 100, "completion_tokens": 50,
+      "prompt_tokens_details": {"cached_tokens": 50, "cache_write_tokens": 30}},
+     {"uncached_input": 20, "cache_read": 50, "cache_write_1h": 0, "cache_write_5m": 30, "output": 50, "reasoning": None},
+     {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150,
+      "input_tokens_uncached": 20, "cache_creation_input_tokens": 30, "cache_read_input_tokens": 50}),
+
+    # A payload claiming more cached/written tokens than there were input tokens must
+    # not drive uncached input negative.
+    ("chat: overclaimed cache clamps", "chat",
+     {"prompt_tokens": 10, "completion_tokens": 5,
+      "prompt_tokens_details": {"cached_tokens": 999, "cache_write_tokens": 999}},
+     {"uncached_input": 0, "cache_read": 10, "cache_write_1h": 0, "cache_write_5m": 0, "output": 5, "reasoning": None},
+     {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
+      "input_tokens_uncached": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 10}),
+
+    # A reported zero is a measurement and must survive as 0, not become None.
+    ("chat: reported zero reasoning", "chat",
+     {"prompt_tokens": 40, "completion_tokens": 90,
+      "completion_tokens_details": {"reasoning_tokens": 0}},
+     {"uncached_input": 40, "cache_read": 0, "cache_write_1h": 0, "cache_write_5m": 0, "output": 90, "reasoning": 0},
+     {"prompt_tokens": 40, "completion_tokens": 90, "total_tokens": 130,
+      "input_tokens_uncached": 40, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}),
+
+    ("responses: cached + write", "responses",
+     {"input_tokens": 100, "output_tokens": 50,
+      "input_tokens_details": {"cached_tokens": 50, "cache_write_tokens": 30}},
+     {"uncached_input": 20, "cache_read": 50, "cache_write_1h": 0, "cache_write_5m": 30, "output": 50, "reasoning": None},
+     {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150,
+      "input_tokens_uncached": 20, "cache_creation_input_tokens": 30, "cache_read_input_tokens": 50}),
+
+    ("responses: reasoning tokens", "responses",
+     {"input_tokens": 40, "output_tokens": 90,
+      "output_tokens_details": {"reasoning_tokens": 70}},
+     {"uncached_input": 40, "cache_read": 0, "cache_write_1h": 0, "cache_write_5m": 0, "output": 90, "reasoning": 70},
+     {"prompt_tokens": 40, "completion_tokens": 90, "total_tokens": 130,
+      "input_tokens_uncached": 40, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}),
+]
+
+USAGE_BACKENDS = {"messages": v1_messages, "chat": chat_api, "responses": resp_api}
+
+
+def test_usage_normalization(case: tuple) -> bool:
+    """
+    One backend's parse_usage() plus the two shared consumers in common.py.
+    All three backends normalize to one counts shape; this pins what comes out of it.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    label, backend, raw, expected_cost, expected_client = case[:5]
+    overrides = case[5] if len(case) > 5 else {}
+    print(f"Testing usage normalization for {label}... ", end="")
+
+    cfg = make_config()
+    for key, value in overrides.items():
+        setattr(cfg, key, value)
+    counts = USAGE_BACKENDS[backend].parse_usage(raw)
+
+    passed  = check_equal(expected_cost  , common.usage_to_cost_tokens(counts))
+    passed &= check_equal(expected_client, common.usage_to_openai_dict(counts))
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+class FakeStream:
+    """A /responses SSE body, replayed from a list of already-encoded 'data:' lines."""
+    def __init__(self, lines: list[str]) -> None:
+        self.status_code = 200
+        self._lines      = lines
+
+    def iter_lines(self): return iter(self._lines)
+    def __enter__(self): return self
+    def __exit__(self, *exc): return False
+
+
+class FakeStreamClient:
+    def __init__(self, lines: list[str]) -> None: self._lines = lines
+    def __enter__(self): return self
+    def __exit__(self, *exc): return False
+    def stream(self, *args: Any, **kwargs: Any): return FakeStream(self._lines)
+
+
+def sse(*events: dict[str, Any]) -> list[str]:
+    return [f"data: {json.dumps(e)}" for e in events]
+
+
+CREATED_EVENT   = {"type": "response.created",  "response": {"id": "resp_1", "status": "in_progress"}}
+TEXT_EVENT      = {"type": "response.output_text.delta", "delta": "Hello."}
+REASONING_EVENT = {"type": "response.reasoning_summary_text.delta", "delta": "Thinking..."}
+COMPLETED_EVENT = {"type": "response.completed", "response": {
+    "id": "resp_1", "status": "completed",
+    "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}}}
+
+# A /responses stream is only finished when the response reports a terminal status.
+# Running out of body without one means the connection was cut mid-response; relaying
+# that as a clean stop hands the client an empty message and no reason for it, which
+# is indistinguishable from the model choosing to say nothing.
+STREAM_CASES = [
+    ("completed stream is relayed",            sse(CREATED_EVENT, TEXT_EVENT, COMPLETED_EVENT), False),
+    ("truncated after reasoning raises",       sse(CREATED_EVENT, REASONING_EVENT)            , True ),
+    ("truncated after text raises",            sse(CREATED_EVENT, TEXT_EVENT)                 , True ),
+    ("truncated before any content raises",    sse(CREATED_EVENT)                             , True ),
+]
+
+
+def test_responses_stream_termination(case: tuple) -> bool:
+    global tests_ttl
+    tests_ttl += 1
+    label, lines, expect_error = case
+    print(f"Testing /responses stream: {label}... ", end="")
+
+    cfg = make_config()
+    cfg.backend          = "gpt"
+    cfg.model            = "gpt-5.6-sol"
+    cfg.openai_providers = {"gpt": make_provider(api="responses")}
+
+    prepared = {"messages": [{"role": "user", "content": "hi"}], "system_segments": [],
+                "system_summary_text": "", "lorebook_at_end_text": "", "max_tokens": 64}
+
+    original_httpx, original_headers = resp_api.httpx, resp_api.request_headers
+    resp_api.httpx = SimpleNamespace(Client=lambda **kw: FakeStreamClient(lines))
+    resp_api.request_headers = lambda provider: {}
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            raised, final = None, None
+            try:
+                for kind, data in resp_api.generate_stream(prepared):
+                    if kind == "final": final = data
+            except Exception as exc:
+                raised = exc
+    finally:
+        resp_api.httpx, resp_api.request_headers = original_httpx, original_headers
+
+    if expect_error:
+        passed = raised is not None and final is None
+        if not passed:
+            print(f"expected an error, got final={final!r} raised={raised!r} ", end="")
+    else:
+        passed = raised is None and final is not None and final["stop_reason"] == "stop"
+        if not passed:
+            print(f"expected a clean final, got final={final!r} raised={raised!r} ", end="")
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def load_body_cases(name: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    fixture = json5.loads((FIXTURES / name).read_text(encoding="utf-8"))
+    return fixture["inputs"], fixture["cases"]
+
+
+def test_provider_request_body(inputs: dict[str, Any], case: dict[str, Any]) -> bool:
+    """
+    Builds one OpenAI-style request body and compares it to the golden dict.
+
+    Each case re-runs make_config() so it is isolated from the last one: cfg is a
+    shared singleton and these cases leave a provider backend selected on it.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    print(f"Testing request body for {case['name']}... ", end="")
+
+    entry = inputs[case["input"]]
+
+    # Config warnings from .env, and the sampling-refused warning, are not under test.
+    with contextlib.redirect_stdout(io.StringIO()):
+        cfg = make_config()
+        cfg.backend          = case["backend"]
+        cfg.model            = case["model"]
+        cfg.openai_providers = {case["backend"]: make_provider(**case.get("provider", {}))}
+        cfg.thinking_enabled = False
+        cfg.thinking_effort  = "medium"
+        for key, value in case.get("cfg", {}).items():
+            setattr(cfg, key, value)
+
+        received = BUILDERS[case["builder"]](entry["prepared"])
+
+    expected = {**case["expected"], BUILDER_MESSAGE_KEY[case["builder"]]: entry["messages"]}
+
+    passed = check_equal(expected, received)
+    # check_equal only walks the keys it was given, so a field the builder should not
+    # have sent at all would slip past it. For a golden body that is a failure too.
+    for key in received:
+        if key not in expected:
+            print(f"unexpected key={key} rec={received[key]!r}")
+            passed = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
 if __name__ == "__main__":
     make_config()
 
@@ -232,6 +553,18 @@ if __name__ == "__main__":
     tests_passed += test_basic_non_streaming_roundtrip("basic_no_ooc.json5")
     tests_passed += test_basic_non_streaming_roundtrip("basic_with_ooc.json5")
     tests_passed += test_chat_dump_formats("dump_chat.json5")
+
+    tests_passed += test_wire_protocol_derivation()
+
+    for usage_case in USAGE_CASES:
+        tests_passed += test_usage_normalization(usage_case)
+
+    for stream_case in STREAM_CASES:
+        tests_passed += test_responses_stream_termination(stream_case)
+
+    body_inputs, body_cases = load_body_cases("provider_bodies.json5")
+    for body_case in body_cases:
+        tests_passed += test_provider_request_body(body_inputs, body_case)
 
     tests_failed : int = tests_ttl - tests_passed
 

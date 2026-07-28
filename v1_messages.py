@@ -14,15 +14,19 @@ from common import (
     append_text_to_content,
     cfg,
     deep_get,
+    error_body,
+    error_message,
     extract_claude_version,
+    print_payload,
+    print_usage,
     resolve_api_key,
-    track_usage,
     trim_to_end_sentence,
+    usage_to_openai_dict,
 )
 
 
 ANTHROPIC_TIMEOUT_ERROR                      = getattr(anthropic, "APITimeoutError", TimeoutError)
-ANTHROPIC_MODELS      : List[Dict[str, Any]] = []
+MODELS      : List[Dict[str, Any]] = []
 MODEL_LIST_LAST_ERROR : Optional[str]        = None
 MODEL_LIST_LAST_TIMEOUT                      = False
 MODEL_LOCK                                   = threading.Lock()
@@ -46,70 +50,15 @@ def anthropic_object_to_dict(obj: Any) -> Dict[str, Any]:
     return {"value": str(obj)}
 
 
-def anthropic_error_body(exc: Exception) -> Optional[Dict[str, Any]]:
-    body = getattr(exc, "body", None)
-    if isinstance(body, dict):
-        return body
-
-    response = getattr(exc, "response", None)
-    if response is not None:
-        try:
-            response_body = response.json()
-            if isinstance(response_body, dict):
-                return response_body
-        except Exception:
-            pass
-
-    return None
-
-
-def anthropic_error_message(body: Optional[Dict[str, Any]], fallback: str) -> str:
-    if isinstance(body, dict):
-        error_obj = body.get("error", {})
-        if isinstance(error_obj, dict):
-            message = error_obj.get("message")
-            if message:
-                return str(message)
-
-        return json.dumps(body, ensure_ascii=False, default=str)
-
-    return fallback
-
-
-def print_anthropic_error(exc: Exception) -> bool:
-    ANSI_RED   : str = "\033[31m"
-    ANSI_RESET : str = "\033[0m"
-    body   = anthropic_error_body(exc)
-    module = exc.__class__.__module__.split(".", 1)[0]
-    if module != "anthropic" and body is None:
-        return False
-
-    fallback = str(exc) or exc.__class__.__name__
-
-    if body is None:
-        body = {
-            "type"  : "error",
-            "error" : {
-                "type"    : exc.__class__.__name__,
-                "message" : fallback,
-            },
-        }
-
-    message = anthropic_error_message(body, fallback)
-    print(json.dumps(body, indent=2, ensure_ascii=False, default=str))
-    print(f"{ANSI_RED}{message}{ANSI_RESET}")
-    return True
-
-
 def model_id_from_info(model_info: Dict[str, Any]) -> str:
     return str(model_info.get("id") or model_info.get("model") or "").strip()
 
 
-def refresh_anthropic_models(key: str, timeout_s: float) -> bool:
+def refresh_models(key: str, timeout_s: float) -> bool:
     """
     Fetches the available Anthropic models and stores them for CLI use.
     """
-    global ANTHROPIC_MODELS, MODEL_LIST_LAST_ERROR, MODEL_LIST_LAST_TIMEOUT
+    global MODELS, MODEL_LIST_LAST_ERROR, MODEL_LIST_LAST_TIMEOUT
 
     try:
         if not key: raise RuntimeError("ANTHROPIC_API_KEY is not configured; model list cannot be retrieved at startup.")
@@ -124,7 +73,7 @@ def refresh_anthropic_models(key: str, timeout_s: float) -> bool:
         models = [anthropic_object_to_dict(model) for model in raw_models]
 
         with MODEL_LOCK:
-            ANTHROPIC_MODELS        = models
+            MODELS        = models
             MODEL_LIST_LAST_ERROR   = None
             MODEL_LIST_LAST_TIMEOUT = False
 
@@ -135,16 +84,16 @@ def refresh_anthropic_models(key: str, timeout_s: float) -> bool:
 
     except (ANTHROPIC_TIMEOUT_ERROR, TimeoutError) as exc:
         with MODEL_LOCK:
-            ANTHROPIC_MODELS        = []
+            MODELS        = []
             MODEL_LIST_LAST_ERROR   = None
             MODEL_LIST_LAST_TIMEOUT = True
         print("WARNING: Could not retrieve a model list from Anthropic. Timeout.")
         return False
 
     except Exception as exc:
-        anthropic_exception_msg : str = anthropic_error_message(anthropic_error_body(exc), str(exc) or exc.__class__.__name__)
+        anthropic_exception_msg : str = error_message(error_body(exc), str(exc) or exc.__class__.__name__)
         with MODEL_LOCK:
-            ANTHROPIC_MODELS        = []
+            MODELS        = []
             MODEL_LIST_LAST_ERROR   = anthropic_exception_msg
             MODEL_LIST_LAST_TIMEOUT = False
         print(f"WARNING: Could not retrieve a model list from Anthropic. {anthropic_exception_msg}.")
@@ -164,7 +113,7 @@ def print_no_model_list_available() -> None:
 
 def print_model_list() -> None:
     with MODEL_LOCK:
-        models            = list(ANTHROPIC_MODELS)
+        models            = list(MODELS)
         selected_model_id = cfg.model
     if not models:
         print_no_model_list_available()
@@ -190,31 +139,36 @@ def print_model_list() -> None:
         print(f"{number_cell}  {model_id:<42}{suffix}")
 
 
-def select_model_by_number(index: int) -> None:
+def select_model_by_number(index: int) -> bool:
+    """
+    Selects an Anthropic model by its number in the CLI list. Returns False when
+    nothing was selected, so the caller knows not to re-resolve thinking.
+    """
     with MODEL_LOCK:
-        if not ANTHROPIC_MODELS:
+        if not MODELS:
             print_no_model_list_available()
-            return
-        if index < 1 or index > len(ANTHROPIC_MODELS):
-            print(f"Model number out of range [1:{len(ANTHROPIC_MODELS)}].")
-            return
-        model_info = ANTHROPIC_MODELS[index - 1]
+            return False
+        if index < 1 or index > len(MODELS):
+            print(f"Model number out of range [1:{len(MODELS)}].")
+            return False
+        model_info = MODELS[index - 1]
         model_id   = model_id_from_info(model_info)
         if not model_id:
             print(f"Model {index} does not have an id and cannot be selected.")
-            return
+            return False
         apply_model(model_info)
+        return True
 
 
 def print_model_info(index: int) -> None:
     with MODEL_LOCK:
-        if not ANTHROPIC_MODELS:
+        if not MODELS:
             print_no_model_list_available()
             return
-        if index < 1 or index > len(ANTHROPIC_MODELS):
-            print(f"Model number out of range. Use 1 through {len(ANTHROPIC_MODELS)}.")
+        if index < 1 or index > len(MODELS):
+            print(f"Model number out of range. Use 1 through {len(MODELS)}.")
             return
-        model_info = dict(ANTHROPIC_MODELS[index - 1])
+        model_info = dict(MODELS[index - 1])
 
     print(json.dumps(model_info, indent=2, ensure_ascii=False, default=str))
 
@@ -223,7 +177,7 @@ def resolve_thinking() -> None:
     """
     Anthropic thinking resolution: capability checks against the selected model
     record and the Anthropic parameter constraints
-    (open_ai.resolve_thinking() is the OpenAI-style counterpart).
+    (v1_chat_completions and v1_responses have their own counterparts).
     """
     if not cfg.thinking_enabled:
         return
@@ -265,7 +219,7 @@ def resolve_thinking() -> None:
 def print_think_status() -> None:
     """
     CLI 'think' status for the Anthropic backend
-    (open_ai.print_think_status() is the OpenAI-style counterpart).
+    (v1_chat_completions and v1_responses have their own counterparts).
     """
     if cfg.preserve_thinking_blocks == UINT64_MAX : preserve_str = "inf"
     else                                          : preserve_str = str(cfg.preserve_thinking_blocks)
@@ -283,6 +237,12 @@ def print_think_status() -> None:
 
 
 def apply_model(model_info: Dict[str, Any]) -> None:
+    """
+    Points cfg at an Anthropic model and its costs.
+
+    Thinking is deliberately not resolved here; the caller does it once the switch
+    is done, the same way the provider registry works (see providers.apply_model).
+    """
     cfg.backend = "anthropic"
     cfg.info  = model_info
     cfg.model = deep_get(cfg.info, "id")
@@ -297,7 +257,6 @@ def apply_model(model_info: Dict[str, Any]) -> None:
     # Do not call set_prefill() here: that would overwrite ASSISTANT_PREFILL
     # with the mode string (for example "none", "assistant", or "instruction").
     cfg.set_prefill_mode(cfg.assistant_prefill_mode)
-    resolve_thinking()
     print(f"=== Switching to {cfg.model} complete ===")
 
 
@@ -459,7 +418,7 @@ def extract_hidden_thinking_envelopes(text: str) -> Tuple[str, List[Dict[str, An
     return cleaned.rstrip(), all_blocks
 
 
-def format_system_for_claude(system_segments: List[str], system_summary_text: str = "") -> List[Dict[str, Any]]:
+def format_system(system_segments: List[str], system_summary_text: str = "") -> List[Dict[str, Any]]:
     """
     Turns pre-split system prompt segments into top-level Anthropic system blocks.
 
@@ -483,7 +442,7 @@ def format_system_for_claude(system_segments: List[str], system_summary_text: st
     return formatted_system
 
 
-def format_to_claude_messages(mlist: List[Dict[str, Any]], lorebook_at_end_text: str = "") -> List[Dict[str, Any]]:
+def format_messages(mlist: List[Dict[str, Any]], lorebook_at_end_text: str = "") -> List[Dict[str, Any]]:
     """
     Converts OpenAI-style chat messages to Anthropic Messages format.
 
@@ -608,10 +567,14 @@ def fallback_cache_write_ttl() -> str:
     return "1h" if "1h" in active_ttl else "5m"
 
 
-def usage_to_cost_tokens(usage: Any) -> Dict[str, int]:
+def parse_usage(usage: Any) -> Dict[str, Any]:
     """
-    Maps an Anthropic usage payload to the normalized token-count dict that
-    common.track_usage() expects.
+    Pulls the token counts the proxy tracks out of an Anthropic usage payload.
+
+    Anthropic reports input_tokens net of caching -- cache reads and cache writes are
+    counted separately rather than included -- so the normalized 'prompt' total has to
+    be summed back up. Anthropic never reports a reasoning count, so 'reasoning' stays
+    None rather than claiming zero for thinking that demonstrably happened.
     """
     cache_creation       = getattr(usage, "cache_creation", {}) or {}
     ephemeral_1h         = int(getattr(cache_creation, "ephemeral_1h_input_tokens", 0) or 0)
@@ -629,68 +592,30 @@ def usage_to_cost_tokens(usage: Any) -> Dict[str, int]:
         if fallback_cache_write_ttl() == "1h" : ephemeral_1h += unknown_cache_write
         else                                  : ephemeral_5m += unknown_cache_write
 
-    return {
-        "uncached_input" : input_tok,
-        "cache_read"     : cache_read,
-        "cache_write_1h" : ephemeral_1h,
-        "cache_write_5m" : ephemeral_5m,
-        "output"         : output_tok,
-    }
-
-
-def print_usage(usage: Any) -> None:
-    track_usage(usage_to_cost_tokens(usage))
-
-
-def usage_to_openai_dict(usage: Any) -> Dict[str, int]:
-    """
-    Anthropic separates cache usage into:
-      input_tokens
-      cache_creation_input_tokens
-      cache_read_input_tokens
-      output_tokens
-
-    OpenAI-compatible clients usually expect:
-      prompt_tokens
-      completion_tokens
-      total_tokens
-
-    This preserves both.
-    """
-    input_tokens   = int(getattr(usage, "input_tokens"               , 0) or 0)
-    output_tokens  = int(getattr(usage, "output_tokens"              , 0) or 0)
-    cache_read     = int(getattr(usage, "cache_read_input_tokens"    , 0) or 0)
-    cache_creation = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
-
-    prompt_tokens = input_tokens + cache_read + cache_creation
+    prompt_tokens = input_tok + cache_read + ephemeral_1h + ephemeral_5m
 
     return {
-        "prompt_tokens"               : prompt_tokens,
-        "completion_tokens"           : output_tokens,
-        "total_tokens"                : prompt_tokens + output_tokens,
-        "input_tokens_uncached"       : input_tokens,
-        "cache_creation_input_tokens" : cache_creation,
-        "cache_read_input_tokens"     : cache_read,
+        "prompt"     : prompt_tokens,
+        "completion" : output_tok,
+        "total"      : prompt_tokens + output_tok,
+        "cached"     : cache_read,
+        "write_1h"   : ephemeral_1h,
+        "write_5m"   : ephemeral_5m,
+        "uncached"   : input_tok,
+        "reasoning"  : None,
     }
 
 
 # Generation
-def print_payload(kwargs: Dict[str, Any]) -> None:
-    if not cfg.debug_log:
-        return
-    print()
-    print("=== Claude payload start ===")
-    print(json.dumps(kwargs, indent=2, ensure_ascii=False))
-    print("=== Claude payload end ===")
 
 
-def build_claude_kwargs(prepared: Dict[str, Any]) -> Dict[str, Any]:
+def build_body(prepared: Dict[str, Any]) -> Dict[str, Any]:
     """
     Builds the Anthropic Messages API request from a prepared chat request
     (see server.prepare_chat_request for the dict shape).
     """
-    formatted_system   = format_system_for_claude(prepared["system_segments"], prepared["system_summary_text"])
-    formatted_messages = format_to_claude_messages(prepared["messages"], prepared["lorebook_at_end_text"])
+    formatted_system   = format_system(prepared["system_segments"], prepared["system_summary_text"])
+    formatted_messages = format_messages(prepared["messages"], prepared["lorebook_at_end_text"])
 
     kwargs: Dict[str, Any] = {
         "model"      : cfg.model,
@@ -727,13 +652,14 @@ def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
         id, stop_reason, text, usage, message_extra
     """
     client = get_anthropic_client()
-    kwargs = build_claude_kwargs(prepared)
+    kwargs = build_body(prepared)
 
     print_payload(kwargs)
 
     message = client.messages.create(**kwargs)
 
-    print_usage(getattr(message, "usage", None))
+    counts = parse_usage(getattr(message, "usage", None))
+    print_usage(counts)
 
     output_text = extract_text_from_anthropic_message(message)
     if cfg.auto_trim:
@@ -759,7 +685,7 @@ def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
         "id"            : getattr(message, "id", "claude"),
         "stop_reason"   : getattr(message, "stop_reason", "stop"),
         "text"          : output_text,
-        "usage"         : usage_to_openai_dict(getattr(message, "usage", None)),
+        "usage"         : usage_to_openai_dict(counts),
         "message_extra" : {
             "anthropic_content"            : anthropic_content,
             "anthropic_thinking_preserved" : bool(thinking_preservation_enabled() and thinking_blocks),
@@ -777,7 +703,7 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
     Errors propagate to the caller, which owns SSE error formatting and logging.
     """
     client = get_anthropic_client()
-    kwargs = build_claude_kwargs(prepared)
+    kwargs = build_body(prepared)
 
     print_payload(kwargs)
 
@@ -807,12 +733,13 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
             response_parts.append(thinking_envelope)
             yield ("text", thinking_envelope)
 
-        print_usage(getattr(final_message, "usage", None))
+        counts = parse_usage(getattr(final_message, "usage", None))
+        print_usage(counts)
 
         yield ("final", {
             "id"                 : getattr(final_message, "id", "claude"),
             "stop_reason"        : getattr(final_message, "stop_reason", "stop"),
-            "usage"              : usage_to_openai_dict(getattr(final_message, "usage", None)),
+            "usage"              : usage_to_openai_dict(counts),
             "snapshot_text"      : "".join(response_parts),
             "snapshot_reasoning" : "".join(reasoning_parts),
         })

@@ -6,7 +6,8 @@ import threading
 
 from flask             import abort, request
 from packaging.version import Version
-from typing            import Any, Dict, List
+from typing            import Any, Dict, List, Optional
+from urllib.parse      import urlsplit
 
 ENABLE_VALUES  = {"1", "y", "true" , "yes", "enable" , "on" }
 DISABLE_VALUES = {"0", "n", "false", "no" , "disable", "off"}
@@ -16,13 +17,29 @@ UINT64_MAX     = 2**64 - 1
 
 # The same thinking efforts, weakest first. Provider dialects fold this ladder onto
 # their own supported subset by walking it downwards from the requested level.
-THINK_EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
-MAX_TOKENS_PARAMS  = {"auto", "max_tokens", "max_completion_tokens"}
-# Which OpenAI-style endpoint a provider speaks. 'chat' is /chat/completions, which every
-# OpenAI-compatible provider implements. 'responses' is OpenAI's own /responses endpoint,
-# the only one that can return reasoning text (see open_ai.build_responses_body).
-OPENAI_API_STYLES    = {"chat", "responses"}
-REASONING_SUMMARIES  = {"none", "auto", "concise", "detailed"}
+THINK_EFFORT_ORDER  = ("low", "medium", "high", "xhigh", "max")
+MAX_TOKENS_PARAMS   = {"auto", "max_tokens", "max_completion_tokens"}
+REASONING_SUMMARIES = {"none", "auto", "concise", "detailed"}
+
+# Which wire protocol a provider speaks. This is derived from its endpoint rather than
+# configured, because there is only ever one right answer: OpenAI's own API serves
+# /responses, which covers the full feature set and is the only endpoint that returns
+# reasoning text (see v1_responses). Everyone else implements /chat/completions and not
+# /responses (see v1_chat_completions).
+#
+# api.openai.com is OpenAI's own host. The Azure suffix is its v1 surface, where
+# {base_url}/responses resolves the same way -- inferred from Microsoft's documented
+# layout rather than tested here, so treat it as best-effort.
+OPENAI_HOSTS         = ("api.openai.com",)
+OPENAI_HOST_SUFFIXES = (".openai.azure.com",)
+
+def openai_native_endpoint(base_url: str) -> bool:
+    """
+    Whether base_url is one of OpenAI's own API endpoints, which are served over
+    /responses. Everything else speaks /chat/completions.
+    """
+    host = (urlsplit(base_url).hostname or "").lower()
+    return host in OPENAI_HOSTS or host.endswith(OPENAI_HOST_SUFFIXES)
 
 def getenv_float(name: str, default: float) -> float:
     raw = os.getenv(name, str(default)).strip()
@@ -124,7 +141,7 @@ class RuntimeConfig:
         self.version = extract_claude_version(self.model)
         self.model_info = {}
         # Full model record from the provider model list. Empty until a backend's
-        # apply_model runs, so capability checks (claude.resolve_thinking) fail
+        # apply_model runs, so capability checks (v1_messages.resolve_thinking) fail
         # closed instead of crashing.
         self.info = {}
 
@@ -138,14 +155,15 @@ class RuntimeConfig:
         #   <NAME>_MODELS_REGEX           keeps only matching ids from the fetched /models list
         #                                 (providers like OpenAI also serve tts/image/embedding models)
         #   <NAME>_MAX_TOKENS_PARAM       'auto' (default), 'max_tokens' or 'max_completion_tokens'
-        #   <NAME>_API                    'chat' (default) or 'responses'; the latter is OpenAI-only
-        #                                 and is the only way to see the model's reasoning
-        #   <NAME>_REASONING_SUMMARY      none|auto|concise|detailed for <NAME>_API=responses
-        #   <NAME>_STORE                  let the provider retain the response (default false)
+        #   <NAME>_REASONING_SUMMARY      none|auto|concise|detailed; OpenAI endpoints only
+        #   <NAME>_STORE                  let the provider retain the response (default false);
+        #                                 OpenAI endpoints only
         #   <NAME>_EXTRA_BODY             json5 object merged verbatim into every request
         #                                 (the escape hatch for provider thinking/caching dialects)
         #   <NAME>_INPUT_TOKEN_COST_USD, <NAME>_OUTPUT_TOKEN_COST_USD,
         #   <NAME>_CACHE_READ_COST_USD, <NAME>_CACHE_WRITE_COST_USD
+        # The wire protocol is not among these: it follows the endpoint, since only
+        # OpenAI serves /responses. See openai_native_endpoint().
         self.openai_providers: Dict[str, Dict[str, Any]] = {}
         for name in [p.strip().lower() for p in os.getenv("OPENAI_PROVIDERS", "").split(",") if p.strip()]:
             prefix = re.sub(r"[^A-Z0-9]", "_", name.upper())
@@ -215,10 +233,7 @@ class RuntimeConfig:
                 print(f"WARNING: {prefix}_MAX_TOKENS_PARAM must be in {MAX_TOKENS_PARAMS}. Defaulting to 'auto'.")
                 max_tokens_param = "auto"
 
-            api_style = os.getenv(f"{prefix}_API", "chat").strip().lower()
-            if api_style not in OPENAI_API_STYLES:
-                print(f"WARNING: {prefix}_API must be in {OPENAI_API_STYLES}. Defaulting to 'chat'.")
-                api_style = "chat"
+            api_style = "responses" if openai_native_endpoint(base_url) else "chat"
 
             reasoning_summary = os.getenv(f"{prefix}_REASONING_SUMMARY", "auto").strip().lower()
             if reasoning_summary not in REASONING_SUMMARIES:
@@ -533,7 +548,7 @@ class RuntimeConfig:
 
 # The single runtime configuration instance shared by every module.
 # It is created empty here and populated by cfg.reload_from_env() at startup.
-# Always mutate it in place; never rebind the name, or modules will desync.
+# Always mutate it in place; never rebind the name.
 cfg = RuntimeConfig()
 
 
@@ -612,6 +627,77 @@ def resolve_api_key(configured_key: str, key_name: str) -> str:
         return provided_key
     abort(500, description=(f"{key_name} is not configured. Either set {key_name} and PROXY_KEY in .env, or set ALLOW_KEY_PASSTHROUGH=true."))
     raise RuntimeError("unreachable")
+
+
+# Backend error rendering. Every backend raises errors carrying the same two things:
+# a status code and a JSON body with an 'error' object -- the Anthropic SDK does it
+# natively, and providers.ProviderError is built to match. So these are shared rather
+# than Anthropic-only, despite having started out that way.
+def error_body(exc: Exception) -> Optional[Dict[str, Any]]:
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        return body
+
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            response_body = response.json()
+            if isinstance(response_body, dict):
+                return response_body
+        except Exception:
+            pass
+
+    return None
+
+
+def error_message(body: Optional[Dict[str, Any]], fallback: str) -> str:
+    if isinstance(body, dict):
+        error_obj = body.get("error", {})
+        if isinstance(error_obj, dict):
+            message = error_obj.get("message")
+            if message:
+                return str(message)
+
+        return json.dumps(body, ensure_ascii=False, default=str)
+
+    return fallback
+
+
+def print_error(exc: Exception) -> None:
+    """
+    Prints an error to the console in red.
+
+    An upstream refusal arrives with a JSON body, which is printed above the message.
+    Anything else is a fault in this proxy rather than an answer from a provider, and
+    says so plainly: the two mean very different things to whoever is reading the
+    terminal. The full traceback for those goes to the error log, not here.
+    """
+    ANSI_RED   : str = "\033[31m"
+    ANSI_RESET : str = "\033[0m"
+
+    body     = error_body(exc)
+    fallback = str(exc) or exc.__class__.__name__
+    # The Anthropic SDK does not always populate a body, so anything it raises counts
+    # as an API error regardless; every other backend carries one (providers.ProviderError).
+    from_api = body is not None or exc.__class__.__module__.split(".", 1)[0] == "anthropic"
+
+    if not from_api:
+        print(f"{ANSI_RED}Proxy error (not an API response): {exc.__class__.__name__}: {fallback}{ANSI_RESET}")
+        print(f"{ANSI_RED}This is a bug in the proxy. See the error log for the traceback.{ANSI_RESET}")
+        return
+
+    if body is None:
+        body = {
+            "type"  : "error",
+            "error" : {
+                "type"    : exc.__class__.__name__,
+                "message" : fallback,
+            },
+        }
+
+    message = error_message(body, fallback)
+    print(json.dumps(body, indent=2, ensure_ascii=False, default=str))
+    print(f"{ANSI_RED}{message}{ANSI_RESET}")
 
 
 def content_to_plain_text(content: Any) -> str:
@@ -705,6 +791,61 @@ def append_prefill_instruction_to_last_user_message(formatted: List[Dict[str, An
     formatted.append({"role": "user", "content": instruction})
 
 
+# Normalized token counts. Every backend's parse_usage() returns this shape, whatever
+# its provider called the fields, and everything downstream reads only this:
+#   prompt      all input tokens, including the cached and newly written ones
+#   completion  output tokens, reasoning included
+#   total       prompt + completion
+#   uncached    input tokens billed at the full input rate
+#   cached      input tokens served from cache (a cache read)
+#   write_1h    input tokens written to a 1h cache; Anthropic only, 0 elsewhere
+#   write_5m    input tokens written to cache at the 5m rate, and the single rate
+#               charged by providers that offer no TTL choice
+#   reasoning   reasoning tokens, or None when the provider does not report a count
+#               (see track_usage: a zero there would be a claim, not a measurement)
+def print_payload(body: Dict[str, Any]) -> None:
+    if not cfg.debug_log:
+        return
+    print()
+    print(f"=== {cfg.backend} payload start ===")
+    print(json.dumps(body, indent=2, ensure_ascii=False, default=str))
+    print(f"=== {cfg.backend} payload end ===")
+
+
+def usage_to_cost_tokens(counts: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Maps normalized counts to the dict track_usage() bills from.
+    """
+    return {
+        "uncached_input" : counts["uncached"],
+        "cache_read"     : counts["cached"],
+        "cache_write_1h" : counts["write_1h"],
+        "cache_write_5m" : counts["write_5m"],
+        "output"         : counts["completion"],
+        # Splits the output line into thinking and visible text; None when unreported.
+        "reasoning"      : counts["reasoning"],
+    }
+
+
+def print_usage(counts: Dict[str, Any]) -> None:
+    track_usage(usage_to_cost_tokens(counts))
+
+
+def usage_to_openai_dict(counts: Dict[str, Any]) -> Dict[str, int]:
+    """
+    Maps normalized counts to the usage object returned to the client, so it sees one
+    consistent shape regardless of which backend served the request.
+    """
+    return {
+        "prompt_tokens"               : counts["prompt"],
+        "completion_tokens"           : counts["completion"],
+        "total_tokens"                : counts["total"],
+        "input_tokens_uncached"       : counts["uncached"],
+        "cache_creation_input_tokens" : counts["write_1h"] + counts["write_5m"],
+        "cache_read_input_tokens"     : counts["cached"],
+    }
+
+
 def track_usage(tokens: Dict[str, Any]) -> None:
     """
     Model-agnostic cost accounting over a normalized token-count dict:
@@ -770,7 +911,7 @@ def track_usage(tokens: Dict[str, Any]) -> None:
     if not cfg.debug_log:
         return
 
-    print("=== Claude usage start ===")
+    print(f"=== {cfg.backend} usage start ===")
     print("Request:")
     print("    Input tokens       =   uncached + cache read + cache write (        1h +         5m)")
     print("    {:18d} = {:10d} + {:10d} + {:11d} ({:10d} + {:10d})".format(ttl_tokens, input_tok, cache_read, cache_creation_input, ephemeral_1h, ephemeral_5m))
@@ -792,5 +933,5 @@ def track_usage(tokens: Dict[str, Any]) -> None:
     print("    Cache cost         = {} ({})".format(fmt_usd(session["cache_net_cost_usd"]), cache_lbl(session["cache_net_cost_usd"])))
     print("    Average input cost = {} / MTok.".format(fmt_usd(session["average_input_cost_usd"]*1_000_000)))
     print("    Total cost         = {} ({} input / {} output)".format(fmt_usd(session["total_spent_usd"]), fmt_usd(session["input_cost_usd"]), fmt_usd(session["output_cost_usd"])))
-    print("=== Claude usage end ===")
+    print(f"=== {cfg.backend} usage end ===")
     print("> ", end="", flush=True)
