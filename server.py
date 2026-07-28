@@ -11,19 +11,11 @@ from flask_cors import CORS
 from typing     import Any, Dict, List, Optional, Tuple
 from waitress   import serve
 
-import claude
+import v1_messages
 import providers
 import v1_chat_completions
 import v1_responses
 
-from claude import (
-    extract_hidden_thinking_envelopes,
-    print_model_info,
-    print_model_list,
-    refresh_anthropic_models,
-    select_model_by_number,
-    thinking_preservation_enabled,
-)
 from common import (
     DISABLE_VALUES,
     ENABLE_VALUES,
@@ -49,7 +41,7 @@ def active_backend():
     print_think_status. How each builds its request is its own business.
     """
     if cfg.backend == "anthropic":
-        return claude
+        return v1_messages
     return v1_responses if providers.api_style() == "responses" else v1_chat_completions
 
 
@@ -69,7 +61,7 @@ def refresh_model_lists() -> None:
     keeps the OPENAI_PROVIDERS declaration order (see providers.refresh_models).
     """
     anthropic_thread = threading.Thread(
-        target = refresh_anthropic_models,
+        target = v1_messages.refresh_models,
         args   = (cfg.anthropic_api_key, cfg.model_list_timeout_seconds),
     )
     anthropic_thread.start()
@@ -114,27 +106,27 @@ def finish_model_switch(switched: bool) -> None:
 
 
 def cli_print_model_list() -> None:
-    print_model_list()
-    providers.print_model_list(number_offset=len(claude.ANTHROPIC_MODELS))
+    v1_messages.print_model_list()
+    providers.print_model_list(number_offset=len(v1_messages.MODELS))
 
 
 def cli_select_model(number: int) -> None:
-    anthropic_count = len(claude.ANTHROPIC_MODELS)
-    if number <= anthropic_count : switched = select_model_by_number(number)
+    anthropic_count = len(v1_messages.MODELS)
+    if number <= anthropic_count : switched = v1_messages.select_model_by_number(number)
     else                         : switched = providers.select_model_by_number(number - anthropic_count)
     finish_model_switch(switched)
 
 
 def cli_print_model_info(number: int) -> None:
-    anthropic_count = len(claude.ANTHROPIC_MODELS)
-    if number <= anthropic_count : print_model_info(number)
+    anthropic_count = len(v1_messages.MODELS)
+    if number <= anthropic_count : v1_messages.print_model_info(number)
     else                         : providers.print_model_info(number - anthropic_count)
 
 
 def cli_refresh_models() -> None:
     refresh_model_lists()
     if cfg.backend == "anthropic":
-        switched = bool(claude.find_cfg(claude.ANTHROPIC_MODELS))
+        switched = bool(v1_messages.find_cfg(v1_messages.MODELS))
     else:
         switched = providers.apply_model_by_id(f"{cfg.backend}/{cfg.model}")
         if not switched:
@@ -845,16 +837,16 @@ def split_system_and_messages(raw_messages: Any) -> Tuple[str, List[Dict[str, An
             role = "user"
 
         # Strip every preservation envelope, but keep assistant envelopes only when preservation is enabled.
-        content, thinking_blocks = extract_hidden_thinking_envelopes(content)
+        content, thinking_blocks = v1_messages.extract_hidden_thinking_envelopes(content)
 
         msg_obj: Dict[str, Any] = {"role": role, "content": content}
-        if role == "assistant" and thinking_preservation_enabled() and thinking_blocks:
+        if role == "assistant" and v1_messages.thinking_preservation_enabled() and thinking_blocks:
             msg_obj["anthropic_thinking_blocks"] = thinking_blocks
         chat_messages.append(msg_obj)
 
     chat_messages, system_summary_text = apply_summary_blocks(chat_messages)
 
-    if thinking_preservation_enabled():
+    if v1_messages.thinking_preservation_enabled():
         # Mark only the last N assistant messages for signed-block rehydration.
         remaining = cfg.preserve_thinking_blocks
         for i in range(len(chat_messages) - 1, -1, -1):
@@ -1237,7 +1229,7 @@ if __name__ == "__main__":
     refresh_model_lists()
     # MODEL may name either an Anthropic model or a provider model ("glm-4.7" or "glm/glm-4.7").
     finish_model_switch(
-        providers.apply_model_by_id(cfg.model) or bool(claude.find_cfg(claude.ANTHROPIC_MODELS))
+        providers.apply_model_by_id(cfg.model) or bool(v1_messages.find_cfg(v1_messages.MODELS))
     )
 
     print("Starting Claude proxy")

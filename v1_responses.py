@@ -171,7 +171,7 @@ def resolve_thinking() -> None:
 def print_think_status() -> None:
     """
     CLI 'think' status for this endpoint
-    (claude.print_think_status and v1_chat_completions.print_think_status are the counterparts).
+    (v1_messages.print_think_status and v1_chat_completions.print_think_status are the counterparts).
     """
     ladder = effort_ladder(cfg.model)
     if ladder is None:
@@ -304,7 +304,7 @@ def output_text(data: Dict[str, Any]) -> Tuple[str, str]:
 def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
     """
     Runs one non-streaming /responses request.
-    Same result shape as claude.generate_non_stream.
+    Same result shape as v1_messages.generate_non_stream.
     """
     provider = cfg.openai_providers[cfg.backend]
 

@@ -1,7 +1,7 @@
 # OpenAI to Anthropic compatibility adapter
-Compatibility adapter for interfacing OpenAI-style chat requests with Antrhopic Message API requests. Typical usage would be using it as an intermediary server between JanitorAI and Claude (with your own Antropic API key).
+Compatibility adapter for interfacing OpenAI-style chat requests with Anthropic Message API requests. Typical usage would be using it as an intermediary server between JanitorAI and Claude (with your own Anthropic API key).
 
-Besides Claude, the proxy can also route to OpenAI-style API providers (OpenAI itself, GLM, Aion Labs, ...) configured through `OPENAI_PROVIDERS` in `.env` (see `env_example.ini`). Their models appear in the CLI `model` list after the Anthropic ones; selecting one switches the active backend. Model-agnostic features (summary blocks, lorebook handling, cost tracking, instruction prefill, auto-trim, dumps) work for every backend; Claude-only features (explicit cache markers, signed thinking-block preservation, assistant prefill) apply only to Claude. The shared thinking settings are translated into the provider's own dialect for GPT, Aion, GLM and Kimi models (see [Thinking on OpenAI-style backends](#thinking-on-openai-style-backends)). Any other provider-specific request option is passed through verbatim via `<NAME>_EXTRA_BODY`.
+Besides Claude, the proxy can also route to other providers (OpenAI, GLM, Aion Labs, Kimi, ...) configured through `OPENAI_PROVIDERS` in `.env` (see `env_example.ini`). Their models appear in the CLI `model` list after the Anthropic ones; selecting one switches the active backend. Which endpoint each provider is called on is worked out from its base URL — OpenAI over `/responses`, everyone else over `/chat/completions` (see [Code layout](#code-layout)). Model-agnostic features (summary blocks, lorebook handling, cost tracking, instruction prefill, auto-trim, dumps) work for every backend; Claude-only features (explicit cache markers, signed thinking-block preservation, assistant prefill) apply only to Claude. The shared thinking settings are translated into the provider's own dialect for GPT, Aion, GLM and Kimi models (see [Thinking on OpenAI-style backends](#thinking-on-openai-style-backends)). Any other provider-specific request option is passed through verbatim via `<NAME>_EXTRA_BODY`.
 
 ## Requirements
 - Anthropic API key from Claude Console. https://platform.claude.com/settings/workspaces/default/keys
@@ -103,7 +103,9 @@ This is 99% a Janitor-side issue, or you've typed the link wrong in its UI.
 
 > Janitor gives an error, some text appeared in the server console.
 
-Well, this is a server-side issue then. You can open an issue here on GitHub. The text in your terminal should provide a hint what's happening, and you can always ask your friendly LLM for help. Give it the error message as-is + the `server.py` file, even the free LLMs are usually good about finding bugs in simple stuff like this.
+Well, this is a server-side issue then. You can open an issue here on GitHub. The text in your terminal should provide a hint what's happening, and you can always ask your friendly LLM for help. Give it the error message as-is plus `server.py` and the backend module for the model you were using (see [Code layout](#code-layout)) — even the free LLMs are usually good about finding bugs in simple stuff like this.
+
+A red `Proxy error (not an API response)` line means the fault is in the proxy rather than something the provider refused; the full traceback for those goes to `ERROR_LOG_PATH`.
 
 ## Command-Line Interface
 
@@ -314,6 +316,26 @@ I was born at a very young age...
 `role="system"` is only valid with `tag="all"`. It inserts the summary into the system fields (after the core definitions + lorebook) instead of the message.
 
 The proxy should print a warning if you made mistakes with your tags somewhere (forgot to close one, mistyped the tag, etc...).
+
+## Code layout
+
+The backend boundary is the upstream wire protocol — one module per protocol, each exposing the same four entry points:
+
+| Module                   | Speaks                              | Serves                                          |
+| ------------------------ | ----------------------------------- | ----------------------------------------------- |
+| `v1_messages.py`         | Anthropic `/v1/messages`            | Claude                                          |
+| `v1_chat_completions.py` | OpenAI-style `/v1/chat/completions` | GLM, Kimi, Aion, and other compatible providers |
+| `v1_responses.py`        | OpenAI `/v1/responses`              | OpenAI                                          |
+
+Which module serves a provider follows from its `<NAME>_BASE_URL` and is not configurable: OpenAI's own API is served over `/responses`, because that is the only endpoint returning the model's reasoning and it covers the full feature set. Everything else is served over `/chat/completions`, which is what those providers implement.
+
+Around them:
+
+- **`server.py`** — the HTTP endpoint Janitor talks to, the runtime CLI, and every model-agnostic transform (summary blocks, lorebook handling, chat snapshots). It picks the backend module per request; the Anthropic-only features are the only place it asks which one it got.
+- **`providers.py`** — what the two OpenAI-style modules share: the provider registry and aggregated model list, HTTP transport, the request message list, and usage normalization. It imports neither of them, so a provider can never depend on the endpoint that happens to be selected.
+- **`common.py`** — configuration from `.env`, cost accounting, text helpers, error rendering.
+
+Tests live in `tests/` and run with `python tests/test_driver.py`. They need no network and no API key: the Anthropic client is faked, and the provider tests assert the exact request body each backend builds.
 
 ## If you've read this far...
 

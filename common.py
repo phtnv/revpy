@@ -141,7 +141,7 @@ class RuntimeConfig:
         self.version = extract_claude_version(self.model)
         self.model_info = {}
         # Full model record from the provider model list. Empty until a backend's
-        # apply_model runs, so capability checks (claude.resolve_thinking) fail
+        # apply_model runs, so capability checks (v1_messages.resolve_thinking) fail
         # closed instead of crashing.
         self.info = {}
 

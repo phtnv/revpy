@@ -24,7 +24,7 @@ from common import (
 
 
 ANTHROPIC_TIMEOUT_ERROR                      = getattr(anthropic, "APITimeoutError", TimeoutError)
-ANTHROPIC_MODELS      : List[Dict[str, Any]] = []
+MODELS      : List[Dict[str, Any]] = []
 MODEL_LIST_LAST_ERROR : Optional[str]        = None
 MODEL_LIST_LAST_TIMEOUT                      = False
 MODEL_LOCK                                   = threading.Lock()
@@ -52,11 +52,11 @@ def model_id_from_info(model_info: Dict[str, Any]) -> str:
     return str(model_info.get("id") or model_info.get("model") or "").strip()
 
 
-def refresh_anthropic_models(key: str, timeout_s: float) -> bool:
+def refresh_models(key: str, timeout_s: float) -> bool:
     """
     Fetches the available Anthropic models and stores them for CLI use.
     """
-    global ANTHROPIC_MODELS, MODEL_LIST_LAST_ERROR, MODEL_LIST_LAST_TIMEOUT
+    global MODELS, MODEL_LIST_LAST_ERROR, MODEL_LIST_LAST_TIMEOUT
 
     try:
         if not key: raise RuntimeError("ANTHROPIC_API_KEY is not configured; model list cannot be retrieved at startup.")
@@ -71,7 +71,7 @@ def refresh_anthropic_models(key: str, timeout_s: float) -> bool:
         models = [anthropic_object_to_dict(model) for model in raw_models]
 
         with MODEL_LOCK:
-            ANTHROPIC_MODELS        = models
+            MODELS        = models
             MODEL_LIST_LAST_ERROR   = None
             MODEL_LIST_LAST_TIMEOUT = False
 
@@ -82,7 +82,7 @@ def refresh_anthropic_models(key: str, timeout_s: float) -> bool:
 
     except (ANTHROPIC_TIMEOUT_ERROR, TimeoutError) as exc:
         with MODEL_LOCK:
-            ANTHROPIC_MODELS        = []
+            MODELS        = []
             MODEL_LIST_LAST_ERROR   = None
             MODEL_LIST_LAST_TIMEOUT = True
         print("WARNING: Could not retrieve a model list from Anthropic. Timeout.")
@@ -91,7 +91,7 @@ def refresh_anthropic_models(key: str, timeout_s: float) -> bool:
     except Exception as exc:
         anthropic_exception_msg : str = error_message(error_body(exc), str(exc) or exc.__class__.__name__)
         with MODEL_LOCK:
-            ANTHROPIC_MODELS        = []
+            MODELS        = []
             MODEL_LIST_LAST_ERROR   = anthropic_exception_msg
             MODEL_LIST_LAST_TIMEOUT = False
         print(f"WARNING: Could not retrieve a model list from Anthropic. {anthropic_exception_msg}.")
@@ -111,7 +111,7 @@ def print_no_model_list_available() -> None:
 
 def print_model_list() -> None:
     with MODEL_LOCK:
-        models            = list(ANTHROPIC_MODELS)
+        models            = list(MODELS)
         selected_model_id = cfg.model
     if not models:
         print_no_model_list_available()
@@ -143,13 +143,13 @@ def select_model_by_number(index: int) -> bool:
     nothing was selected, so the caller knows not to re-resolve thinking.
     """
     with MODEL_LOCK:
-        if not ANTHROPIC_MODELS:
+        if not MODELS:
             print_no_model_list_available()
             return False
-        if index < 1 or index > len(ANTHROPIC_MODELS):
-            print(f"Model number out of range [1:{len(ANTHROPIC_MODELS)}].")
+        if index < 1 or index > len(MODELS):
+            print(f"Model number out of range [1:{len(MODELS)}].")
             return False
-        model_info = ANTHROPIC_MODELS[index - 1]
+        model_info = MODELS[index - 1]
         model_id   = model_id_from_info(model_info)
         if not model_id:
             print(f"Model {index} does not have an id and cannot be selected.")
@@ -160,13 +160,13 @@ def select_model_by_number(index: int) -> bool:
 
 def print_model_info(index: int) -> None:
     with MODEL_LOCK:
-        if not ANTHROPIC_MODELS:
+        if not MODELS:
             print_no_model_list_available()
             return
-        if index < 1 or index > len(ANTHROPIC_MODELS):
-            print(f"Model number out of range. Use 1 through {len(ANTHROPIC_MODELS)}.")
+        if index < 1 or index > len(MODELS):
+            print(f"Model number out of range. Use 1 through {len(MODELS)}.")
             return
-        model_info = dict(ANTHROPIC_MODELS[index - 1])
+        model_info = dict(MODELS[index - 1])
 
     print(json.dumps(model_info, indent=2, ensure_ascii=False, default=str))
 
@@ -416,7 +416,7 @@ def extract_hidden_thinking_envelopes(text: str) -> Tuple[str, List[Dict[str, An
     return cleaned.rstrip(), all_blocks
 
 
-def format_system_for_claude(system_segments: List[str], system_summary_text: str = "") -> List[Dict[str, Any]]:
+def format_system(system_segments: List[str], system_summary_text: str = "") -> List[Dict[str, Any]]:
     """
     Turns pre-split system prompt segments into top-level Anthropic system blocks.
 
@@ -440,7 +440,7 @@ def format_system_for_claude(system_segments: List[str], system_summary_text: st
     return formatted_system
 
 
-def format_to_claude_messages(mlist: List[Dict[str, Any]], lorebook_at_end_text: str = "") -> List[Dict[str, Any]]:
+def format_messages(mlist: List[Dict[str, Any]], lorebook_at_end_text: str = "") -> List[Dict[str, Any]]:
     """
     Converts OpenAI-style chat messages to Anthropic Messages format.
 
@@ -641,13 +641,13 @@ def print_payload(kwargs: Dict[str, Any]) -> None:
     print("=== Claude payload end ===")
 
 
-def build_claude_kwargs(prepared: Dict[str, Any]) -> Dict[str, Any]:
+def build_kwargs(prepared: Dict[str, Any]) -> Dict[str, Any]:
     """
     Builds the Anthropic Messages API request from a prepared chat request
     (see server.prepare_chat_request for the dict shape).
     """
-    formatted_system   = format_system_for_claude(prepared["system_segments"], prepared["system_summary_text"])
-    formatted_messages = format_to_claude_messages(prepared["messages"], prepared["lorebook_at_end_text"])
+    formatted_system   = format_system(prepared["system_segments"], prepared["system_summary_text"])
+    formatted_messages = format_messages(prepared["messages"], prepared["lorebook_at_end_text"])
 
     kwargs: Dict[str, Any] = {
         "model"      : cfg.model,
@@ -684,7 +684,7 @@ def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
         id, stop_reason, text, usage, message_extra
     """
     client = get_anthropic_client()
-    kwargs = build_claude_kwargs(prepared)
+    kwargs = build_kwargs(prepared)
 
     print_payload(kwargs)
 
@@ -734,7 +734,7 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
     Errors propagate to the caller, which owns SSE error formatting and logging.
     """
     client = get_anthropic_client()
-    kwargs = build_claude_kwargs(prepared)
+    kwargs = build_kwargs(prepared)
 
     print_payload(kwargs)
 

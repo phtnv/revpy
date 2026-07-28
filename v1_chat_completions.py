@@ -182,7 +182,7 @@ def resolve_thinking() -> None:
 def print_think_status() -> None:
     """
     CLI 'think' status for this endpoint
-    (claude.print_think_status and v1_responses.print_think_status are the counterparts).
+    (v1_messages.print_think_status and v1_responses.print_think_status are the counterparts).
     """
     probe = provider_thinking_params(cfg.model, True, cfg.thinking_effort)
     if probe is None:
@@ -300,7 +300,7 @@ def parse_usage(usage: Any) -> Dict[str, Any]:
 def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
     """
     Runs one non-streaming /chat/completions request.
-    Same result shape as claude.generate_non_stream.
+    Same result shape as v1_messages.generate_non_stream.
     """
     provider = cfg.openai_providers[cfg.backend]
     body     = build_body(prepared)
@@ -346,7 +346,7 @@ def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
 def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
     """
     Runs one streaming /chat/completions request, yielding the same backend-neutral
-    events as claude.generate_stream. Provider SSE chunks are relayed nearly verbatim.
+    events as v1_messages.generate_stream. Provider SSE chunks are relayed nearly verbatim.
 
     Note: not every provider sends usage in the stream. Providers that support the
     option can enable it via EXTRA_BODY, e.g. {"stream_options": {"include_usage": true}}.

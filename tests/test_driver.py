@@ -32,7 +32,7 @@ USAGE      = {
 
 sys.path.insert(0, str(ROOT))
 common    : Any = importlib.import_module("common")
-claude    : Any = importlib.import_module("claude")
+v1_messages: Any = importlib.import_module("v1_messages")
 chat_api  : Any = importlib.import_module("v1_chat_completions")
 resp_api  : Any = importlib.import_module("v1_responses")
 server    : Any = importlib.import_module("server")
@@ -211,9 +211,9 @@ def test_basic_non_streaming_roundtrip(name: str) -> bool:
     ref_msg = reference_from_fixture(name)
     rx_msg  = FakeAnthropic(ref_msg["reply"])
 
-    claude.get_anthropic_client = lambda: rx_msg
+    v1_messages.get_anthropic_client = lambda: rx_msg
     server.time.time            = lambda: CREATED
-    claude.print_usage          = lambda usage: None
+    v1_messages.print_usage          = lambda usage: None
     response = server.app.test_client().post("/v1/chat/completions", json=ref_msg["request"])
 
     rx_msg = received_from(response, rx_msg)
@@ -232,9 +232,9 @@ def test_chat_dump_formats(name: str) -> bool:
     ref_msg = reference_from_fixture(name)
     fake    = FakeAnthropic(ref_msg["reply"])
 
-    claude.get_anthropic_client = lambda: fake
+    v1_messages.get_anthropic_client = lambda: fake
     server.time.time            = lambda: CREATED
-    claude.print_usage          = lambda usage: None
+    v1_messages.print_usage          = lambda usage: None
     server.app.test_client().post("/v1/chat/completions", json=ref_msg["request"])
 
     expected_snapshot = fixture["expected_snapshot"]
