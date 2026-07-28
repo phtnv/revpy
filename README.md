@@ -63,7 +63,7 @@ Besides Claude, the proxy can also route to other providers (OpenAI, GLM, Aion L
     ```
     Expected output
     ```log
-    Starting Claude reverse proxy
+    Starting Claude proxy
     Local URL: http://127.0.0.1:5001
     Chat completions: http://127.0.0.1:5001/chat/completions
     Cloudflare Tunnel service URL should point to this local address:

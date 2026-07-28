@@ -17,9 +17,9 @@ UINT64_MAX     = 2**64 - 1
 
 # The same thinking efforts, weakest first. Provider dialects fold this ladder onto
 # their own supported subset by walking it downwards from the requested level.
-THINK_EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
-MAX_TOKENS_PARAMS  = {"auto", "max_tokens", "max_completion_tokens"}
-REASONING_SUMMARIES  = {"none", "auto", "concise", "detailed"}
+THINK_EFFORT_ORDER  = ("low", "medium", "high", "xhigh", "max")
+MAX_TOKENS_PARAMS   = {"auto", "max_tokens", "max_completion_tokens"}
+REASONING_SUMMARIES = {"none", "auto", "concise", "detailed"}
 
 # Which wire protocol a provider speaks. This is derived from its endpoint rather than
 # configured, because there is only ever one right answer: OpenAI's own API serves
@@ -158,12 +158,12 @@ class RuntimeConfig:
         #   <NAME>_REASONING_SUMMARY      none|auto|concise|detailed; OpenAI endpoints only
         #   <NAME>_STORE                  let the provider retain the response (default false);
         #                                 OpenAI endpoints only
-        # The wire protocol is not configurable: it follows the endpoint, since only
-        # OpenAI serves /responses. See openai_native_endpoint().
         #   <NAME>_EXTRA_BODY             json5 object merged verbatim into every request
         #                                 (the escape hatch for provider thinking/caching dialects)
         #   <NAME>_INPUT_TOKEN_COST_USD, <NAME>_OUTPUT_TOKEN_COST_USD,
         #   <NAME>_CACHE_READ_COST_USD, <NAME>_CACHE_WRITE_COST_USD
+        # The wire protocol is not among these: it follows the endpoint, since only
+        # OpenAI serves /responses. See openai_native_endpoint().
         self.openai_providers: Dict[str, Dict[str, Any]] = {}
         for name in [p.strip().lower() for p in os.getenv("OPENAI_PROVIDERS", "").split(",") if p.strip()]:
             prefix = re.sub(r"[^A-Z0-9]", "_", name.upper())
@@ -548,7 +548,7 @@ class RuntimeConfig:
 
 # The single runtime configuration instance shared by every module.
 # It is created empty here and populated by cfg.reload_from_env() at startup.
-# Always mutate it in place; never rebind the name, or modules will desync.
+# Always mutate it in place; never rebind the name.
 cfg = RuntimeConfig()
 
 
@@ -911,7 +911,7 @@ def track_usage(tokens: Dict[str, Any]) -> None:
     if not cfg.debug_log:
         return
 
-    print("=== Claude usage start ===")
+    print(f"=== {cfg.backend} usage start ===")
     print("Request:")
     print("    Input tokens       =   uncached + cache read + cache write (        1h +         5m)")
     print("    {:18d} = {:10d} + {:10d} + {:11d} ({:10d} + {:10d})".format(ttl_tokens, input_tok, cache_read, cache_creation_input, ephemeral_1h, ephemeral_5m))
@@ -933,5 +933,5 @@ def track_usage(tokens: Dict[str, Any]) -> None:
     print("    Cache cost         = {} ({})".format(fmt_usd(session["cache_net_cost_usd"]), cache_lbl(session["cache_net_cost_usd"])))
     print("    Average input cost = {} / MTok.".format(fmt_usd(session["average_input_cost_usd"]*1_000_000)))
     print("    Total cost         = {} ({} input / {} output)".format(fmt_usd(session["total_spent_usd"]), fmt_usd(session["input_cost_usd"]), fmt_usd(session["output_cost_usd"])))
-    print("=== Claude usage end ===")
+    print(f"=== {cfg.backend} usage end ===")
     print("> ", end="", flush=True)
