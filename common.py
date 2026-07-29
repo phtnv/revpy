@@ -7,7 +7,6 @@ import threading
 from flask             import abort, request
 from packaging.version import Version
 from typing            import Any, Dict, List, Optional
-from urllib.parse      import urlsplit
 
 ENABLE_VALUES  = {"1", "y", "true" , "yes", "enable" , "on" }
 DISABLE_VALUES = {"0", "n", "false", "no" , "disable", "off"}
@@ -21,25 +20,18 @@ THINK_EFFORT_ORDER  = ("low", "medium", "high", "xhigh", "max")
 MAX_TOKENS_PARAMS   = {"auto", "max_tokens", "max_completion_tokens"}
 REASONING_SUMMARIES = {"none", "auto", "concise", "detailed"}
 
-# Which wire protocol a provider speaks. This is derived from its endpoint rather than
-# configured, because there is only ever one right answer: OpenAI's own API serves
-# /responses, which covers the full feature set and is the only endpoint that returns
-# reasoning text (see v1_responses). Everyone else implements /chat/completions and not
-# /responses (see v1_chat_completions).
+# Which wire protocol a provider speaks, and the variable declaring the providers that
+# speak it. A provider is served by the module for the list it was declared in; nothing
+# is derived from its endpoint, so pointing a provider at any host that implements the
+# protocol is a matter of putting its name in the right list.
 #
-# api.openai.com is OpenAI's own host. The Azure suffix is its v1 surface, where
-# {base_url}/responses resolves the same way -- inferred from Microsoft's documented
-# layout rather than tested here, so treat it as best-effort.
-OPENAI_HOSTS         = ("api.openai.com",)
-OPENAI_HOST_SUFFIXES = (".openai.azure.com",)
-
-def openai_native_endpoint(base_url: str) -> bool:
-    """
-    Whether base_url is one of OpenAI's own API endpoints, which are served over
-    /responses. Everything else speaks /chat/completions.
-    """
-    host = (urlsplit(base_url).hostname or "").lower()
-    return host in OPENAI_HOSTS or host.endswith(OPENAI_HOST_SUFFIXES)
+# Declaration order across the three lists is the order of this dict, which is also the
+# order of the CLI model list.
+API_STYLE_VARS = {
+    "messages"  : "V1_MESSAGES_PROVIDERS",
+    "chat"      : "V1_CHAT_COMPLETIONS_PROVIDERS",
+    "responses" : "V1_RESPONSES_PROVIDERS",
+}
 
 def getenv_float(name: str, default: float) -> float:
     raw = os.getenv(name, str(default)).strip()
@@ -110,6 +102,40 @@ def deep_get(obj: Any, path: str, default: Any = None) -> Any:
 
     return cur
 
+def cost_value(costs: Dict[str, Any], key: str, default: float) -> float:
+    """
+    One price out of a <NAME>_MODEL_<FAMILY>_COST object, in USD per 1 million tokens.
+    A missing key takes the default; an explicit 0 means free and is kept as such.
+    """
+    raw = costs.get(key)
+    if raw is None:
+        return default
+    try: return float(raw)
+    except (TypeError, ValueError):
+        print(f"WARNING: cost '{key}' must be a number. Defaulting to {default}.")
+        return default
+
+
+def resolve_costs(costs: Dict[str, Any]) -> Dict[str, float]:
+    """
+    The five prices every provider and cost family resolves to, from whichever subset
+    was configured. Both cache write buckets default to cache_write, which defaults to
+    the input price -- that is what a provider charging no write fee looks like, and it
+    nets those tokens to zero in the cache report. Anthropic-style providers, the only
+    ones that let you pick a TTL, set the two buckets apart.
+    """
+    input_cost = cost_value(costs, "input", 0.0)
+    write_cost = cost_value(costs, "cache_write", input_cost)
+
+    return {
+        "input_cost"          : input_cost,
+        "output_cost"         : cost_value(costs, "output"        , 0.0),
+        "cache_read_cost"     : cost_value(costs, "cache_read"    , 0.0),
+        "cache_write_5m_cost" : cost_value(costs, "cache_write_5m", write_cost),
+        "cache_write_1h_cost" : cost_value(costs, "cache_write_1h", write_cost),
+    }
+
+
 def extract_claude_version(value: Any) -> Version:
     """
     Extracts a Claude major.minor model version from either display names like
@@ -133,137 +159,160 @@ def extract_claude_version(value: Any) -> Version:
 PREFILL_MODES = {"none", "assistant", "instruction"}
 class RuntimeConfig:
 
+    def parse_cost_families(self, prefix: str) -> List[Dict[str, Any]]:
+        """
+        Per-model cost families: <PREFIX>_MODEL_<FAMILY>_REGEX is matched (re.search)
+        against the selected model id; the first declared match wins. The costs live in
+        <PREFIX>_MODEL_<FAMILY>_COST as a json5 object, USD per 1 million tokens:
+            {input: 0.80, output: 1.60, cache_read: 0.20, cache_write: 1.00}
+        Anthropic-style providers can price the two cache TTLs apart with cache_write_5m
+        and cache_write_1h. See resolve_costs() for what a missing key falls back to.
+        Models matching no family use the provider-level costs.
+        """
+        families: List[Dict[str, Any]] = []
+        family_var_re = re.compile(rf"^{re.escape(prefix)}_MODEL_([A-Za-z0-9]+)_REGEX$")
+
+        for env_name in os.environ:
+            match = family_var_re.match(env_name)
+            if match is None:
+                continue
+            family   = match.group(1)
+            cost_var = f"{prefix}_MODEL_{family}_COST"
+
+            try:
+                pattern = re.compile(os.environ[env_name].strip())
+            except re.error as exc:
+                print(f"WARNING: {env_name} is not a valid regex ({exc}). Skipping cost family.")
+                continue
+
+            try:
+                costs = json5.loads(os.getenv(cost_var, "").strip() or "null")
+                if not isinstance(costs, dict):
+                    raise ValueError("must be a json5 object like {input: 0.8, output: 1.6, cache_read: 0.2}")
+                families.append({"name": family.lower(), "regex": pattern, **resolve_costs(costs)})
+            except Exception as exc:
+                print(f"WARNING: {cost_var}: {exc}. Skipping cost family.")
+
+        return families
+
+
+    def parse_provider(self, name: str, api: str) -> Optional[Dict[str, Any]]:
+        """
+        One provider entry, from the <NAME>_* variables. Returns None when the provider
+        cannot be used at all, which is a missing base URL and nothing else.
+
+        Required:
+            <NAME>_BASE_URL            the /v1 root, without a trailing slash
+            <NAME>_API_KEY             provider key
+        Optional:
+            <NAME>_MODELS              comma-separated model ids; skips the /models request
+            <NAME>_MODELS_REGEX        keeps only matching ids from the fetched /models list
+                                       (providers like OpenAI also serve tts/image/embedding models)
+            <NAME>_MAX_TOKENS_PARAM    'auto' (default), 'max_tokens' or 'max_completion_tokens'
+            <NAME>_REASONING_SUMMARY   none|auto|concise|detailed; /responses only
+            <NAME>_STORE               let the provider retain the response (default false);
+                                       /responses only
+            <NAME>_EXTRA_BODY          json5 object merged verbatim into every request
+                                       (the escape hatch for provider thinking/caching dialects)
+            <NAME>_INPUT_TOKEN_COST_USD, <NAME>_OUTPUT_TOKEN_COST_USD,
+            <NAME>_CACHE_READ_COST_USD, <NAME>_CACHE_WRITE_COST_USD,
+            <NAME>_CACHE_WRITE_5M_COST_USD, <NAME>_CACHE_WRITE_1H_COST_USD
+            <NAME>_MODEL_<FAMILY>_REGEX / _COST   see parse_cost_families()
+
+        The wire protocol is not among these. It is the list the name was declared in.
+        """
+        prefix = re.sub(r"[^A-Z0-9]", "_", name.upper())
+
+        base_url = os.getenv(f"{prefix}_BASE_URL", "").strip().rstrip("/")
+        if not base_url:
+            print(f"WARNING: provider '{name}' is declared in {API_STYLE_VARS[api]} but {prefix}_BASE_URL is missing. Skipping.")
+            return None
+
+        extra_body = {}
+        extra_raw  = os.getenv(f"{prefix}_EXTRA_BODY", "").strip()
+        if extra_raw:
+            try:
+                parsed = json5.loads(extra_raw)
+                if isinstance(parsed, dict) : extra_body = parsed
+                else                        : print(f"WARNING: {prefix}_EXTRA_BODY must be a JSON object. Ignoring.")
+            except Exception as exc:
+                print(f"WARNING: {prefix}_EXTRA_BODY is not valid json5 ({exc}). Ignoring.")
+
+        models_regex = None
+        models_regex_raw = os.getenv(f"{prefix}_MODELS_REGEX", "").strip()
+        if models_regex_raw:
+            try: models_regex = re.compile(models_regex_raw)
+            except re.error as exc:
+                print(f"WARNING: {prefix}_MODELS_REGEX is not a valid regex ({exc}). Ignoring.")
+
+        max_tokens_param = os.getenv(f"{prefix}_MAX_TOKENS_PARAM", "auto").strip().lower()
+        if max_tokens_param not in MAX_TOKENS_PARAMS:
+            print(f"WARNING: {prefix}_MAX_TOKENS_PARAM must be in {MAX_TOKENS_PARAMS}. Defaulting to 'auto'.")
+            max_tokens_param = "auto"
+
+        reasoning_summary = os.getenv(f"{prefix}_REASONING_SUMMARY", "auto").strip().lower()
+        if reasoning_summary not in REASONING_SUMMARIES:
+            print(f"WARNING: {prefix}_REASONING_SUMMARY must be in {REASONING_SUMMARIES}. Defaulting to 'auto'.")
+            reasoning_summary = "auto"
+
+        input_cost = getenv_float(f"{prefix}_INPUT_TOKEN_COST_USD", 0.0)
+        write_cost = getenv_float(f"{prefix}_CACHE_WRITE_COST_USD", input_cost)
+
+        return {
+            "api"                 : api,
+            "base_url"            : base_url,
+            "api_key"             : os.getenv(f"{prefix}_API_KEY", "").strip(),
+            "api_key_name"        : f"{prefix}_API_KEY",
+            "models"              : [m.strip() for m in os.getenv(f"{prefix}_MODELS", "").split(",") if m.strip()],
+            "models_regex"        : models_regex,
+            "max_tokens_param"    : max_tokens_param,
+            "reasoning_summary"   : reasoning_summary,
+            # The /responses endpoint retains responses for 30 days by default. Chat
+            # content is nobody else's business, so the proxy opts out unless asked.
+            "store"               : getenv_bool(f"{prefix}_STORE", False),
+            "extra_body"          : extra_body,
+            "cost_families"       : self.parse_cost_families(prefix),
+            "input_cost"          : input_cost,
+            "output_cost"         : getenv_float(f"{prefix}_OUTPUT_TOKEN_COST_USD"   , 0.0),
+            "cache_read_cost"     : getenv_float(f"{prefix}_CACHE_READ_COST_USD"     , 0.0),
+            "cache_write_5m_cost" : getenv_float(f"{prefix}_CACHE_WRITE_5M_COST_USD" , write_cost),
+            "cache_write_1h_cost" : getenv_float(f"{prefix}_CACHE_WRITE_1H_COST_USD" , write_cost),
+        }
+
+
     def reload_from_env(self) -> None:
         self.host = os.getenv("HOST", "127.0.0.1")
         self.port = getenv_int("PORT", 5001)
 
-        self.model = os.getenv("MODEL", "claude-sonnet-4-6")
+        # The model to start on, as a bare id or "provider/model-id". The prefixed form
+        # names its own provider and so resolves without a model list, which is what to
+        # use when a provider's /models request is unavailable (see server startup).
+        self.model = os.getenv("MODEL", "").strip()
         self.version = extract_claude_version(self.model)
         self.model_info = {}
-        # Full model record from the provider model list. Empty until a backend's
-        # apply_model runs, so capability checks (v1_messages.resolve_thinking) fail
-        # closed instead of crashing.
+        # Full model record from the provider model list. Empty until providers.apply_model
+        # runs, so capability checks (v1_messages.resolve_thinking) fail closed instead of
+        # crashing.
         self.info = {}
 
-        # Active backend: "anthropic", or the name of an OpenAI-style provider
-        # from OPENAI_PROVIDERS. Switched by selecting a model in the CLI.
-        self.backend = "anthropic"
+        # Active backend: the name of a configured provider. Empty until a model is
+        # selected, which is what binds a backend (see providers.apply_model).
+        self.backend = ""
 
-        # OpenAI-style providers (GPT, GLM, Aion, ...). Each name in OPENAI_PROVIDERS
-        # is configured through <NAME>_BASE_URL, <NAME>_API_KEY, and optionally:
-        #   <NAME>_MODELS                 comma-separated model ids; skips the /models request
-        #   <NAME>_MODELS_REGEX           keeps only matching ids from the fetched /models list
-        #                                 (providers like OpenAI also serve tts/image/embedding models)
-        #   <NAME>_MAX_TOKENS_PARAM       'auto' (default), 'max_tokens' or 'max_completion_tokens'
-        #   <NAME>_REASONING_SUMMARY      none|auto|concise|detailed; OpenAI endpoints only
-        #   <NAME>_STORE                  let the provider retain the response (default false);
-        #                                 OpenAI endpoints only
-        #   <NAME>_EXTRA_BODY             json5 object merged verbatim into every request
-        #                                 (the escape hatch for provider thinking/caching dialects)
-        #   <NAME>_INPUT_TOKEN_COST_USD, <NAME>_OUTPUT_TOKEN_COST_USD,
-        #   <NAME>_CACHE_READ_COST_USD, <NAME>_CACHE_WRITE_COST_USD
-        # The wire protocol is not among these: it follows the endpoint, since only
-        # OpenAI serves /responses. See openai_native_endpoint().
-        self.openai_providers: Dict[str, Dict[str, Any]] = {}
-        for name in [p.strip().lower() for p in os.getenv("OPENAI_PROVIDERS", "").split(",") if p.strip()]:
-            prefix = re.sub(r"[^A-Z0-9]", "_", name.upper())
-
-            extra_body = {}
-            extra_raw  = os.getenv(f"{prefix}_EXTRA_BODY", "").strip()
-            if extra_raw:
-                try:
-                    parsed = json5.loads(extra_raw)
-                    if isinstance(parsed, dict) : extra_body = parsed
-                    else                        : print(f"WARNING: {prefix}_EXTRA_BODY must be a JSON object. Ignoring.")
-                except Exception as exc:
-                    print(f"WARNING: {prefix}_EXTRA_BODY is not valid json5 ({exc}). Ignoring.")
-
-            base_url = os.getenv(f"{prefix}_BASE_URL", "").strip().rstrip("/")
-            if not base_url:
-                print(f"WARNING: provider '{name}' listed in OPENAI_PROVIDERS but {prefix}_BASE_URL is missing. Skipping.")
-                continue
-
-            # Per-model cost families: <PREFIX>_MODEL_<FAMILY>_REGEX is matched (re.search)
-            # against the selected model id; the first declared match wins. The costs live in
-            # <PREFIX>_MODEL_<FAMILY>_COST as a json5 object, USD per 1 million tokens:
-            #   {input: 0.80, output: 1.60, cache_read: 0.20, cache_write: 1.00}
-            # Missing cost keys default to 0, except cache_write which defaults to the input
-            # cost (i.e. writes are free, which is what providers without a write fee do).
-            # Models matching no family use the provider-level costs.
-            cost_families: List[Dict[str, Any]] = []
-            family_var_re = re.compile(rf"^{re.escape(prefix)}_MODEL_([A-Za-z0-9]+)_REGEX$")
-            for env_name in os.environ:
-                match = family_var_re.match(env_name)
-                if match is None:
+        # Every configured provider, keyed by name, in declaration order.
+        # See parse_provider() for what a name is configured with.
+        self.providers: Dict[str, Dict[str, Any]] = {}
+        for api, list_var in API_STYLE_VARS.items():
+            for name in [p.strip().lower() for p in os.getenv(list_var, "").split(",") if p.strip()]:
+                if name in self.providers:
+                    print(f"WARNING: provider '{name}' is declared more than once. Keeping the '{self.providers[name]['api']}' one.")
                     continue
-                family   = match.group(1)
-                cost_var = f"{prefix}_MODEL_{family}_COST"
+                provider = self.parse_provider(name, api)
+                if provider is not None:
+                    self.providers[name] = provider
 
-                try:
-                    pattern = re.compile(os.environ[env_name].strip())
-                except re.error as exc:
-                    print(f"WARNING: {env_name} is not a valid regex ({exc}). Skipping cost family.")
-                    continue
+        self.request_timeout_seconds = getenv_float("REQUEST_TIMEOUT_SECONDS", 600.0)
 
-                try:
-                    costs = json5.loads(os.getenv(cost_var, "").strip() or "null")
-                    if not isinstance(costs, dict):
-                        raise ValueError("must be a json5 object like {input: 0.8, output: 1.6, cache_read: 0.2}")
-                    input_cost = float(costs.get("input", 0.0) or 0.0)
-                    cost_families.append({
-                        "name"             : family.lower(),
-                        "regex"            : pattern,
-                        "input_cost"       : input_cost,
-                        "output_cost"      : float(costs.get("output"    , 0.0) or 0.0),
-                        "cache_read_cost"  : float(costs.get("cache_read", 0.0) or 0.0),
-                        "cache_write_cost" : float(costs.get("cache_write", input_cost) or input_cost),
-                    })
-                except Exception as exc:
-                    print(f"WARNING: {cost_var}: {exc}. Skipping cost family.")
-
-            models_regex = None
-            models_regex_raw = os.getenv(f"{prefix}_MODELS_REGEX", "").strip()
-            if models_regex_raw:
-                try: models_regex = re.compile(models_regex_raw)
-                except re.error as exc:
-                    print(f"WARNING: {prefix}_MODELS_REGEX is not a valid regex ({exc}). Ignoring.")
-
-            max_tokens_param = os.getenv(f"{prefix}_MAX_TOKENS_PARAM", "auto").strip().lower()
-            if max_tokens_param not in MAX_TOKENS_PARAMS:
-                print(f"WARNING: {prefix}_MAX_TOKENS_PARAM must be in {MAX_TOKENS_PARAMS}. Defaulting to 'auto'.")
-                max_tokens_param = "auto"
-
-            api_style = "responses" if openai_native_endpoint(base_url) else "chat"
-
-            reasoning_summary = os.getenv(f"{prefix}_REASONING_SUMMARY", "auto").strip().lower()
-            if reasoning_summary not in REASONING_SUMMARIES:
-                print(f"WARNING: {prefix}_REASONING_SUMMARY must be in {REASONING_SUMMARIES}. Defaulting to 'auto'.")
-                reasoning_summary = "auto"
-
-            input_cost = getenv_float(f"{prefix}_INPUT_TOKEN_COST_USD", 0.0)
-            self.openai_providers[name] = {
-                "base_url"         : base_url,
-                "api_key"          : os.getenv(f"{prefix}_API_KEY", "").strip(),
-                "api_key_name"     : f"{prefix}_API_KEY",
-                "models"           : [m.strip() for m in os.getenv(f"{prefix}_MODELS", "").split(",") if m.strip()],
-                "models_regex"     : models_regex,
-                "max_tokens_param" : max_tokens_param,
-                "api"              : api_style,
-                "reasoning_summary": reasoning_summary,
-                # The /responses endpoint retains responses for 30 days by default. Chat
-                # content is nobody else's business, so the proxy opts out unless asked.
-                "store"            : getenv_bool(f"{prefix}_STORE", False),
-                "extra_body"       : extra_body,
-                "cost_families"    : cost_families,
-                "input_cost"       : input_cost,
-                "output_cost"      : getenv_float(f"{prefix}_OUTPUT_TOKEN_COST_USD", 0.0),
-                "cache_read_cost"  : getenv_float(f"{prefix}_CACHE_READ_COST_USD"  , 0.0),
-                "cache_write_cost" : getenv_float(f"{prefix}_CACHE_WRITE_COST_USD" , input_cost),
-            }
-
-        self.openai_request_timeout_seconds = getenv_float("OPENAI_REQUEST_TIMEOUT_SECONDS", 600.0)
-
-        self.anthropic_api_key     = os.getenv("ANTHROPIC_API_KEY", "").strip()
         self.proxy_key             = os.getenv("PROXY_KEY", "").strip()
         self.require_proxy_key     = getenv_bool("REQUIRE_PROXY_KEY", True)
         self.allow_key_passthrough = getenv_bool("ALLOW_KEY_PASSTHROUGH", False)
@@ -304,38 +353,15 @@ class RuntimeConfig:
         # 0 disables preservation, N preserves the last N assistant messages, and inf/all preserves every assistant message.
         self.preserve_thinking_blocks = getenv_preserve_thinking_blocks("PRESERVE_THINKING_BLOCKS", "0")
 
-        # Cost tracking. Values are USD per 1 million tokens.
-        self.cost_table: Dict[str, Dict[str, float]] = {
-            "fable": {
-                "input"          : getenv_float("FABLE_INPUT_TOKEN_COST_USD"   , 10.00),
-                "output"         : getenv_float("FABLE_OUTPUT_TOKEN_COST_USD"  , 50.00),
-                "cache_write_5m" : getenv_float("FABLE_CACHE_WRITE_5M_COST_USD", 12.50),
-                "cache_write_1h" : getenv_float("FABLE_CACHE_WRITE_1H_COST_USD", 20.00),
-                "cache_read"     : getenv_float("FABLE_CACHE_READ_COST_USD"    ,  1.00),
-            },
-            "opus": {
-                "input"          : getenv_float("OPUS_INPUT_TOKEN_COST_USD"   ,  5.00),
-                "output"         : getenv_float("OPUS_OUTPUT_TOKEN_COST_USD"  , 25.00),
-                "cache_write_5m" : getenv_float("OPUS_CACHE_WRITE_5M_COST_USD",  6.25),
-                "cache_write_1h" : getenv_float("OPUS_CACHE_WRITE_1H_COST_USD", 10.00),
-                "cache_read"     : getenv_float("OPUS_CACHE_READ_COST_USD"    ,  0.50),
-            },
-            "sonnet": {
-                "input"          : getenv_float("SONNET_INPUT_TOKEN_COST_USD"   ,  3.00),
-                "output"         : getenv_float("SONNET_OUTPUT_TOKEN_COST_USD"  , 15.00),
-                "cache_write_5m" : getenv_float("SONNET_CACHE_WRITE_5M_COST_USD",  3.75),
-                "cache_write_1h" : getenv_float("SONNET_CACHE_WRITE_1H_COST_USD",  6.00),
-                "cache_read"     : getenv_float("SONNET_CACHE_READ_COST_USD"    ,  0.30),
-            },
-            "haiku": {
-                "input"          : getenv_float("HAIKU_INPUT_TOKEN_COST_USD"   ,  1.00),
-                "output"         : getenv_float("HAIKU_OUTPUT_TOKEN_COST_USD"  ,  5.00),
-                "cache_write_5m" : getenv_float("HAIKU_CACHE_WRITE_5M_COST_USD",  1.25),
-                "cache_write_1h" : getenv_float("HAIKU_CACHE_WRITE_1H_COST_USD",  2.00),
-                "cache_read"     : getenv_float("HAIKU_CACHE_READ_COST_USD"    ,  0.10),
-            }
-        }
-        self.sync_active_costs()
+        # Cost tracking. Values are USD per 1 million tokens, and are configured per
+        # provider rather than here; these are the inert values a request would be billed
+        # at before a model has been selected (see providers.apply_model).
+        self.model_cost_family    = ""
+        self.input_token_cost_usd = 0.0
+        self.output_token_cost_usd   = 0.0
+        self.cache_write_5m_cost_usd = 0.0
+        self.cache_write_1h_cost_usd = 0.0
+        self.cache_read_cost_usd     = 0.0
 
         # Prompt caching.
         # Anthropic supports automatic top-level caching and explicit block-level caching.
@@ -357,26 +383,8 @@ class RuntimeConfig:
         self.cache_anthropic_auto = getenv_bool("CACHE_ANTHROPIC_AUTO", False)
         self.cache_anthropic_ttl  = getenv_cache_ttl("CACHE_ANTHROPIC_TTL", "1h")
 
-        self.error_log_path = os.getenv("ERROR_LOG_PATH", "claude_error_log.txt")
+        self.error_log_path = os.getenv("ERROR_LOG_PATH", "revpy_error.log")
         self.model_list_timeout_seconds = getenv_float("MODEL_LIST_TIMEOUT_SECONDS", 10.0)
-
-
-    def sync_active_costs(self) -> None:
-        model_l = str(self.model or "").lower()
-        if   "haiku"  in model_l : self.model_cost_family = "haiku"
-        elif "sonnet" in model_l : self.model_cost_family = "sonnet"
-        elif "opus"   in model_l : self.model_cost_family = "opus"
-        elif "fable"  in model_l : self.model_cost_family = "fable"
-        else:
-            print(f"Unknown model family {model_l}. Using fable's (most expensive) pricing estimates.")
-            self.model_cost_family = "fable"
-
-        costs = self.cost_table[self.model_cost_family]
-        self.input_token_cost_usd    = costs["input"]
-        self.output_token_cost_usd   = costs["output"]
-        self.cache_write_5m_cost_usd = costs["cache_write_5m"]
-        self.cache_write_1h_cost_usd = costs["cache_write_1h"]
-        self.cache_read_cost_usd     = costs["cache_read"]
 
 
     def set_prefill_mode(self, mode: str) -> None:

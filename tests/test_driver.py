@@ -3,6 +3,7 @@ import contextlib
 import importlib
 import io
 import json
+import os
 import sys
 import tempfile
 
@@ -32,19 +33,26 @@ USAGE      = {
 
 sys.path.insert(0, str(ROOT))
 common      : Any = importlib.import_module("common")
+providers   : Any = importlib.import_module("providers")
 v1_messages : Any = importlib.import_module("v1_messages")
 chat_api    : Any = importlib.import_module("v1_chat_completions")
 resp_api    : Any = importlib.import_module("v1_responses")
 server      : Any = importlib.import_module("server")
 
-# The two OpenAI-style request builders, keyed by the wire protocol they speak.
+# The three request builders, keyed by the wire protocol they speak.
 BUILDERS = {
+    "messages"  : lambda prepared: v1_messages.build_body(prepared),
     "chat"      : lambda prepared: chat_api.build_body(prepared),
     "responses" : lambda prepared: resp_api.build_body(prepared),
 }
 
-# Where each endpoint carries the message list build_message_list() produces.
+# Where each OpenAI-style endpoint carries the message list build_message_list() produces.
+# The Anthropic body is shaped differently enough -- system is a field of its own, and
+# content is blocks rather than strings -- that its cases carry their own expected
+# 'system' and 'messages' instead of sharing this one.
 BUILDER_MESSAGE_KEY = {"chat": "messages", "responses": "input"}
+
+PROVIDER = "claude"
 
 
 class FakeMessages:
@@ -90,31 +98,36 @@ def make_config() -> Any:
     cfg.use_adaptive             = False
     cfg.preserve_thinking_blocks = 0
     cfg.error_log_path           = str(ROOT / "test_error_log.txt")
+    # A model is what binds a backend, so the roundtrip tests need one selected. The
+    # cases that exercise a provider replace both.
+    cfg.providers = {PROVIDER: make_provider(api="messages", api_key_name="CLAUDE_API_KEY")}
+    cfg.backend   = PROVIDER
     return cfg
 
 
 def make_provider(**overrides: Any) -> dict[str, Any]:
     """
-    A synthetic OPENAI_PROVIDERS entry, in the shape RuntimeConfig builds them.
+    A synthetic provider entry, in the shape RuntimeConfig.parse_provider builds them.
     Defaults are the ones a provider gets with only BASE_URL and API_KEY set, so a
     case only has to name what it actually exercises.
     """
     provider = {
-        "base_url"          : "https://provider.test/v1",
-        "api_key"           : "test-key",
-        "api_key_name"      : "TEST_API_KEY",
-        "models"            : [],
-        "models_regex"      : None,
-        "max_tokens_param"  : "auto",
-        "api"               : "chat",
-        "reasoning_summary" : "auto",
-        "store"             : False,
-        "extra_body"        : {},
-        "cost_families"     : [],
-        "input_cost"        : 0.0,
-        "output_cost"       : 0.0,
-        "cache_read_cost"   : 0.0,
-        "cache_write_cost"  : 0.0,
+        "api"                 : "chat",
+        "base_url"            : "https://provider.test/v1",
+        "api_key"             : "test-key",
+        "api_key_name"        : "TEST_API_KEY",
+        "models"              : [],
+        "models_regex"        : None,
+        "max_tokens_param"    : "auto",
+        "reasoning_summary"   : "auto",
+        "store"               : False,
+        "extra_body"          : {},
+        "cost_families"       : [],
+        "input_cost"          : 0.0,
+        "output_cost"         : 0.0,
+        "cache_read_cost"     : 0.0,
+        "cache_write_5m_cost" : 0.0,
+        "cache_write_1h_cost" : 0.0,
     }
     provider.update(overrides)
     return provider
@@ -132,7 +145,7 @@ def reference_from_fixture(name) -> dict[str, Any]:
         "anthropic_model"      : MODEL,
         "anthropic_max_tokens" : MAX_TOKENS,
         "anthropic_messages"   : fixture.get("expected_anthropic_messages", fixture["messages"]),
-        "openai_model"         : f"anthropic/{MODEL}",
+        "openai_model"         : f"{PROVIDER}/{MODEL}",
         "openai_created"       : CREATED,
         "openai_content"       : fixture.get("expected_openai_assistant", fixture["anthropic_response"]),
     }
@@ -263,38 +276,115 @@ def test_chat_dump_formats(name: str) -> bool:
     return passed
 
 
-WIRE_PROTOCOL_CASES = [
-    # (base_url, expected protocol)
-    ("https://api.openai.com/v1"                  , "responses"),
-    ("https://API.OpenAI.com/v1"                  , "responses"),
-    ("https://my-resource.openai.azure.com/openai/v1", "responses"),
-    ("https://api.z.ai/api/paas/v4"               , "chat"),
-    ("https://api.moonshot.ai/v1"                 , "chat"),
-    ("https://api.aionlabs.ai/v1"                 , "chat"),
-    ("https://openrouter.ai/api/v1"               , "chat"),
-    # Must key on the host, not a substring: these are not OpenAI.
-    ("https://api.openai.com.evil.test/v1"        , "chat"),
-    ("https://not-openai.example.com/v1"          , "chat"),
-]
+# The environment one config-parsing pass reads. Exercises all three lists, a name
+# declared twice, a name with no base URL, and a cost family with the two cache TTLs
+# priced apart.
+PROVIDER_ENV = {
+    "V1_MESSAGES_PROVIDERS"        : "claude",
+    "V1_CHAT_COMPLETIONS_PROVIDERS": "glm,twice,nourl",
+    "V1_RESPONSES_PROVIDERS"       : "gpt,twice",
+
+    "CLAUDE_BASE_URL"              : "https://api.anthropic.com/v1/",
+    "CLAUDE_INPUT_TOKEN_COST_USD"  : "3.00",
+    "CLAUDE_OUTPUT_TOKEN_COST_USD" : "15.00",
+    "CLAUDE_MODEL_OPUS_REGEX"      : "opus",
+    "CLAUDE_MODEL_OPUS_COST"       : "{input: 5.00, output: 25.00, cache_read: 0.50, cache_write_5m: 6.25, cache_write_1h: 10.00}",
+    "GLM_BASE_URL"                 : "https://api.z.ai/api/paas/v4",
+    "GPT_BASE_URL"                 : "https://api.openai.com/v1",
+    "TWICE_BASE_URL"               : "https://twice.test/v1",
+}
 
 
-def test_wire_protocol_derivation() -> bool:
+def parse_provider_env() -> Any:
     """
-    The wire protocol is derived from the provider endpoint rather than configured,
-    so the derivation is the only thing deciding which backend module serves a
-    provider. Anything but an OpenAI host must land on /chat/completions.
+    Reloads the config over PROVIDER_ENV, then restores the test config. Config parsing
+    reads os.environ directly, so this is the only way to exercise it.
+    """
+    for key, value in PROVIDER_ENV.items():
+        os.environ[key] = value
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            common.cfg.reload_from_env()
+            return dict(common.cfg.providers)
+    finally:
+        for key in PROVIDER_ENV:
+            os.environ.pop(key, None)
+        make_config()
+
+
+def test_provider_config_parsing() -> bool:
+    """
+    The wire protocol is the list a provider was declared in, and nothing else decides
+    which backend module serves it. This pins that mapping, the declaration order the
+    CLI numbering follows, and the two ways a declaration is rejected.
     """
     global tests_ttl
     tests_ttl += 1
-    print("Testing wire protocol derivation from base_url... ", end="")
+    print("Testing provider config parsing... ", end="")
 
-    passed = True
-    for base_url, expected in WIRE_PROTOCOL_CASES:
-        received = "responses" if common.openai_native_endpoint(base_url) else "chat"
-        if received != expected:
-            print(f"\n  {base_url}: exp={expected} rec={received}", end="")
-            passed = False
+    providers_parsed = parse_provider_env()
 
+    # Order is messages, then chat, then responses -- not the order names appear in .env.
+    expected_order = ["claude", "glm", "twice", "gpt"]
+    expected_api   = {"claude": "messages", "glm": "chat", "twice": "chat", "gpt": "responses"}
+
+    passed = check_equal(
+        {"order": expected_order, "api": expected_api},
+        {"order": list(providers_parsed), "api": {n: p["api"] for n, p in providers_parsed.items()}},
+    )
+
+    # 'nourl' has no base URL and is dropped; 'twice' keeps its first declaration (chat).
+    if "nourl" in providers_parsed:
+        print("provider without a base URL was not skipped ", end="")
+        passed = False
+
+    # A trailing slash must not survive into the request URL.
+    if providers_parsed["claude"]["base_url"] != "https://api.anthropic.com/v1":
+        print(f"base_url exp='https://api.anthropic.com/v1' rec={providers_parsed['claude']['base_url']!r} ", end="")
+        passed = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+# What a model selection resolves its five prices to.
+#   (label, model id, expected prices)
+# Every provider resolves them the same way: the first matching cost family, else the
+# provider-level prices. Both cache write buckets fall back to cache_write, which falls
+# back to the input price -- so a provider that charges no write fee nets those to zero.
+COST_CASES = [
+    ("cost family wins, TTLs priced apart", "claude-opus-4-8",
+     {"family": "claude:opus", "input": 5.00, "output": 25.00, "read": 0.50, "write_5m": 6.25, "write_1h": 10.00}),
+
+    ("no family matches, provider prices", "claude-sonnet-4-6",
+     {"family": "claude", "input": 3.00, "output": 15.00, "read": 0.00, "write_5m": 3.00, "write_1h": 3.00}),
+]
+
+
+def test_cost_resolution(case: tuple) -> bool:
+    global tests_ttl
+    tests_ttl += 1
+    label, model_id, expected = case
+    print(f"Testing cost resolution: {label}... ", end="")
+
+    providers_parsed = parse_provider_env()
+
+    cfg = make_config()
+    cfg.providers = providers_parsed
+    with contextlib.redirect_stdout(io.StringIO()):
+        providers.apply_model({"id": model_id, "provider": "claude"})
+
+    received = {
+        "family"   : cfg.model_cost_family,
+        "input"    : cfg.input_token_cost_usd,
+        "output"   : cfg.output_token_cost_usd,
+        "read"     : cfg.cache_read_cost_usd,
+        "write_5m" : cfg.cache_write_5m_cost_usd,
+        "write_1h" : cfg.cache_write_1h_cost_usd,
+    }
+
+    passed = check_equal(expected, received)
     if passed : print(f"{GREEN}PASS{RESET}")
     else      : print(f"{RED}FAIL{RESET}")
     return passed
@@ -465,9 +555,9 @@ def test_responses_stream_termination(case: tuple) -> bool:
     print(f"Testing /responses stream: {label}... ", end="")
 
     cfg = make_config()
-    cfg.backend          = "gpt"
-    cfg.model            = "gpt-5.6-sol"
-    cfg.openai_providers = {"gpt": make_provider(api="responses")}
+    cfg.backend   = "gpt"
+    cfg.model     = "gpt-5.6-sol"
+    cfg.providers = {"gpt": make_provider(api="responses")}
 
     prepared = {"messages": [{"role": "user", "content": "hi"}], "system_segments": [],
                 "system_summary_text": "", "lorebook_at_end_text": "", "max_tokens": 64}
@@ -523,7 +613,7 @@ def test_provider_request_body(inputs: dict[str, Any], case: dict[str, Any]) -> 
         cfg = make_config()
         cfg.backend          = case["backend"]
         cfg.model            = case["model"]
-        cfg.openai_providers = {case["backend"]: make_provider(**case.get("provider", {}))}
+        cfg.providers        = {case["backend"]: make_provider(api=case["builder"], **case.get("provider", {}))}
         cfg.thinking_enabled = False
         cfg.thinking_effort  = "medium"
         for key, value in case.get("cfg", {}).items():
@@ -531,7 +621,12 @@ def test_provider_request_body(inputs: dict[str, Any], case: dict[str, Any]) -> 
 
         received = BUILDERS[case["builder"]](entry["prepared"])
 
-    expected = {**case["expected"], BUILDER_MESSAGE_KEY[case["builder"]]: entry["messages"]}
+    if case["builder"] == "messages":
+        # The input's system/messages unless the case pins its own, which the cases
+        # exercising cache markers do -- those change the message shape itself.
+        expected = {**entry["anthropic"], **case["expected"]}
+    else:
+        expected = {**case["expected"], BUILDER_MESSAGE_KEY[case["builder"]]: entry["messages"]}
 
     passed = check_equal(expected, received)
     # check_equal only walks the keys it was given, so a field the builder should not
@@ -554,7 +649,10 @@ if __name__ == "__main__":
     tests_passed += test_basic_non_streaming_roundtrip("basic_with_ooc.json5")
     tests_passed += test_chat_dump_formats("dump_chat.json5")
 
-    tests_passed += test_wire_protocol_derivation()
+    tests_passed += test_provider_config_parsing()
+
+    for cost_case in COST_CASES:
+        tests_passed += test_cost_resolution(cost_case)
 
     for usage_case in USAGE_CASES:
         tests_passed += test_usage_normalization(usage_case)

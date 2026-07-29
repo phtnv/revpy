@@ -33,16 +33,22 @@ LATEST_CHAT_SNAPSHOT : Dict[str, Any] = {}
 LATEST_CHAT_LOCK                      = threading.Lock()
 
 
+# The backend module per wire protocol. All three expose the five entry points
+# dispatched through here: generate_non_stream, generate_stream, after_model_switch,
+# resolve_thinking and print_think_status. How each builds its request is its own business.
+BACKENDS = {
+    "messages"  : v1_messages,
+    "chat"      : v1_chat_completions,
+    "responses" : v1_responses,
+}
+
+
 def active_backend():
     """
-    The backend module serving requests, picked by the wire protocol the selected
-    model's provider speaks. All three expose the four entry points dispatched
-    through here: generate_non_stream, generate_stream, resolve_thinking and
-    print_think_status. How each builds its request is its own business.
+    The backend module serving requests: the one for the protocol the selected model's
+    provider was declared under (see providers.api_style).
     """
-    if cfg.backend == "anthropic":
-        return v1_messages
-    return v1_responses if providers.api_style() == "responses" else v1_chat_completions
+    return BACKENDS[providers.api_style()]
 
 
 def model_label() -> str:
@@ -51,23 +57,6 @@ def model_label() -> str:
 # Flask app
 app = Flask(__name__)
 CORS(app)
-
-def refresh_model_lists() -> None:
-    """
-    Fetches the Anthropic and OpenAI-style provider model lists in parallel.
-
-    List order is unaffected by response order: each backend fills its own list
-    (Anthropic's is always numbered first in the CLI), and the provider list
-    keeps the OPENAI_PROVIDERS declaration order (see providers.refresh_models).
-    """
-    anthropic_thread = threading.Thread(
-        target = v1_messages.refresh_models,
-        args   = (cfg.anthropic_api_key, cfg.model_list_timeout_seconds),
-    )
-    anthropic_thread.start()
-    providers.refresh_models(cfg.model_list_timeout_seconds)
-    anthropic_thread.join()
-
 
 # Runtime CLI config
 def reload_runtime_env() -> None:
@@ -86,7 +75,7 @@ def reload_runtime_env() -> None:
     cfg.host = bound_host
     cfg.port = bound_port
 
-    refresh_model_lists()
+    providers.refresh_models(cfg.model_list_timeout_seconds)
 
     print("Reloaded runtime configuration from .env.")
     print("HOST and PORT were not changed; restart the process to change bind address.")
@@ -94,44 +83,20 @@ def reload_runtime_env() -> None:
 
 def finish_model_switch(switched: bool) -> None:
     """
-    Resolves the shared thinking settings against the model that was just selected.
+    Runs the newly selected model through its backend's post-switch hook, which
+    validates the shared settings against it and reports how they land.
 
-    Neither backend does this inside its own apply_model(): the provider registry
-    serves the OpenAI-style wire modules and cannot import one to ask without a
-    cycle, so the caller owns it and both backends stay symmetric. Nothing is
-    resolved when no switch happened, which would report against a stale model.
+    providers.apply_model() does not do this itself: the registry serves all three wire
+    modules and cannot import one to ask without a cycle. Nothing runs when no switch
+    happened, which would report against a stale model.
     """
     if switched:
-        active_backend().resolve_thinking()
-
-
-def cli_print_model_list() -> None:
-    v1_messages.print_model_list()
-    providers.print_model_list(number_offset=len(v1_messages.MODELS))
-
-
-def cli_select_model(number: int) -> None:
-    anthropic_count = len(v1_messages.MODELS)
-    if number <= anthropic_count : switched = v1_messages.select_model_by_number(number)
-    else                         : switched = providers.select_model_by_number(number - anthropic_count)
-    finish_model_switch(switched)
-
-
-def cli_print_model_info(number: int) -> None:
-    anthropic_count = len(v1_messages.MODELS)
-    if number <= anthropic_count : v1_messages.print_model_info(number)
-    else                         : providers.print_model_info(number - anthropic_count)
+        active_backend().after_model_switch()
 
 
 def cli_refresh_models() -> None:
-    refresh_model_lists()
-    if cfg.backend == "anthropic":
-        switched = bool(v1_messages.find_cfg(v1_messages.MODELS))
-    else:
-        switched = providers.apply_model_by_id(f"{cfg.backend}/{cfg.model}")
-        if not switched:
-            print(f"Model {cfg.backend}/{cfg.model} is no longer in the refreshed provider list.")
-    finish_model_switch(switched)
+    providers.refresh_models(cfg.model_list_timeout_seconds)
+    finish_model_switch(providers.apply_model_by_id(f"{cfg.backend}/{cfg.model}"))
 
 
 
@@ -215,8 +180,8 @@ def admin_cli_loop() -> None:
 
         try:
             if cmd in {"c", "cache"}:
-                if cfg.backend != "anthropic":
-                    print(f"Cache markers are Anthropic-only. Backend '{cfg.backend}' has no explicit cache control (use EXTRA_BODY if the provider supports one).")
+                if providers.api_style() != "messages":
+                    print(f"Cache markers are an Anthropic-protocol feature. Backend '{cfg.backend}' has no explicit cache control (use EXTRA_BODY if the provider supports one).")
                     continue
                 if parts_l < 2:
                     cfg.print_cache_status()
@@ -347,7 +312,7 @@ def admin_cli_loop() -> None:
 
             if cmd in {"m", "model", "models"}:
                 if parts_l < 2:
-                    cli_print_model_list()
+                    providers.print_model_list()
                     continue
 
                 arg1 = parts[1].lower()
@@ -355,7 +320,7 @@ def admin_cli_loop() -> None:
                     try: model_id = int(arg1)
                     except Exception: pass
                     else:
-                        cli_select_model(model_id)
+                        finish_model_switch(providers.select_model_by_number(model_id))
                         continue
                     if arg1 in {"i", "info"}:
                         print(json.dumps(cfg.model_info, indent=2, ensure_ascii=False, default=str))
@@ -374,7 +339,7 @@ def admin_cli_loop() -> None:
                     try: model_id = int(arg2)
                     except Exception: pass
                     else:
-                        cli_print_model_info(model_id)
+                        providers.print_model_info(model_id)
                         continue
                 print(CLI_CMD_MODEL_INFO)
                 continue
@@ -1223,16 +1188,43 @@ def baseurl()       : return handle_chat_completion()
 def v1_baseurl()    : return handle_chat_completion()
 
 
+def print_provider_table() -> None:
+    """
+    What the three provider lists resolved to. A provider declared under the wrong
+    protocol is accepted here and only fails at the first request, so the resolved
+    table is worth seeing before that.
+    """
+    print("Configured providers:")
+    for name, provider in cfg.providers.items():
+        print(f"  {name:<10}  {provider['api']:<10}  {provider['base_url']}")
+    print()
+
+
 if __name__ == "__main__":
     load_dotenv()
     cfg.reload_from_env()
-    refresh_model_lists()
-    # MODEL may name either an Anthropic model or a provider model ("glm-4.7" or "glm/glm-4.7").
-    finish_model_switch(
-        providers.apply_model_by_id(cfg.model) or bool(v1_messages.find_cfg(v1_messages.MODELS))
-    )
 
-    print("Starting Claude proxy")
+    if not cfg.providers:
+        print("No providers are configured.")
+        print("Declare at least one in V1_MESSAGES_PROVIDERS, V1_CHAT_COMPLETIONS_PROVIDERS or")
+        print("V1_RESPONSES_PROVIDERS in .env, then configure it through its <NAME>_* variables.")
+        print("See env_example.ini for a working configuration.")
+        raise SystemExit(1)
+
+    print_provider_table()
+    providers.refresh_models(cfg.model_list_timeout_seconds)
+
+    # MODEL is a bare id or "provider/model-id". The prefixed form resolves without a
+    # model list, which is the only thing that still works when a provider's /models
+    # request failed -- so it is the form worth configuring.
+    if not providers.apply_model_by_id(cfg.model):
+        print()
+        print(f"MODEL '{cfg.model}' matches no model of any configured provider.")
+        print("Set MODEL=provider/model-id in .env, using one of the providers listed above.")
+        raise SystemExit(1)
+    finish_model_switch(True)
+
+    print("Starting proxy")
     print(f"Local URL: http://{cfg.host}:{cfg.port}")
     print(f"Chat completions: http://{cfg.host}:{cfg.port}/chat/completions")
     print("Cloudflare Tunnel service URL should point to this local address:")
@@ -1244,8 +1236,9 @@ if __name__ == "__main__":
         print("Set PROXY_KEY in .env before exposing this through Cloudflare Tunnel.")
         print()
 
-    if not cfg.anthropic_api_key and not cfg.allow_key_passthrough:
-        print("WARNING: ANTHROPIC_API_KEY is missing and ALLOW_KEY_PASSTHROUGH=false.")
+    if not cfg.providers[cfg.backend]["api_key"] and not cfg.allow_key_passthrough:
+        key_name = cfg.providers[cfg.backend]["api_key_name"]
+        print(f"WARNING: {key_name} is missing and ALLOW_KEY_PASSTHROUGH=false.")
         print("Requests will fail until you configure one of these modes.")
         print()
 

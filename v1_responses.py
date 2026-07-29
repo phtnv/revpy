@@ -3,9 +3,10 @@ The /responses backend: OpenAI's own endpoint, and the only one that returns the
 model's reasoning. Ask for a summary and the response carries reasoning items whose
 text the proxy wraps in a <think> block, which /chat/completions cannot do at all.
 
-This is the only path to OpenAI in this proxy, so everything here can assume OpenAI's
-catalogue and OpenAI's rules -- one effort ladder per model rather than one per model
-per endpoint. Other providers speak /chat/completions (see v1_chat_completions).
+Everything here assumes OpenAI's catalogue and OpenAI's rules -- one effort ladder per
+model rather than one per model per endpoint -- since OpenAI is the only vendor serving
+this protocol. A model it does not recognize simply gets no reasoning parameter, and
+<NAME>_EXTRA_BODY is the escape hatch for a gateway with its own dialect.
 """
 
 import httpx
@@ -119,8 +120,7 @@ def note_summary_blocked(exc: Exception) -> bool:
     return True
 
 
-def reasoning_param(model_id: str, thinking_enabled: bool, thinking_effort: str,
-                    summary: str) -> Optional[Dict[str, Any]]:
+def reasoning_param(model_id: str, thinking_enabled: bool, thinking_effort: str, summary: str) -> Optional[Dict[str, Any]]:
     """
     The 'reasoning' object: the effort plus, when thinking is on, the summary detail
     level that makes the model's reasoning visible at all. Returns None for models
@@ -166,6 +166,15 @@ def resolve_thinking() -> None:
         return
 
     print(f"Thinking passthrough: enabled with effort '{effort}' (from '{cfg.thinking_effort}').")
+
+
+def after_model_switch() -> None:
+    """
+    Post-switch hook for this backend (v1_messages and v1_chat_completions have their
+    own). There is nothing to validate against the model here, so this only reports how
+    the thinking settings land on it.
+    """
+    resolve_thinking()
 
 
 def print_think_status() -> None:
@@ -214,7 +223,7 @@ def build_body(prepared: Dict[str, Any]) -> Dict[str, Any]:
     Note the model decides whether to reason: on adaptive models an easy turn can
     come back with no reasoning at all, and then there is no summary to show.
     """
-    provider = cfg.openai_providers[cfg.backend]
+    provider = cfg.providers[cfg.backend]
 
     body: Dict[str, Any] = {
         "model"             : cfg.model,
@@ -226,8 +235,7 @@ def build_body(prepared: Dict[str, Any]) -> Dict[str, Any]:
 
     apply_sampling(body)
 
-    reasoning = reasoning_param(cfg.model, cfg.thinking_enabled, cfg.thinking_effort,
-                                provider["reasoning_summary"])
+    reasoning = reasoning_param(cfg.model, cfg.thinking_enabled, cfg.thinking_effort, provider["reasoning_summary"])
     if reasoning is not None:
         body["reasoning"] = reasoning
 
@@ -310,8 +318,7 @@ def truncated_stream_message(text_chars: int, reasoning_chars: int) -> str:
 def output_text(data: Dict[str, Any]) -> Tuple[str, str]:
     """
     Pulls (reply text, reasoning text) out of a non-streaming response body.
-    Multiple summary parts are joined with a blank line, the same way the streaming
-    path separates them.
+    Multiple summary parts are joined with a blank line, the same way the streaming path separates them.
     """
     text_parts      : List[str] = []
     reasoning_parts : List[str] = []
@@ -333,10 +340,9 @@ def output_text(data: Dict[str, Any]) -> Tuple[str, str]:
 
 def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Runs one non-streaming /responses request.
-    Same result shape as v1_messages.generate_non_stream.
+    Runs one non-streaming /responses request. Same result shape as v1_messages.generate_non_stream.
     """
-    provider = cfg.openai_providers[cfg.backend]
+    provider = cfg.providers[cfg.backend]
 
     def send() -> Any:
         body = build_body(prepared)
@@ -362,8 +368,8 @@ def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
     counts = parse_usage(data.get("usage"))
     print_usage(counts)
 
-    # A failed response still arrives as HTTP 200 with the reason in the body. Without
-    # this it would be relayed as an ordinary reply, which is usually an empty one.
+    # A failed response still arrives as HTTP 200 with the reason in the body.
+    # Without this it would be relayed as an ordinary reply, which is usually an empty one.
     if str(data.get("status") or "") == "failed":
         message = deep_get(data, "error.message") or "the model failed to produce a response."
         raise ProviderError(502, {"error": {"message": str(message)}}, f"{cfg.backend}: {message}")
@@ -391,7 +397,7 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
     off one message, this is a typed event stream: reasoning summary text and reply
     text arrive as separate event types, which is exactly the split the proxy needs.
     """
-    provider = cfg.openai_providers[cfg.backend]
+    provider = cfg.providers[cfg.backend]
 
     response_parts  : List[str] = []
     reasoning_parts : List[str] = []
@@ -399,8 +405,7 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
     message_id    = ""
     usage         = None
 
-    # Two attempts at most: an unverified org rejects the summary request before any
-    # event is streamed, and note_summary_blocked drops it so the retry succeeds.
+    # Two attempts at most: an unverified org rejects the summary request before any event is streamed, and note_summary_blocked drops it so the retry succeeds.
     for attempt in (0, 1):
         body = build_body(prepared)
         body["stream"] = True
@@ -473,10 +478,7 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
                             response_parts.append(delta)
                             yield ("text", delta)
 
-                # Running out of body without a terminal event means the connection was
-                # cut mid-response. Falling through here would report a clean stop with
-                # an empty message and zero usage -- a silent failure that looks to the
-                # client exactly like the model choosing to say nothing.
+                # Running out of body without a terminal event means the connection was cut mid-response.
                 if not stream_completed:
                     raise ProviderError(502, {"error": {"message": truncated_stream_message(
                         len("".join(response_parts)), len("".join(reasoning_parts)))}},

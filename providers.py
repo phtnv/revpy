@@ -1,14 +1,15 @@
 """
-Shared plumbing for the OpenAI-style backends.
+The provider registry, shared by all three backends.
 
-Everything here is common to both OpenAI-style wire protocols -- /chat/completions
-and /responses -- and belongs to neither: the provider registry and its model list,
-the HTTP transport, the request message list, and the usage normalization the cost
-tracker consumes. The wire modules import from here; this module imports from none
-of them, so a provider can never depend on the endpoint that happens to be selected.
+Everything here belongs to no single wire protocol: the registry and its aggregated
+model list, model selection and pricing, the HTTP transport, and the request message
+list the two OpenAI-style modules build from. The wire modules import from here; this
+module imports from none of them, so a provider can never depend on the endpoint that
+happens to be selected.
 
-Anthropic does not pass through here at all; it speaks its own protocol with its own
-SDK and keeps its own model list.
+The OpenAI-style modules use everything here. The Anthropic one keeps its own transport
+(it speaks its protocol through the Anthropic SDK) and its own message formatting, but
+is registered, listed, selected and priced through this module like any other provider.
 """
 
 import httpx
@@ -24,6 +25,7 @@ from common import (
     THINK_EFFORT_ORDER,
     append_prefill_instruction_to_last_user_message,
     cfg,
+    extract_claude_version,
     resolve_api_key,
 )
 
@@ -64,16 +66,18 @@ def is_openai_model(model_id: str) -> bool:
 
 def api_style(backend: str = "") -> str:
     """
-    Which wire protocol the active (or named) provider speaks: 'chat' or 'responses'.
-    This is what picks the backend module (see server.active_backend). It is derived
-    from the provider's endpoint when the config is parsed, not configured -- only
-    OpenAI serves /responses (see common.openai_native_endpoint).
+    Which wire protocol the active (or named) provider speaks: 'messages', 'chat' or
+    'responses'. This is what picks the backend module (see server.active_backend), and
+    it is the list the provider was declared in -- nothing about it is guessed.
 
-    Falls back to 'chat' for the Anthropic backend and unknown provider names, so
-    callers can ask about any backend without guarding.
+    Raises for a name that is not configured. There is no safe default to fall back on:
+    silently answering 'chat' would route the request to the wrong protocol.
     """
-    provider = cfg.openai_providers.get(backend or cfg.backend) or {}
-    return provider.get("api", "chat")
+    name     = backend or cfg.backend
+    provider = cfg.providers.get(name)
+    if provider is None:
+        raise KeyError(f"No provider named '{name}' is configured.")
+    return provider["api"]
 
 
 # Aggregated model list across every configured OpenAI-style provider.
@@ -124,10 +128,11 @@ def fetch_provider_models(name: str, provider: Dict[str, Any], timeout_s: float)
     """
     Fetches one provider's /models list. Runs in a worker thread during refresh;
     failures raise and are reported by the caller.
+
+    Anthropic's /models answers the same {"data": [...]} shape as the OpenAI-style
+    ones, so only the auth header differs (see auth_headers).
     """
-    headers = {}
-    if provider["api_key"]:
-        headers["Authorization"] = f"Bearer {provider['api_key']}"
+    headers = auth_headers(provider, provider["api_key"]) if provider["api_key"] else {}
 
     response = httpx.get(f"{provider['base_url']}/models", headers=headers, timeout=timeout_s)
     if response.status_code != 200:
@@ -161,19 +166,18 @@ def refresh_models(timeout_s: float) -> None:
 
     Providers with a <NAME>_MODELS override skip the /models request entirely.
     A failing provider is skipped with a warning; it does not block the others.
-    The requests run in parallel, but results are collected in OPENAI_PROVIDERS
-    declaration order, so the aggregated list (and the CLI numbering) does not
-    depend on response order.
+    The requests run in parallel, but results are collected in declaration order,
+    so the aggregated list (and the CLI numbering) does not depend on response order.
     """
     global MODELS
 
     models: List[Dict[str, Any]] = []
 
-    if cfg.openai_providers:
-        with ThreadPoolExecutor(max_workers=len(cfg.openai_providers)) as pool:
+    if cfg.providers:
+        with ThreadPoolExecutor(max_workers=len(cfg.providers)) as pool:
             fetches = [
                 (name, provider, None if provider["models"] else pool.submit(fetch_provider_models, name, provider, timeout_s))
-                for name, provider in cfg.openai_providers.items()
+                for name, provider in cfg.providers.items()
             ]
 
             for name, provider, future in fetches:
@@ -192,35 +196,43 @@ def refresh_models(timeout_s: float) -> None:
         MODELS = models
 
 
-def print_model_list(number_offset: int = 0) -> None:
+def print_model_list() -> None:
     """
-    Prints the aggregated provider model list, numbered after the Anthropic list.
+    Prints the aggregated model list of every configured provider.
     """
     with MODEL_LOCK:
         models = list(MODELS)
     if not models:
-        if cfg.openai_providers:
-            print("No OpenAI-style provider models available.")
+        print_no_models_available()
         return
 
-    number_width = len(str(number_offset + len(models)))
+    number_width = len(str(len(models)))
 
-    for index, entry in enumerate(models, start=number_offset + 1):
+    for index, entry in enumerate(models, start=1):
         selected    = (cfg.backend == entry["provider"]) and (cfg.model == entry["id"])
         number      = str(index).rjust(number_width)
         number_cell = f"[{number}]" if selected else f" {number} "
 
-        print(f"{number_cell}  {entry['id']:<42}  {entry['provider']}")
+        # Anthropic's model list carries a display name; the OpenAI-style ones do not.
+        display_name = str(entry.get("display_name") or "")
+        suffix       = f"  {display_name}" if display_name else ""
+
+        print(f"{number_cell}  {entry['id']:<42}  {entry['provider']:<10}{suffix}".rstrip())
+
+
+def print_no_models_available() -> None:
+    if cfg.providers : print("No provider returned a model list. Use 'model refresh' to try again.")
+    else             : print("No providers are configured.")
 
 
 def select_model_by_number(index: int) -> bool:
     """
-    Selects a provider model by its number in the aggregated list. Returns False
-    when nothing was selected, so the caller knows not to re-resolve thinking.
+    Selects a model by its number in the aggregated list. Returns False when nothing
+    was selected, so the caller knows not to run the post-switch hook.
     """
     with MODEL_LOCK:
         if not MODELS:
-            print("No OpenAI-style provider models available.")
+            print_no_models_available()
             return False
         if index < 1 or index > len(MODELS):
             print(f"Model number out of range [1:{len(MODELS)}].")
@@ -233,7 +245,7 @@ def select_model_by_number(index: int) -> bool:
 def print_model_info(index: int) -> None:
     with MODEL_LOCK:
         if not MODELS:
-            print("No OpenAI-style provider models available.")
+            print_no_models_available()
             return
         if index < 1 or index > len(MODELS):
             print(f"Model number out of range. Use 1 through {len(MODELS)}.")
@@ -245,20 +257,27 @@ def print_model_info(index: int) -> None:
 
 def apply_model(entry: Dict[str, Any]) -> None:
     """
-    Points cfg at a provider model and its costs.
+    Points cfg at a model, its provider and its costs. This is what binds the active
+    backend: the provider decides the wire protocol, and so the module serving requests.
 
-    Thinking is deliberately not resolved here: which module owns that depends on
-    the wire protocol the provider speaks, and this module must not import them.
-    The caller resolves it once the switch is done (see server.finish_model_switch).
+    Nothing model-specific is resolved here -- thinking and prefill depend on the wire
+    protocol, and this module must not import the backends. The caller runs the backend's
+    own hook once the switch is done (see server.finish_model_switch).
     """
-    provider = cfg.openai_providers[entry["provider"]]
+    provider = cfg.providers[entry["provider"]]
 
     print(f"=== Switching to {entry['provider']}/{entry['id']} ===")
     cfg.backend    = entry["provider"]
     cfg.model      = entry["id"]
     cfg.info       = dict(entry)
     cfg.model_info = dict(entry)
-    cfg.version    = Version("0.0")
+
+    # Only the Anthropic backend reads the version (prefill and system-message rules
+    # turn on it), but extracting it for everyone is simpler than asking who is asking.
+    version = extract_claude_version(entry.get("display_name") or "")
+    if version == Version("0.0"):
+        version = extract_claude_version(entry["id"])
+    cfg.version = version
 
     # Per-model cost family when one matches, provider-level costs otherwise.
     cost_source = provider
@@ -270,22 +289,27 @@ def apply_model(entry: Dict[str, Any]) -> None:
             break
 
     print(f"Using cost family '{cost_family}'.")
-    cfg.model_cost_family     = cost_family
-    cfg.input_token_cost_usd  = cost_source["input_cost"]
-    cfg.output_token_cost_usd = cost_source["output_cost"]
-    cfg.cache_read_cost_usd   = cost_source["cache_read_cost"]
-    # OpenAI-style providers cache automatically, with a single rate and no TTL choice,
-    # so both write buckets get the same price. It defaults to the input cost, which
-    # nets stray write tokens to zero for the providers that do not charge for writes.
-    cfg.cache_write_5m_cost_usd = cost_source["cache_write_cost"]
-    cfg.cache_write_1h_cost_usd = cost_source["cache_write_cost"]
+    cfg.model_cost_family       = cost_family
+    cfg.input_token_cost_usd    = cost_source["input_cost"]
+    cfg.output_token_cost_usd   = cost_source["output_cost"]
+    cfg.cache_read_cost_usd     = cost_source["cache_read_cost"]
+    cfg.cache_write_5m_cost_usd = cost_source["cache_write_5m_cost"]
+    cfg.cache_write_1h_cost_usd = cost_source["cache_write_1h_cost"]
+
+    if not cost_source["input_cost"] and not cost_source["output_cost"]:
+        print(f"WARNING: no prices are configured for '{cost_family}'. This model will be reported as free.")
+
     print(f"=== Switching to {entry['provider']}/{entry['id']} complete ===")
 
 
 def apply_model_by_id(model_id: str) -> bool:
     """
-    Applies a provider model matching either "model-id" or "provider/model-id".
-    Returns False quietly when nothing matches (the caller falls back to Anthropic).
+    Applies the model matching either "model-id" or "provider/model-id" in the fetched
+    list. Returns False quietly when nothing matches, so the caller can report it.
+
+    The prefixed form names its own provider, so it is applied even when it is not in
+    the list -- which is the case whenever a provider's /models request failed, and the
+    reason MODEL=provider/model-id is the form worth configuring.
     """
     with MODEL_LOCK:
         models = list(MODELS)
@@ -294,16 +318,34 @@ def apply_model_by_id(model_id: str) -> bool:
         if model_id in (entry["id"], f"{entry['provider']}/{entry['id']}"):
             apply_model(entry)
             return True
+
+    name, separator, bare_id = model_id.partition("/")
+    if separator and bare_id and name in cfg.providers:
+        print(f"Model '{model_id}' is not in the model list; taking it as configured.")
+        apply_model({"id": bare_id, "provider": name})
+        return True
+
     return False
 
 
-def request_headers(provider: Dict[str, Any]) -> Dict[str, str]:
-    key = resolve_api_key(provider["api_key"], provider["api_key_name"])
+# Anthropic authenticates with its own header rather than a bearer token, and requires
+# the API version on every request. The SDK sends both itself; this is for the requests
+# that do not go through it (the model list).
+ANTHROPIC_VERSION = "2023-06-01"
+
+
+def auth_headers(provider: Dict[str, Any], key: str) -> Dict[str, str]:
+    if provider["api"] == "messages":
+        return {"x-api-key": key, "anthropic-version": ANTHROPIC_VERSION}
     return {"Authorization": f"Bearer {key}"}
 
 
+def request_headers(provider: Dict[str, Any]) -> Dict[str, str]:
+    return auth_headers(provider, resolve_api_key(provider["api_key"], provider["api_key_name"]))
+
+
 def request_timeout() -> httpx.Timeout:
-    return httpx.Timeout(cfg.openai_request_timeout_seconds, connect=10.0)
+    return httpx.Timeout(cfg.request_timeout_seconds, connect=10.0)
 
 
 def build_message_list(prepared: Dict[str, Any]) -> List[Dict[str, Any]]:

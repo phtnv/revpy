@@ -1,5 +1,5 @@
 {
-    // Golden request bodies for the OpenAI-style backends.
+    // Golden request bodies for all three backends.
     //
     // These pin the exact dict each backend's build_body() produces, so a change to
     // the request builders has to be deliberate: every body here must come out
@@ -7,13 +7,15 @@
     // No network is involved; only the request builders run.
     //
     // 'inputs' holds prepared chat requests (what server.prepare_chat_request returns)
-    // together with the message list build_message_list() must produce from them. The
-    // two endpoints carry that list under different keys -- 'messages' on chat,
+    // together with the request each backend must build from them. The two OpenAI-style
+    // endpoints share one message list under different keys -- 'messages' on chat,
     // 'input' on responses -- so the test injects it under the right one rather than
-    // repeating it in every expected body.
+    // repeating it in every expected body. The Anthropic body is shaped differently
+    // enough to get its own 'anthropic' entry, which a case may override.
     //
-    // In a case, 'provider' overrides the defaults in make_provider() and 'cfg'
-    // overrides the test config.
+    // A case's 'builder' picks both the backend module and the wire protocol its
+    // provider is declared under. 'provider' overrides the defaults in make_provider()
+    // and 'cfg' overrides the test config.
 
     inputs: {
         basic: {
@@ -34,6 +36,17 @@
                 { role: "assistant", content: "Hi there." },
                 { role: "user"     , content: "Continue." },
             ],
+            anthropic: {
+                system: [
+                    { type: "text", text: "Core definitions." },
+                    { type: "text", text: "Advanced prompt."  },
+                ],
+                messages: [
+                    { role: "user"     , content: "Hello."    },
+                    { role: "assistant", content: "Hi there." },
+                    { role: "user"     , content: "Continue." },
+                ],
+            },
         },
 
         // Exercises the rest of build_message_list(): blank system segments are dropped,
@@ -56,10 +69,128 @@
                 { role: "assistant", content: "Hi there." },
                 { role: "system"   , content: "<lorebook>Entry.</lorebook>" },
             ],
+            // The Anthropic body handles the same three the other way round: every system
+            // segment stays its own block (blank ones included, unlike the OpenAI-style
+            // join), the summary becomes a trailing block, and the moved lorebook is
+            // appended to the last user message as an OOC update -- which is what a model
+            // below 4.8 gets, since those take no mid-conversation system message.
+            anthropic: {
+                system: [
+                    { type: "text", text: "Core definitions."     },
+                    { type: "text", text: "   "                   },
+                    { type: "text", text: "Advanced prompt."      },
+                    { type: "text", text: "Previously: they met." },
+                ],
+                messages: [
+                    { role: "user"     , content: "Hello.\n\n<OOC>\nGameMaster lore update:\n\n<lorebook>Entry.</lorebook>\n</OOC>" },
+                    { role: "assistant", content: "Hi there." },
+                ],
+            },
         },
     },
 
     cases: [
+        {
+            name    : "claude messages: plain body",
+            builder : "messages",
+            backend : "claude",
+            model   : "claude-test-model",
+            input   : "basic",
+            expected: {
+                model      : "claude-test-model",
+                max_tokens : 256,
+            },
+        },
+
+        {
+            // The lorebook relocation and the summary block, plus sampling. top_k is an
+            // Anthropic-only parameter with no equivalent on the other two endpoints.
+            name    : "claude messages: moved lorebook + sampling",
+            builder : "messages",
+            backend : "claude",
+            model   : "claude-test-model",
+            input   : "full",
+            cfg     : {
+                send_temperature : true,
+                temperature      : 0.7,
+                send_top_p       : true,
+                top_p            : 0.99,
+                send_top_k       : true,
+                top_k            : 75,
+            },
+            expected: {
+                model       : "claude-test-model",
+                max_tokens  : 512,
+                temperature : 0.7,
+                top_p       : 0.99,
+                top_k       : 75,
+            },
+        },
+
+        {
+            // Adaptive thinking sends the effort in output_config rather than a budget.
+            // EXTRA_BODY cannot be merged into an SDK call, so it rides along as its own
+            // keyword argument and the SDK forwards it.
+            name    : "claude messages: adaptive thinking + EXTRA_BODY",
+            builder : "messages",
+            backend : "claude",
+            model   : "claude-test-model",
+            input   : "basic",
+            provider: {
+                extra_body: { custom_field: 1 },
+            },
+            cfg     : {
+                thinking_enabled : true,
+                use_adaptive     : true,
+                thinking_effort  : "high",
+            },
+            expected: {
+                model         : "claude-test-model",
+                max_tokens    : 256,
+                thinking      : { type: "adaptive", display: "summarized" },
+                output_config : { effort: "high" },
+                extra_body    : { custom_field: 1 },
+            },
+        },
+
+        {
+            // Budget thinking, and the explicit cache markers no other backend has: one
+            // per system block, one at the first message and one at the third from end.
+            name    : "claude messages: budget thinking + cache markers",
+            builder : "messages",
+            backend : "claude",
+            model   : "claude-test-model",
+            input   : "basic",
+            cfg     : {
+                thinking_enabled : true,
+                use_adaptive     : false,
+                thinking_budget  : 2048,
+                cache_en         : true,
+                cache_system     : true,
+                cache_system_ttl : "1h",
+                cache_manual_msg : 1,
+                cache_manual_ttl : "1h",
+                cache_auto_msg   : 3,
+                cache_auto_ttl   : "5m",
+            },
+            expected: {
+                model      : "claude-test-model",
+                max_tokens : 256,
+                thinking   : { type: "enabled", budget_tokens: 2048 },
+                system     : [
+                    { type: "text", text: "Core definitions.", cache_control: { type: "ephemeral", ttl: "1h" } },
+                    { type: "text", text: "Advanced prompt." , cache_control: { type: "ephemeral", ttl: "1h" } },
+                ],
+                messages   : [
+                    // The manual marker lands on the first message, the auto marker three
+                    // from the end -- the same message here, and the later write wins.
+                    { role: "user"     , content: [{ type: "text", text: "Hello.", cache_control: { type: "ephemeral" } }] },
+                    { role: "assistant", content: "Hi there." },
+                    { role: "user"     , content: "Continue." },
+                ],
+            },
+        },
+
         {
             name    : "glm-5.2 chat: thinking dialect + sampling",
             builder : "chat",
@@ -152,9 +283,6 @@
             backend : "gpt",
             model   : "gpt-5.6",
             input   : "basic",
-            provider: {
-                api: "responses",
-            },
             cfg     : {
                 thinking_enabled : true,
                 thinking_effort  : "max",
@@ -180,7 +308,6 @@
             model   : "gpt-5.1",
             input   : "basic",
             provider: {
-                api   : "responses",
                 store : true,
             },
             cfg     : {
@@ -204,7 +331,6 @@
             model   : "o3",
             input   : "basic",
             provider: {
-                api               : "responses",
                 reasoning_summary : "none",
             },
             cfg     : {

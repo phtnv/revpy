@@ -1,8 +1,16 @@
+"""
+The /v1/messages backend: Anthropic's own protocol, spoken through the Anthropic SDK.
+
+This is where the proxy's Anthropic-only features live -- explicit cache markers with
+a TTL each, signed thinking-block preservation, and assistant prefill. None of them
+have an equivalent on the other two endpoints, so nothing here is shared with them.
+Providers are registered, listed, selected and priced in providers.py like any other.
+"""
+
 import anthropic
 import base64
 import json
 import re
-import threading
 import time
 
 from packaging.version import Version
@@ -14,9 +22,6 @@ from common import (
     append_text_to_content,
     cfg,
     deep_get,
-    error_body,
-    error_message,
-    extract_claude_version,
     print_payload,
     print_usage,
     resolve_api_key,
@@ -25,165 +30,14 @@ from common import (
 )
 
 
-ANTHROPIC_TIMEOUT_ERROR                      = getattr(anthropic, "APITimeoutError", TimeoutError)
-MODELS      : List[Dict[str, Any]] = []
-MODEL_LIST_LAST_ERROR : Optional[str]        = None
-MODEL_LIST_LAST_TIMEOUT                      = False
-MODEL_LOCK                                   = threading.Lock()
-
-
-def anthropic_object_to_dict(obj: Any) -> Dict[str, Any]:
-    """
-    Converts Anthropic SDK model objects into JSON-printable dictionaries.
-    """
-    if isinstance(obj, dict)      : return dict(obj)
-    if hasattr(obj, "model_dump") : return obj.model_dump(mode="json")
-    if hasattr(obj, "dict")       : return obj.dict()
-
-    if hasattr(obj, "__dict__"):
-        return {
-            key: value
-            for key, value in vars(obj).items()
-            if not key.startswith("_")
-        }
-
-    return {"value": str(obj)}
-
-
-def model_id_from_info(model_info: Dict[str, Any]) -> str:
-    return str(model_info.get("id") or model_info.get("model") or "").strip()
-
-
-def refresh_models(key: str, timeout_s: float) -> bool:
-    """
-    Fetches the available Anthropic models and stores them for CLI use.
-    """
-    global MODELS, MODEL_LIST_LAST_ERROR, MODEL_LIST_LAST_TIMEOUT
-
-    try:
-        if not key: raise RuntimeError("ANTHROPIC_API_KEY is not configured; model list cannot be retrieved at startup.")
-
-        client = anthropic.Anthropic(api_key=key)
-        page   = client.models.list(limit=100, timeout=timeout_s)
-
-        raw_models = getattr(page, "data", None)
-        if raw_models is None:
-            raw_models = list(page)
-
-        models = [anthropic_object_to_dict(model) for model in raw_models]
-
-        with MODEL_LOCK:
-            MODELS        = models
-            MODEL_LIST_LAST_ERROR   = None
-            MODEL_LIST_LAST_TIMEOUT = False
-
-        if models : print(f"Retrieved {len(models)} Anthropic model(s).")
-        else      : print(f"Anthropic returned an empty model list.")
-
-        return True
-
-    except (ANTHROPIC_TIMEOUT_ERROR, TimeoutError) as exc:
-        with MODEL_LOCK:
-            MODELS        = []
-            MODEL_LIST_LAST_ERROR   = None
-            MODEL_LIST_LAST_TIMEOUT = True
-        print("WARNING: Could not retrieve a model list from Anthropic. Timeout.")
-        return False
-
-    except Exception as exc:
-        anthropic_exception_msg : str = error_message(error_body(exc), str(exc) or exc.__class__.__name__)
-        with MODEL_LOCK:
-            MODELS        = []
-            MODEL_LIST_LAST_ERROR   = anthropic_exception_msg
-            MODEL_LIST_LAST_TIMEOUT = False
-        print(f"WARNING: Could not retrieve a model list from Anthropic. {anthropic_exception_msg}.")
-        return False
-
-
-def print_no_model_list_available() -> None:
-    print("No Anthropic model list is available.")
-
-    with MODEL_LOCK:
-        last_timeout = MODEL_LIST_LAST_TIMEOUT
-        last_error   = MODEL_LIST_LAST_ERROR
-
-    if   last_timeout : print("Last retrieval failed: timeout")
-    elif last_error   : print(f"Last retrieval failed: error: {last_error}")
-
-
-def print_model_list() -> None:
-    with MODEL_LOCK:
-        models            = list(MODELS)
-        selected_model_id = cfg.model
-    if not models:
-        print_no_model_list_available()
-        return
-
-    number_width = len(str(len(models)))
-
-    for index, model_info in enumerate(models, start=1):
-        model_id     = model_id_from_info(model_info)
-        display_name = str(model_info.get("display_name") or model_info.get("name") or "")
-        created_at   = str(model_info.get("created_at") or "")
-
-        number      = str(index).rjust(number_width)
-        number_cell = f"[{number}]" if model_id == selected_model_id else f" {number} "
-
-        extra_parts = []
-        if display_name : extra_parts.append(display_name)
-        if created_at   : extra_parts.append(created_at)
-
-        extra  = "  ".join(extra_parts)
-        suffix = f"  {extra}" if extra else ""
-
-        print(f"{number_cell}  {model_id:<42}{suffix}")
-
-
-def select_model_by_number(index: int) -> bool:
-    """
-    Selects an Anthropic model by its number in the CLI list. Returns False when
-    nothing was selected, so the caller knows not to re-resolve thinking.
-    """
-    with MODEL_LOCK:
-        if not MODELS:
-            print_no_model_list_available()
-            return False
-        if index < 1 or index > len(MODELS):
-            print(f"Model number out of range [1:{len(MODELS)}].")
-            return False
-        model_info = MODELS[index - 1]
-        model_id   = model_id_from_info(model_info)
-        if not model_id:
-            print(f"Model {index} does not have an id and cannot be selected.")
-            return False
-        apply_model(model_info)
-        return True
-
-
-def print_model_info(index: int) -> None:
-    with MODEL_LOCK:
-        if not MODELS:
-            print_no_model_list_available()
-            return
-        if index < 1 or index > len(MODELS):
-            print(f"Model number out of range. Use 1 through {len(MODELS)}.")
-            return
-        model_info = dict(MODELS[index - 1])
-
-    print(json.dumps(model_info, indent=2, ensure_ascii=False, default=str))
-
-
 def resolve_thinking() -> None:
     """
-    Anthropic thinking resolution: capability checks against the selected model
-    record and the Anthropic parameter constraints
-    (v1_chat_completions and v1_responses have their own counterparts).
+    Anthropic thinking resolution: capability checks against the selected model record and the Anthropic parameter constraints.
     """
     if not cfg.thinking_enabled:
         return
 
     name = deep_get(cfg.info, "id")
-    print(f"Name is {name}")
 
     if not deep_get(cfg.info, "capabilities.thinking.supported"):
         print(f"Model {name} does not support thinking. Disabling.")
@@ -218,8 +72,7 @@ def resolve_thinking() -> None:
 
 def print_think_status() -> None:
     """
-    CLI 'think' status for the Anthropic backend
-    (v1_chat_completions and v1_responses have their own counterparts).
+    CLI 'think' status for the Anthropic backend.
     """
     if cfg.preserve_thinking_blocks == UINT64_MAX : preserve_str = "inf"
     else                                          : preserve_str = str(cfg.preserve_thinking_blocks)
@@ -236,45 +89,30 @@ def print_think_status() -> None:
     else                                 : print(f"  Thinking preserved  {preserve_str}")
 
 
-def apply_model(model_info: Dict[str, Any]) -> None:
+def after_model_switch() -> None:
     """
-    Points cfg at an Anthropic model and its costs.
+    Post-switch hook for this backend. Runs after providers.apply_model has pointed cfg at the new model.
 
-    Thinking is deliberately not resolved here; the caller does it once the switch
-    is done, the same way the provider registry works (see providers.apply_model).
+    Prefill is validated here rather than in resolve_thinking() because the rules turn
+    on the model version, so the check has to run whether or not thinking is enabled.
+    Do not call cfg.set_prefill() here: that would overwrite ASSISTANT_PREFILL with the
+    mode string (for example "none", "assistant", or "instruction").
     """
-    cfg.backend = "anthropic"
-    cfg.info  = model_info
-    cfg.model = deep_get(cfg.info, "id")
-    print(f"=== Switching to {cfg.model} ===")
-    cfg.model_info   = cfg.info
-    display_name_str = deep_get(cfg.info, "display_name")
-    cfg.version      = extract_claude_version(display_name_str)
-    if cfg.version == Version("0.0"):
-        cfg.version = extract_claude_version(cfg.model)
-    cfg.sync_active_costs()
-    # Validate the configured prefill mode against the selected model.
-    # Do not call set_prefill() here: that would overwrite ASSISTANT_PREFILL
-    # with the mode string (for example "none", "assistant", or "instruction").
     cfg.set_prefill_mode(cfg.assistant_prefill_mode)
-    print(f"=== Switching to {cfg.model} complete ===")
+    resolve_thinking()
 
 
-def find_cfg(models: List[Dict[str, Any]]) -> str:
-    for model in models:
-        model_id = deep_get(model, "id")
-        if model_id != cfg.model:
-            continue
-        apply_model(model)
-        return model_id
-    print(f"Requested model {cfg.model} not found in model list from Anthropic.")
-    print("Unless you know what you're doing, it is recommended to do 'model list' followed by 'models select <number>'.")
-    print("Otherwise payload correctness cannot be guaranteed.")
-    return ""
+# The SDK appends /v1/messages to its base_url itself, while a provider is configured
+# with the /v1 root like every other one, so the suffix has to come back off.
+V1_SUFFIX_RE = re.compile(r"/v1/?$")
 
 
 def get_anthropic_client() -> anthropic.Anthropic:
-    return anthropic.Anthropic(api_key=resolve_api_key(cfg.anthropic_api_key, "ANTHROPIC_API_KEY"))
+    provider = cfg.providers[cfg.backend]
+    return anthropic.Anthropic(
+        api_key  = resolve_api_key(provider["api_key"], provider["api_key_name"]),
+        base_url = V1_SUFFIX_RE.sub("", provider["base_url"]),
+    )
 
 
 def make_cache_control(ttl: str) -> Dict[str, str]:
@@ -293,9 +131,8 @@ def add_cache_control_to_content(content: Any, ttl: str) -> Any:
     """
     Adds explicit Anthropic cache_control to the last non-empty text block.
 
-    Anthropic prompt caching is enabled by adding cache_control either at the
-    request level or on content blocks. This script uses explicit block-level
-    caching to avoid caching the assistant prefill as the final block.
+    Anthropic prompt caching is enabled by adding cache_control either at the request level or on content blocks.
+    This script uses explicit block-level caching to avoid caching the assistant prefill as the final block.
     """
     if not cfg.cache_en:
         return content
@@ -422,9 +259,8 @@ def format_system(system_segments: List[str], system_summary_text: str = "") -> 
     """
     Turns pre-split system prompt segments into top-level Anthropic system blocks.
 
-    The model-agnostic lorebook splitting happens in server.split_system_text();
-    this only decides the Anthropic representation: one text block per segment,
-    with the explicit system cache marker applied to each non-empty block.
+    The model-agnostic lorebook splitting happens in server.split_system_text().
+    This only decides the Anthropic representation: one text block per segment, with the explicit system cache marker applied to each non-empty block.
     """
     summary_text = system_summary_text.strip()
 
@@ -447,11 +283,10 @@ def format_messages(mlist: List[Dict[str, Any]], lorebook_at_end_text: str = "")
     Converts OpenAI-style chat messages to Anthropic Messages format.
 
     Consecutive same-role user/assistant messages are merged because Anthropic expects alternating user/assistant turns.
-    Internal mid-conversation system messages are inserted only for Claude 4.8+ when LOREBOOK_AT_END moves
-    the split lorebook out of the top-level system prompt.
+    Internal mid-conversation system messages are inserted only for Claude 4.8+ when LOREBOOK_AT_END moves the split lorebook out of the top-level system prompt.
 
-    Manual caching marks the configured first-N-message prefix. Automatic caching marks an
-    end-relative conversation point after any lorebook relocation and before optional prefill,
+    Manual caching marks the configured first-N-message prefix.
+    Automatic caching marks an end-relative conversation point after any lorebook relocation and before optional prefill,
     so moved lorebook content is treated like any other end-of-conversation item.
     """
 
@@ -614,6 +449,7 @@ def build_body(prepared: Dict[str, Any]) -> Dict[str, Any]:
     Builds the Anthropic Messages API request from a prepared chat request
     (see server.prepare_chat_request for the dict shape).
     """
+    provider           = cfg.providers[cfg.backend]
     formatted_system   = format_system(prepared["system_segments"], prepared["system_summary_text"])
     formatted_messages = format_messages(prepared["messages"], prepared["lorebook_at_end_text"])
 
@@ -640,6 +476,12 @@ def build_body(prepared: Dict[str, Any]) -> Dict[str, Any]:
     if formatted_system:
         kwargs["system"] = formatted_system
     kwargs["messages"] = formatted_messages
+
+    # The SDK rejects unknown keyword arguments, so <NAME>_EXTRA_BODY cannot simply be
+    # merged into the body the way the OpenAI-style backends do it. It is still merged
+    # last upstream, so it can override anything the proxy sends.
+    if provider["extra_body"]:
+        kwargs["extra_body"] = provider["extra_body"]
 
     return kwargs
 

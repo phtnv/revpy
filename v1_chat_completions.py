@@ -2,11 +2,11 @@
 The /chat/completions backend: the OpenAI-style endpoint every compatible provider
 implements. GLM, Kimi and Aion are served from here.
 
-OpenAI's own models are not. They speak /responses in this proxy (see v1_responses),
-which is the only endpoint that can return their reasoning text, so nothing here
-carries OpenAI model knowledge beyond the name of the token-limit field. Pointing a
-provider on this endpoint at OpenAI's catalogue is unsupported; <NAME>_EXTRA_BODY and
-<NAME>_MAX_TOKENS_PARAM are the escape hatches if you do it anyway.
+OpenAI's own models are better served over /responses (see v1_responses), the only
+endpoint that returns their reasoning text, so nothing here carries OpenAI model
+knowledge beyond the name of the token-limit field. Declaring an OpenAI-compatible
+gateway here works regardless -- you lose the reasoning, and <NAME>_EXTRA_BODY and
+<NAME>_MAX_TOKENS_PARAM are the escape hatches for whatever else it wants.
 """
 
 import httpx
@@ -179,6 +179,15 @@ def resolve_thinking() -> None:
     else              : print(f"Thinking passthrough: enabled with effort '{effort}' (from '{cfg.thinking_effort}').")
 
 
+def after_model_switch() -> None:
+    """
+    Post-switch hook for this backend (v1_messages and v1_responses have their own).
+    There is nothing to validate against the model here, so this only reports how the
+    thinking settings land on it.
+    """
+    resolve_thinking()
+
+
 def print_think_status() -> None:
     """
     CLI 'think' status for this endpoint
@@ -236,7 +245,7 @@ def build_body(prepared: Dict[str, Any]) -> Dict[str, Any]:
     Builds the chat completion request from a prepared chat request.
     The provider's EXTRA_BODY is merged in verbatim last.
     """
-    provider = cfg.openai_providers[cfg.backend]
+    provider = cfg.providers[cfg.backend]
     messages = build_message_list(prepared)
 
     body: Dict[str, Any] = {
@@ -305,7 +314,7 @@ def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
     Runs one non-streaming /chat/completions request.
     Same result shape as v1_messages.generate_non_stream.
     """
-    provider = cfg.openai_providers[cfg.backend]
+    provider = cfg.providers[cfg.backend]
     body     = build_body(prepared)
 
     print_payload(body)
@@ -355,7 +364,7 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
     option can enable it via EXTRA_BODY, e.g. {"stream_options": {"include_usage": true}}.
     Without usage the request is tracked as zero cost.
     """
-    provider = cfg.openai_providers[cfg.backend]
+    provider = cfg.providers[cfg.backend]
     body     = build_body(prepared)
     body["stream"] = True
 

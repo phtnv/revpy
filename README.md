@@ -1,10 +1,20 @@
-# OpenAI to Anthropic compatibility adapter
-Compatibility adapter for interfacing OpenAI-style chat requests with Anthropic Message API requests. Typical usage would be using it as an intermediary server between JanitorAI and Claude (with your own Anthropic API key).
+# Chat completions proxy
+Compatibility adapter that takes OpenAI-style `/chat/completions` requests from a chat frontend and forwards them to whichever API your model actually speaks. Typical usage is as an intermediary server between JanitorAI and a provider you hold the key for.
 
-Besides Claude, the proxy can also route to other providers (OpenAI, GLM, Aion Labs, Kimi, ...) configured through `OPENAI_PROVIDERS` in `.env` (see `env_example.ini`). Their models appear in the CLI `model` list after the Anthropic ones; selecting one switches the active backend. Which endpoint each provider is called on is worked out from its base URL — OpenAI over `/responses`, everyone else over `/chat/completions` (see [Code layout](#code-layout)). Model-agnostic features (summary blocks, lorebook handling, cost tracking, instruction prefill, auto-trim, dumps) work for every backend; Claude-only features (explicit cache markers, signed thinking-block preservation, assistant prefill) apply only to Claude. The shared thinking settings are translated into the provider's own dialect for GPT, Aion, GLM and Kimi models (see [Thinking on OpenAI-style backends](#thinking-on-openai-style-backends)). Any other provider-specific request option is passed through verbatim via `<NAME>_EXTRA_BODY`.
+Three upstream protocols are supported, and you say which one a provider speaks by declaring it in the matching list in `.env` (see `env_example.ini`):
+
+| Variable | Endpoint | Providers |
+| --- | --- | --- |
+| `V1_MESSAGES_PROVIDERS` | `/v1/messages` | Anthropic (Claude) |
+| `V1_CHAT_COMPLETIONS_PROVIDERS` | `/v1/chat/completions` | GLM, Kimi, Aion Labs, most others |
+| `V1_RESPONSES_PROVIDERS` | `/v1/responses` | OpenAI |
+
+Nothing is guessed from the URL, so a provider goes wherever you put it. Every configured provider's models appear in one CLI `model` list; selecting one switches the active backend.
+
+Model-agnostic features (summary blocks, lorebook handling, cost tracking, instruction prefill, auto-trim, dumps) work for every backend. Anthropic-protocol features (explicit cache markers, signed thinking-block preservation, assistant prefill) apply only to providers on `/v1/messages`. The shared thinking settings are translated into the provider's own dialect for GPT, Aion, GLM and Kimi models (see [Thinking on OpenAI-style backends](#thinking-on-openai-style-backends)). Any other provider-specific request option is passed through verbatim via `<NAME>_EXTRA_BODY`.
 
 ## Requirements
-- Anthropic API key from Claude Console. https://platform.claude.com/settings/workspaces/default/keys
+- An API key for at least one provider. For Claude, from Claude Console: https://platform.claude.com/settings/workspaces/default/keys
 - [Python](https://www.python.org/downloads/).
     - This guide assumes it's in your path. On Windows, this means you've checked the `Add python.exe to PATH` when installing.
 - [cloudflared](https://developers.cloudflare.com/tunnel/downloads/)
@@ -20,10 +30,16 @@ Besides Claude, the proxy can also route to other providers (OpenAI, GLM, Aion L
 
 2. In the .env file, edit at least these two lines
     ```ini
-    ANTHROPIC_API_KEY=your_anthropic_api_key
+    CLAUDE_API_KEY=your_anthropic_api_key
     PROXY_KEY=key_you_write_in_janitor
     ```
-    `ANTHROPIC_API_KEY` is the key you generated in Claude Console. `PROXY_KEY` is the key you actually put into Janitor as the Proxy key. They can be the same, but why spread your private key around?
+    `CLAUDE_API_KEY` is the key you generated in Claude Console. `PROXY_KEY` is the key you actually put into Janitor as the Proxy key. They can be the same, but why spread your private key around?
+
+    The example config starts on Claude. To use a different provider, uncomment its list and its `<NAME>_*` block, and point `MODEL` at it:
+    ```ini
+    V1_CHAT_COMPLETIONS_PROVIDERS=glm
+    MODEL=glm/glm-4.7
+    ```
 
 3. Setup the environment.
     ```bash
@@ -63,7 +79,14 @@ Besides Claude, the proxy can also route to other providers (OpenAI, GLM, Aion L
     ```
     Expected output
     ```log
-    Starting Claude proxy
+    Configured providers:
+      claude      messages    https://api.anthropic.com/v1
+
+    Retrieved 12 model(s) from provider 'claude'.
+    === Switching to claude/claude-sonnet-4-6 ===
+    Using cost family 'claude:sonnet'.
+    === Switching to claude/claude-sonnet-4-6 complete ===
+    Starting proxy
     Local URL: http://127.0.0.1:5001
     Chat completions: http://127.0.0.1:5001/chat/completions
     Cloudflare Tunnel service URL should point to this local address:
@@ -113,17 +136,19 @@ The proxy has a small CLI (command-line interface) embedded in it. In the same t
 
 ## Model selection
 
-At startup the proxy fetches the available model list from Anthropic.
+At startup the proxy fetches the model list of every configured provider, in the order the provider lists are given above.
 
 In CLI type `m` to see the available model list (along with the currently selected model).
 
-Type `m <number>` to select a specific model from the list. The model you set in Janitor's UI has no effect.
+Type `m <number>` to select a specific model from the list. The model you set in Janitor's UI has no effect. Selecting a model from another provider switches the active backend with it, including the endpoint the proxy calls and the prices it bills at.
 
-CLI model selection is runtime-only. To make a model the default after restart, edit `MODEL=` in `.env`.
+CLI model selection is runtime-only. To make a model the default after restart, edit `MODEL=` in `.env`. Write it as `provider/model-id`: that form names its own provider, so it still resolves when the provider's model list is unavailable.
+
+If a provider's `/models` request fails, the proxy warns and carries on with the others.
 
 ## Caching
 
-The proxy implements prompt caching. For a detailed guide how caching works, you can read Anthropic's [official docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
+Everything in this section is an Anthropic-protocol feature and applies to providers declared in `V1_MESSAGES_PROVIDERS`. For everyone else see [Caching on OpenAI-style backends](#caching-on-openai-style-backends). For a detailed guide how caching works, you can read Anthropic's [official docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
 
 The short version is that Anthropic provides you up to 4 markers to place at any user (that's you), assistant (that's the LLM) or system (that's the bot definitions, advanced prompts and summaries) messages in your chat. Messages up to and including these markers will be cached.
 
@@ -189,7 +214,7 @@ For lorebook-heavy bots, you can consider disabling all except the system cache 
 
 ### Caching on OpenAI-style backends
 
-None of the above applies to the OpenAI-style providers: they cache automatically, with no markers to place and no TTL to choose, so the `c` commands do nothing while one of them is selected. OpenAI caches prompts from 1024 tokens up, and bills a cache hit at the `cache_read` rate. From `gpt-5.6` on it also charges for the write, at 1.25x the input rate, which the proxy reports in the usual cache-cost line — configure it per model with `cache_write` in `<NAME>_MODEL_<FAMILY>_COST`. Providers that write for free simply leave `cache_write` at the input price, which nets those tokens to zero.
+None of the above applies to providers on `/chat/completions` or `/responses`: they cache automatically, with no markers to place and no TTL to choose, so the `c` commands do nothing while one of them is selected. OpenAI caches prompts from 1024 tokens up, and bills a cache hit at the `cache_read` rate. From `gpt-5.6` on it also charges for the write, at 1.25x the input rate, which the proxy reports in the usual cache-cost line — configure it per model with `cache_write` in `<NAME>_MODEL_<FAMILY>_COST`. Providers that write for free simply leave `cache_write` at the input price, which nets those tokens to zero.
 
 Since the cache still keys on a stable prefix, the big gotcha above is unchanged: a lorebook that shuffles its entries invalidates everything after it.
 
@@ -212,6 +237,8 @@ Newer models use effort. Some of them support a budget too, but this proxy defau
 The proxy will automatically select the appropriate parameter based on the model selected from CLI.
 
 Thinking will contribute to output tokens (increasing cost), but the thoughts are generally not preserved (unless you enable `PRESERVE_THINKING_BLOCKS` in this proxy), so only the final output will be a part of the input tokens for the next message.
+
+Whether a model can think at all is read from the provider's model record. When that record says nothing about it — which is what you get for a model the proxy could not fetch, or a provider that does not report capabilities — thinking is reported as unsupported and switched off at model selection.
 
 ### Thinking on OpenAI-style backends
 
@@ -238,7 +265,7 @@ An effort above what a model offers folds down to its highest, so `max` becomes 
 
 Models with no dialect (DeepSeek, ...) ignore the CLI thinking settings entirely; use `<NAME>_EXTRA_BODY` for those. `EXTRA_BODY` is merged after the dialect, so it also overrides it if you want to force a specific parameter.
 
-Thinking preservation is Anthropic-only. On these backends the thoughts are simply wrapped in a `<think>` block for Janitor, and are not sent back.
+Thinking preservation is an Anthropic-protocol feature. On these backends the thoughts are simply wrapped in a `<think>` block for Janitor, and are not sent back.
 
 On every backend the thinking is billed as output whether or not you can read it, so the usage report splits the output tokens into reasoning and visible text with a cost for each:
 
@@ -254,7 +281,7 @@ Because reasoning tokens also count against the output limit, a small `max_token
 
 ### Seeing GPT's reasoning
 
-`/chat/completions` never returns the reasoning text — not as a field, not as an option. OpenAI exposes it only on its own `/responses` endpoint, which is why this proxy always calls OpenAI there. Nothing needs configuring: any provider whose `<NAME>_BASE_URL` is an OpenAI endpoint is served over `/responses`, and every other provider over `/chat/completions`, which is the only endpoint they implement.
+`/chat/completions` never returns the reasoning text — not as a field, not as an option. OpenAI exposes it only on its own `/responses` endpoint, so declare OpenAI in `V1_RESPONSES_PROVIDERS` and you get the thoughts. Declaring it in `V1_CHAT_COMPLETIONS_PROVIDERS` works too, and silently costs you the reasoning.
 
 The thoughts arrive in a `<think>` block exactly like the other backends, streaming as they are generated. Two optional settings go with it:
 
@@ -319,20 +346,20 @@ The proxy should print a warning if you made mistakes with your tags somewhere (
 
 ## Code layout
 
-The backend boundary is the upstream wire protocol — one module per protocol, each exposing the same four entry points:
+The backend boundary is the upstream wire protocol — one module per protocol, each exposing the same five entry points:
 
-| Module                   | Speaks                              | Serves                                          |
-| ------------------------ | ----------------------------------- | ----------------------------------------------- |
-| `v1_messages.py`         | Anthropic `/v1/messages`            | Claude                                          |
-| `v1_chat_completions.py` | OpenAI-style `/v1/chat/completions` | GLM, Kimi, Aion, and other compatible providers |
-| `v1_responses.py`        | OpenAI `/v1/responses`              | OpenAI                                          |
+| Module                   | Speaks                              | Declared in                     |
+| ------------------------ | ----------------------------------- | ------------------------------- |
+| `v1_messages.py`         | Anthropic `/v1/messages`            | `V1_MESSAGES_PROVIDERS`         |
+| `v1_chat_completions.py` | OpenAI-style `/v1/chat/completions` | `V1_CHAT_COMPLETIONS_PROVIDERS` |
+| `v1_responses.py`        | OpenAI `/v1/responses`              | `V1_RESPONSES_PROVIDERS`        |
 
-Which module serves a provider follows from its `<NAME>_BASE_URL` and is not configurable: OpenAI's own API is served over `/responses`, because that is the only endpoint returning the model's reasoning and it covers the full feature set. Everything else is served over `/chat/completions`, which is what those providers implement.
+Which module serves a provider is the list you declared it in, and nothing else. Selecting one of its models is what binds the backend.
 
 Around them:
 
-- **`server.py`** — the HTTP endpoint Janitor talks to, the runtime CLI, and every model-agnostic transform (summary blocks, lorebook handling, chat snapshots). It picks the backend module per request; the Anthropic-only features are the only place it asks which one it got.
-- **`providers.py`** — what the two OpenAI-style modules share: the provider registry and aggregated model list, HTTP transport, the request message list, and usage normalization. It imports neither of them, so a provider can never depend on the endpoint that happens to be selected.
+- **`server.py`** — the HTTP endpoint Janitor talks to, the runtime CLI, and every model-agnostic transform (summary blocks, lorebook handling, chat snapshots). It picks the backend module per request; the Anthropic-protocol features are the only place it asks which one it got.
+- **`providers.py`** — the registry every backend shares: provider config, the aggregated model list, model selection and pricing, HTTP transport, and the request message list the two OpenAI-style modules build from. It imports none of the backends, so a provider can never depend on the endpoint that happens to be selected.
 - **`common.py`** — configuration from `.env`, cost accounting, text helpers, error rendering.
 
 Tests live in `tests/` and run with `python tests/test_driver.py`. They need no network and no API key: the Anthropic client is faked, and the provider tests assert the exact request body each backend builds.
