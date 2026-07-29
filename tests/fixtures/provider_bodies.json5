@@ -300,6 +300,31 @@
         },
 
         {
+            // Background mode is a flag on the request and nothing else; it does not
+            // touch 'store', which is what keeps the privacy default intact while the
+            // response is still recoverable after a cut stream.
+            name    : "gpt-5.6 responses: background, store still off",
+            builder : "responses",
+            backend : "gpt",
+            model   : "gpt-5.6",
+            input   : "basic",
+            provider: {
+                background : true,
+            },
+            cfg     : {
+                thinking_enabled : true,
+                thinking_effort  : "high",
+            },
+            expected: {
+                model             : "gpt-5.6",
+                max_output_tokens : 256,
+                store             : false,
+                background        : true,
+                reasoning         : { effort: "high", summary: "auto" },
+            },
+        },
+
+        {
             // gpt-5.1 tops out at 'high' and takes 'none' as its off switch. No summary
             // is asked for while thinking is off.
             name    : "gpt-5.1 responses: thinking off, store on",

@@ -12,6 +12,7 @@ this protocol. A model it does not recognize simply gets no reasoning parameter,
 import httpx
 import json
 import re
+import time
 
 from packaging.version import Version
 from typing            import Any, Dict, Iterator, List, Optional, Tuple
@@ -168,6 +169,25 @@ def resolve_thinking() -> None:
     print(f"Thinking passthrough: enabled with effort '{effort}' (from '{cfg.thinking_effort}').")
 
 
+def resolve_background() -> None:
+    """
+    Reports whether responses are run as background jobs, and what that costs in privacy.
+
+    Worth saying out loud rather than leaving in .env: a background response is retained
+    by OpenAI for about ten minutes regardless of <NAME>_STORE, so that it can be polled
+    and resumed. That is a real, if brief, exception to the retention stance the store
+    setting otherwise buys.
+    """
+    provider = cfg.providers[cfg.backend]
+    if not provider["background"]:
+        return
+
+    print("Background mode: enabled. A cut stream is resumed instead of losing the turn.")
+    if not provider["store"]:
+        print(f"                 Note {cfg.backend.upper()}_STORE is off, but OpenAI still keeps a background")
+        print("                 response for about ten minutes so it can be polled.")
+
+
 def after_model_switch() -> None:
     """
     Post-switch hook for this backend (v1_messages and v1_chat_completions have their
@@ -175,6 +195,7 @@ def after_model_switch() -> None:
     the thinking settings land on it.
     """
     resolve_thinking()
+    resolve_background()
 
 
 def print_think_status() -> None:
@@ -233,6 +254,13 @@ def build_body(prepared: Dict[str, Any]) -> Dict[str, Any]:
         "store"             : provider["store"],
     }
 
+    # A background response is run as a job rather than as the answer to this request,
+    # which is what lets a dropped connection be picked back up (see generate_stream).
+    # It is compatible with store=false: OpenAI keeps the job for about ten minutes so
+    # it can be polled, then forgets it.
+    if provider["background"]:
+        body["background"] = True
+
     apply_sampling(body)
 
     reasoning = reasoning_param(cfg.model, cfg.thinking_enabled, cfg.thinking_effort, provider["reasoning_summary"])
@@ -285,7 +313,9 @@ def parse_usage(usage: Any) -> Dict[str, Any]:
 # The response is an 'output' list of items rather than a single message: reasoning items
 # carry the summary of the model's thinking, message items carry the reply. A turn can
 # produce several of each, and on adaptive models the reasoning items may be absent.
-STOP_REASONS = {"completed": "stop", "incomplete": "length", "failed": "error"}
+# 'cancelled' is only reachable in background mode, where the proxy cancels a response
+# nobody is waiting for any more (cancel_response).
+STOP_REASONS = {"completed": "stop", "incomplete": "length", "failed": "error", "cancelled": "stop"}
 
 # The response statuses that end a turn. A stream that runs out of body without
 # reporting one of these was cut mid-response -- see generate_stream(). A mid-stream
@@ -293,7 +323,7 @@ STOP_REASONS = {"completed": "stop", "incomplete": "length", "failed": "error"}
 TERMINAL_STATUSES = frozenset(STOP_REASONS)
 
 
-def truncated_stream_message(text_chars: int, reasoning_chars: int) -> str:
+def truncated_stream_message(text_chars: int, reasoning_chars: int, reason: str = "") -> str:
     """
     Explains a stream that stopped without OpenAI ever finishing the response.
 
@@ -303,15 +333,20 @@ def truncated_stream_message(text_chars: int, reasoning_chars: int) -> str:
     event. It is not a time limit -- runs that stream output for minutes are fine,
     while ones that sit in reasoning for under a minute are cut.
 
-    What arrived before the cut has already gone to the client, so say how much.
+    What arrived before the cut has already gone to the client, so say how much. In
+    background mode the cut alone is not what ended the turn -- 'reason' says what did,
+    which is the difference between a limit of this proxy's and one of OpenAI's.
     """
-    got = f"{text_chars} characters of reply and {reasoning_chars} of reasoning"
+    got    = f"{text_chars} characters of reply and {reasoning_chars} of reasoning"
+    advice = reason or (
+        f"Background mode ({cfg.backend.upper()}_BACKGROUND) survives this kind of cut."
+    )
     return (
         f"The response stream ended before the model finished ({got}). OpenAI closed "
         "the connection without completing the response, and did not say why. This "
-        "happens while the model is reasoning silently on a long prompt; retrying, "
-        "shortening the prompt, or lowering the thinking effort ('t effort low') "
-        "usually gets through."
+        f"happens while the model is reasoning silently on a long prompt. {advice} "
+        "Retrying, shortening the prompt, or lowering the thinking effort "
+        "('t effort low') usually gets through."
     )
 
 
@@ -336,6 +371,78 @@ def output_text(data: Dict[str, Any]) -> Tuple[str, str]:
                     text_parts.append(str(part["text"]))
 
     return "".join(text_parts), "\n\n".join(reasoning_parts)
+
+
+# Background responses.
+# A background response is a job: it keeps running after the connection that started it
+# goes away, and every event it streams carries a sequence_number to resume from. That is
+# what makes the silent-reasoning cut recoverable -- but only while the job is still
+# running. Once it finishes there is no live stream left to attach to, and its events are
+# not replayed, so a response that completed while the proxy was disconnected has to be
+# collected from the response object instead. Both paths are needed; neither covers the
+# other. Retrieval works with store=false, which OpenAI keeps for about ten minutes.
+def fetch_response(provider: Dict[str, Any], response_id: str) -> Dict[str, Any]:
+    """The current state of a response, by id."""
+    response = httpx.get(
+        f"{provider['base_url']}/responses/{response_id}",
+        headers=request_headers(provider),
+        timeout=request_timeout(),
+    )
+    if response.status_code != 200:
+        raise error_from_response(cfg.backend, response)
+
+    data = response.json()
+    return data if isinstance(data, dict) else {}
+
+
+def cancel_response(provider: Dict[str, Any], response_id: str) -> None:
+    """
+    Drops a background response nobody is listening to any more.
+
+    Without this a client that walks away mid-turn leaves the model running, and
+    billing, until it finishes on its own. Best effort by design: this runs while an
+    error or a disconnect is already on its way out, and must not replace it with one
+    of its own.
+    """
+    try:
+        httpx.post(
+            f"{provider['base_url']}/responses/{response_id}/cancel",
+            headers=request_headers(provider),
+            timeout=request_timeout(),
+        )
+    except Exception as exc:
+        print(f"WARNING: could not cancel background response {response_id}: {exc}")
+
+
+def await_response(provider: Dict[str, Any], response_id: str, deadline: float) -> Dict[str, Any]:
+    """
+    Polls a background response until it reports a terminal status. Raises once the
+    deadline passes, cancelling what is still running rather than leaving it billing.
+    """
+    while True:
+        data = fetch_response(provider, response_id)
+        if str(data.get("status") or "") in TERMINAL_STATUSES:
+            return data
+
+        if time.monotonic() >= deadline:
+            cancel_response(provider, response_id)
+            raise ProviderError(504, {"error": {"message":
+                f"The model was still working after {cfg.responses_turn_timeout_seconds:.0f}s "
+                "(RESPONSES_TURN_TIMEOUT_SECONDS), so the response was cancelled."}},
+                f"{cfg.backend}: background response timed out.")
+
+        time.sleep(cfg.responses_poll_seconds)
+
+
+def raise_if_failed(data: Dict[str, Any]) -> None:
+    """
+    A failed response arrives as HTTP 200 with the reason in the body. Without this it
+    is relayed as an ordinary reply, which is usually an empty one.
+    """
+    if str(data.get("status") or "") != "failed":
+        return
+    message = deep_get(data, "error.message") or "the model failed to produce a response."
+    raise ProviderError(502, {"error": {"message": str(message)}}, f"{cfg.backend}: {message}")
 
 
 def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
@@ -364,15 +471,20 @@ def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
         if response.status_code != 200:
             raise error_from_response(cfg.backend, response)
 
-    data   = response.json()
+    data = response.json()
+    data = data if isinstance(data, dict) else {}
+
+    # A background request is accepted the moment it is queued, so the body answering the
+    # POST carries no reply at all -- the job has to be waited for and collected. Any
+    # other unfinished status is polled too: relaying one as a reply would hand the client
+    # an empty message, which is the failure this endpoint is prone to hiding.
+    if str(data.get("status") or "") not in TERMINAL_STATUSES and data.get("id"):
+        data = await_response(provider, str(data["id"]), time.monotonic() + cfg.responses_turn_timeout_seconds)
+
     counts = parse_usage(data.get("usage"))
     print_usage(counts)
 
-    # A failed response still arrives as HTTP 200 with the reason in the body.
-    # Without this it would be relayed as an ordinary reply, which is usually an empty one.
-    if str(data.get("status") or "") == "failed":
-        message = deep_get(data, "error.message") or "the model failed to produce a response."
-        raise ProviderError(502, {"error": {"message": str(message)}}, f"{cfg.backend}: {message}")
+    raise_if_failed(data)
 
     reply_text, reasoning_text = output_text(data)
     finish_reason = STOP_REASONS.get(str(data.get("status") or ""), "stop")
@@ -391,19 +503,172 @@ def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+class StreamState:
+    """
+    What one turn has received so far. Kept in an object rather than in locals because a
+    background turn can be served by several connections in a row, and each of them has
+    to carry on from what the last one left.
+    """
+    def __init__(self) -> None:
+        self.response_parts  : List[str] = []
+        self.reasoning_parts : List[str] = []
+        self.finish_reason = "stop"
+        self.message_id    = ""
+        self.usage         : Any = None
+        # Every streamed event is numbered, and a resumed stream starts after a number
+        # the proxy names, so this is what says where to pick up.
+        self.last_sequence = -1
+        self.completed     = False
+
+    def text(self)      -> str: return "".join(self.response_parts)
+    def reasoning(self) -> str: return "".join(self.reasoning_parts)
+
+    def content(self) -> Tuple[int, int]:
+        """
+        How much of the reply exists so far. Deliberately not the sequence number: the
+        stream numbers its keepalives too, so counting those would report a connection
+        that carried nothing but heartbeats as one that made progress.
+        """
+        return (len(self.text()), len(self.reasoning()))
+
+
+def truncated_stream_error(state: StreamState, reason: str = "") -> ProviderError:
+    return ProviderError(
+        502,
+        {"error": {"message": truncated_stream_message(len(state.text()), len(state.reasoning()), reason)}},
+        f"{cfg.backend}: the response stream ended before the model finished.",
+    )
+
+
+def consume_events(response: Any, state: StreamState) -> Iterator[Tuple[str, str]]:
+    """
+    Reads one connection's SSE body into the state, yielding the deltas as they arrive.
+    Returns when the body ends, whether or not the response finished -- the caller
+    decides what an unfinished one means.
+    """
+    for line in response.iter_lines():
+        if not line.startswith("data:"):
+            continue
+        data_str = line[5:].strip()
+        if data_str == "[DONE]":
+            break
+
+        try: event = json.loads(data_str)
+        except Exception: continue
+        if not isinstance(event, dict):
+            continue
+
+        # A resumed stream is asked to start after the last number seen, so it should
+        # never repeat one. Dropping them here too means an off-by-one costs nothing;
+        # without it, it would duplicate text in the middle of the reply.
+        sequence = event.get("sequence_number")
+        if isinstance(sequence, int):
+            if sequence <= state.last_sequence:
+                continue
+            state.last_sequence = sequence
+
+        event_type = str(event.get("type") or "")
+
+        # A mid-stream error arrives as an event; the HTTP status was already 200.
+        if event_type == "error":
+            message = deep_get(event, "message") or json.dumps(event, default=str)
+            raise ProviderError(500, {"error": {"message": str(message)}}, f"{cfg.backend}: {message}")
+
+        if event_type.startswith("response.") and isinstance(event.get("response"), dict):
+            finished = event["response"]
+            if finished.get("id")    : state.message_id = str(finished["id"])
+            if finished.get("usage") : state.usage      = finished["usage"]
+            if finished.get("status"):
+                status = str(finished["status"])
+                state.finish_reason = STOP_REASONS.get(status, state.finish_reason)
+                if status in TERMINAL_STATUSES:
+                    state.completed = True
+
+        # The model can emit several summary blocks per turn; keep them apart.
+        if event_type == "response.reasoning_summary_part.added" and state.reasoning_parts:
+            state.reasoning_parts.append("\n\n")
+            yield ("reasoning", "\n\n")
+
+        if event_type == "response.reasoning_summary_text.delta":
+            delta = event.get("delta") or ""
+            if delta:
+                state.reasoning_parts.append(delta)
+                yield ("reasoning", delta)
+
+        if event_type == "response.output_text.delta":
+            delta = event.get("delta") or ""
+            if delta:
+                state.response_parts.append(delta)
+                yield ("text", delta)
+
+
+def finish_from_object(data: Dict[str, Any], state: StreamState) -> Iterator[Tuple[str, str]]:
+    """
+    Completes a turn from the response object after the stream stopped carrying it.
+
+    A background response that finished while the proxy was disconnected has no live
+    stream left to attach to and does not replay the events it already sent, so the only
+    way to see the rest of the reply is to read it off the object. What was streamed is a
+    prefix of what the object holds, so only the remainder is yielded; on the off chance
+    that it is not, nothing is invented and the mismatch is reported.
+    """
+    raise_if_failed(data)
+
+    full_text, full_reasoning = output_text(data)
+
+    for kind, streamed, full, parts in (
+        ("reasoning", state.reasoning(), full_reasoning, state.reasoning_parts),
+        ("text"     , state.text()     , full_text     , state.response_parts ),
+    ):
+        if not full.startswith(streamed):
+            print(f"WARNING: the recovered {kind} does not continue what was already streamed; "
+                  "leaving the reply as it arrived.")
+            continue
+        remainder = full[len(streamed):]
+        if remainder:
+            parts.append(remainder)
+            yield (kind, remainder)
+
+    if data.get("usage"):
+        state.usage = data["usage"]
+    state.finish_reason = STOP_REASONS.get(str(data.get("status") or ""), state.finish_reason)
+    state.completed     = True
+
+
+def open_stream(client: Any, provider: Dict[str, Any], body: Dict[str, Any], state: StreamState, resume: bool) -> Any:
+    """
+    The connection a turn is read from: a POST that starts the response, or a GET that
+    picks a background one back up after the number it last delivered.
+    """
+    if not resume:
+        return client.stream(
+            "POST",
+            f"{provider['base_url']}/responses",
+            json=body,
+            headers=request_headers(provider),
+        )
+
+    return client.stream(
+        "GET",
+        f"{provider['base_url']}/responses/{state.message_id}?stream=true&starting_after={state.last_sequence}",
+        headers=request_headers(provider),
+    )
+
+
 def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
     """
     Runs one streaming /responses request. Unlike the chat stream, which relays deltas
     off one message, this is a typed event stream: reasoning summary text and reply
     text arrive as separate event types, which is exactly the split the proxy needs.
+
+    OpenAI cuts these streams mid-response -- no terminal event, no error, most often
+    while the model is reasoning silently over a long prompt. In background mode the
+    response outlives the connection, so a cut is recovered rather than lost: reconnect
+    to the running job, or read the finished one off its object. Without background mode
+    a cut is still an error, the same one as before.
     """
     provider = cfg.providers[cfg.backend]
-
-    response_parts  : List[str] = []
-    reasoning_parts : List[str] = []
-    finish_reason = "stop"
-    message_id    = ""
-    usage         = None
+    state    = StreamState()
 
     # Two attempts at most: an unverified org rejects the summary request before any event is streamed, and note_summary_blocked drops it so the retry succeeds.
     for attempt in (0, 1):
@@ -411,90 +676,99 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
         body["stream"] = True
         print_payload(body)
 
+        # Read from the body rather than the provider, so EXTRA_BODY can force it either way.
+        background            = bool(body.get("background"))
+        started               = time.monotonic()
+        deadline              = started + cfg.responses_turn_timeout_seconds
+        reconnects            = 0
         retry_without_summary = False
-        stream_completed      = False
+        resume                = False
 
         with httpx.Client(timeout=request_timeout()) as client:
-            with client.stream(
-                "POST",
-                f"{provider['base_url']}/responses",
-                json=body,
-                headers=request_headers(provider),
-            ) as response:
-                if response.status_code != 200:
-                    response.read()
-                    error = error_from_response(cfg.backend, response)
-                    if attempt == 0 and note_summary_blocked(error):
-                        retry_without_summary = True
-                    else:
-                        raise error
+            try:
+                while True:
+                    before = state.content()
 
-                if retry_without_summary:
-                    continue
+                    try:
+                        with open_stream(client, provider, body, state, resume) as response:
+                            if response.status_code != 200:
+                                response.read()
+                                error = error_from_response(cfg.backend, response)
+                                if attempt == 0 and not resume and note_summary_blocked(error):
+                                    retry_without_summary = True
+                                    break
+                                raise error
 
-                for line in response.iter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    data_str = line[5:].strip()
-                    if data_str == "[DONE]":
+                            yield from consume_events(response, state)
+
+                    except httpx.TimeoutException:
+                        # A connection that goes quiet is the same cut in another shape:
+                        # nothing at all arrived before the read timeout. It is recovered
+                        # the same way, and without a job to recover it is a real failure.
+                        if not background or not state.message_id:
+                            raise
+
+                    if state.completed:
                         break
 
-                    try: event = json.loads(data_str)
-                    except Exception: continue
-                    if not isinstance(event, dict):
-                        continue
+                    # The stream stopped without the response ever finishing. Only a
+                    # background response can be recovered: anything else is gone.
+                    if not background or not state.message_id:
+                        raise truncated_stream_error(state)
 
-                    event_type = str(event.get("type") or "")
+                    # The job itself says whether there is anything left to stream, and it
+                    # is the only thing that does: a connection carrying nothing means the
+                    # model is thinking silently, not that the turn is lost. If the job has
+                    # finished, its events are not replayed and only the object still has
+                    # the reply; if it is still running, reconnecting resumes it.
+                    current = fetch_response(provider, state.message_id)
+                    status  = str(current.get("status") or "")
 
-                    # A mid-stream error arrives as an event; the HTTP status was already 200.
-                    if event_type == "error":
-                        message = deep_get(event, "message") or json.dumps(event, default=str)
-                        raise ProviderError(500, {"error": {"message": str(message)}}, f"{cfg.backend}: {message}")
+                    if status in TERMINAL_STATUSES:
+                        yield from finish_from_object(current, state)
+                        break
 
-                    if event_type.startswith("response.") and isinstance(event.get("response"), dict):
-                        finished = event["response"]
-                        if finished.get("id")    : message_id = str(finished["id"])
-                        if finished.get("usage") : usage      = finished["usage"]
-                        if finished.get("status"):
-                            status = str(finished["status"])
-                            finish_reason = STOP_REASONS.get(status, finish_reason)
-                            if status in TERMINAL_STATUSES:
-                                stream_completed = True
+                    reconnects += 1
+                    elapsed     = time.monotonic() - started
+                    print(f"WARNING: the response stream was cut after {elapsed:.0f}s (status '{status}', "
+                          f"reconnect {reconnects}); resuming background response {state.message_id}.")
 
-                    # The model can emit several summary blocks per turn; keep them apart.
-                    if event_type == "response.reasoning_summary_part.added" and reasoning_parts:
-                        reasoning_parts.append("\n\n")
-                        yield ("reasoning", "\n\n")
+                    # A still-running job is never given up on for any reason but this one,
+                    # which is a limit of this proxy rather than anything OpenAI reported.
+                    if elapsed >= cfg.responses_turn_timeout_seconds:
+                        raise truncated_stream_error(state,
+                            f"This proxy stopped waiting after {elapsed:.0f}s "
+                            f"(RESPONSES_TURN_TIMEOUT_SECONDS={cfg.responses_turn_timeout_seconds:.0f}) while the "
+                            f"response was still '{status}' at OpenAI, so it was cancelled; raising that setting "
+                            "lets a long turn finish.")
 
-                    if event_type == "response.reasoning_summary_text.delta":
-                        delta = event.get("delta") or ""
-                        if delta:
-                            reasoning_parts.append(delta)
-                            yield ("reasoning", delta)
+                    # Nothing new arrived, so the model is mid-thought and there is no
+                    # point reconnecting instantly -- that would just spin on the API.
+                    if state.content() == before:
+                        time.sleep(min(cfg.responses_poll_seconds, max(0.0, deadline - time.monotonic())))
 
-                    if event_type == "response.output_text.delta":
-                        delta = event.get("delta") or ""
-                        if delta:
-                            response_parts.append(delta)
-                            yield ("text", delta)
+                    resume = True
 
-                # Running out of body without a terminal event means the connection was cut mid-response.
-                if not stream_completed:
-                    raise ProviderError(502, {"error": {"message": truncated_stream_message(
-                        len("".join(response_parts)), len("".join(reasoning_parts)))}},
-                        f"{cfg.backend}: the response stream ended before the model finished.")
+            finally:
+                # A background response keeps running, and billing, whether or not anyone
+                # is still reading it -- including when the client hung up and closed this
+                # generator, which is why this is a finally.
+                if background and state.message_id and not state.completed:
+                    cancel_response(provider, state.message_id)
 
+        if retry_without_summary:
+            continue
         break
 
-    counts        = parse_usage(usage)
-    snapshot_text = "".join(response_parts)
+    counts        = parse_usage(state.usage)
+    snapshot_text = state.text()
     print_usage(counts)
-    warn_truncated_by_reasoning(finish_reason, snapshot_text, counts)
+    warn_truncated_by_reasoning(state.finish_reason, snapshot_text, counts)
 
     yield ("final", {
-        "id"                 : message_id or cfg.model,
-        "stop_reason"        : finish_reason,
+        "id"                 : state.message_id or cfg.model,
+        "stop_reason"        : state.finish_reason,
         "usage"              : usage_to_openai_dict(counts),
         "snapshot_text"      : snapshot_text,
-        "snapshot_reasoning" : "".join(reasoning_parts),
+        "snapshot_reasoning" : state.reasoning(),
     })

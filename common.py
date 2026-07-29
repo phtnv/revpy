@@ -212,6 +212,9 @@ class RuntimeConfig:
             <NAME>_REASONING_SUMMARY   none|auto|concise|detailed; /responses only
             <NAME>_STORE               let the provider retain the response (default false);
                                        /responses only
+            <NAME>_BACKGROUND          run the response as a background job, so a dropped
+                                       connection can be resumed instead of losing the
+                                       turn (default false); /responses only
             <NAME>_EXTRA_BODY          json5 object merged verbatim into every request
                                        (the escape hatch for provider thinking/caching dialects)
             <NAME>_INPUT_TOKEN_COST_USD, <NAME>_OUTPUT_TOKEN_COST_USD,
@@ -270,6 +273,11 @@ class RuntimeConfig:
             # The /responses endpoint retains responses for 30 days by default. Chat
             # content is nobody else's business, so the proxy opts out unless asked.
             "store"               : getenv_bool(f"{prefix}_STORE", False),
+            # Background responses survive the connection that started them, which is what
+            # makes a cut stream resumable rather than a lost turn. OpenAI keeps them for
+            # about 10 minutes so they can be polled, whatever 'store' says -- see
+            # v1_responses.generate_stream and the README.
+            "background"          : getenv_bool(f"{prefix}_BACKGROUND", False),
             "extra_body"          : extra_body,
             "cost_families"       : self.parse_cost_families(prefix),
             "input_cost"          : input_cost,
@@ -312,6 +320,13 @@ class RuntimeConfig:
                     self.providers[name] = provider
 
         self.request_timeout_seconds = getenv_float("REQUEST_TIMEOUT_SECONDS", 600.0)
+
+        # Background /responses recovery (see v1_responses). How long a whole turn may
+        # take, which is a different question from how long one HTTP call may take:
+        # a recovered turn is many calls, and the model reasons silently between them.
+        # This is the only thing that ends a turn whose job is still running.
+        self.responses_turn_timeout_seconds = max(0.0, getenv_float("RESPONSES_TURN_TIMEOUT_SECONDS", 1800.0))
+        self.responses_poll_seconds         = max(0.1, getenv_float("RESPONSES_POLL_SECONDS", 2.0))
 
         self.proxy_key             = os.getenv("PROXY_KEY", "").strip()
         self.require_proxy_key     = getenv_bool("REQUIRE_PROXY_KEY", True)

@@ -12,6 +12,7 @@ from types             import SimpleNamespace
 from typing            import Any
 from packaging.version import Version
 
+import httpx
 import json5
 
 
@@ -121,6 +122,7 @@ def make_provider(**overrides: Any) -> dict[str, Any]:
         "max_tokens_param"    : "auto",
         "reasoning_summary"   : "auto",
         "store"               : False,
+        "background"          : False,
         "extra_body"          : {},
         "cost_families"       : [],
         "input_cost"          : 0.0,
@@ -519,14 +521,68 @@ class FakeStream:
 
 
 class FakeStreamClient:
-    def __init__(self, lines: list[str]) -> None: self._lines = lines
+    """
+    Serves one canned body per connection, in the order the case lists them: a
+    background turn that is cut reconnects, and each connection gets the next body.
+    """
+    def __init__(self, bodies: list[list[str]], calls: list[tuple[str, str]]) -> None:
+        self._bodies = list(bodies)
+        self._calls  = calls
+
     def __enter__(self): return self
     def __exit__(self, *exc): return False
-    def stream(self, *args: Any, **kwargs: Any): return FakeStream(self._lines)
+
+    def stream(self, method: str, url: str, **kwargs: Any):
+        self._calls.append((method, url))
+        body = self._bodies.pop(0) if self._bodies else []
+        # A body of TIMEOUT is a connection that goes quiet rather than closing.
+        if body == TIMEOUT:
+            raise httpx.ReadTimeout("timed out")
+        return FakeStream(body)
+
+
+class FakeResponse:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.status_code = 200
+        self._payload    = payload
+        self.text        = json.dumps(payload)
+
+    def json(self): return self._payload
+
+
+def fake_httpx(bodies: list[list[str]], objects: list[dict[str, Any]], calls: list[tuple[str, str]],
+               posts: list[dict[str, Any]] | None = None) -> SimpleNamespace:
+    """
+    Stands in for the httpx module in v1_responses: streamed bodies for the connections,
+    canned response objects for the retrievals, and one list recording every call so a
+    case can assert what the recovery path actually did. 'posts' answers the
+    non-streaming request; without it a POST is a cancellation.
+    """
+    def get(url: str, **kwargs: Any) -> FakeResponse:
+        calls.append(("GET", url))
+        return FakeResponse(objects.pop(0) if objects else {"id": "resp_1", "status": "in_progress"})
+
+    def post(url: str, **kwargs: Any) -> FakeResponse:
+        calls.append(("POST", url))
+        if posts:
+            return FakeResponse(posts.pop(0))
+        return FakeResponse({"id": "resp_1", "status": "cancelled"})
+
+    return SimpleNamespace(Client=lambda **kw: FakeStreamClient(bodies, calls), get=get, post=post,
+                           TimeoutException=httpx.TimeoutException)
+
+
+# A connection that never delivers anything, as opposed to one that closes early.
+TIMEOUT = "TIMEOUT"
 
 
 def sse(*events: dict[str, Any]) -> list[str]:
     return [f"data: {json.dumps(e)}" for e in events]
+
+
+def seq(number: int, event: dict[str, Any]) -> dict[str, Any]:
+    """The same event, numbered. A resumed stream is asked to start after a number."""
+    return {**event, "sequence_number": number}
 
 
 CREATED_EVENT   = {"type": "response.created",  "response": {"id": "resp_1", "status": "in_progress"}}
@@ -536,54 +592,305 @@ COMPLETED_EVENT = {"type": "response.completed", "response": {
     "id": "resp_1", "status": "completed",
     "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}}}
 
+# The response object as a retrieval returns it, for the recovery paths.
+def response_object(status: str, text: str = "", reasoning: str = "") -> dict[str, Any]:
+    output: list[dict[str, Any]] = []
+    if reasoning : output.append({"type": "reasoning", "summary": [{"type": "summary_text", "text": reasoning}]})
+    if text      : output.append({"type": "message"  , "content": [{"type": "output_text" , "text": text     }]})
+    return {"id": "resp_1", "status": status, "output": output,
+            "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}}
+
+
 # A /responses stream is only finished when the response reports a terminal status.
 # Running out of body without one means the connection was cut mid-response; relaying
 # that as a clean stop hands the client an empty message and no reason for it, which
 # is indistinguishable from the model choosing to say nothing.
+#
+# In background mode a cut is recoverable instead: the response outlives the connection,
+# so the proxy reconnects to it while it is still running, and reads it off the response
+# object once it has finished (a finished response does not replay its events).
 STREAM_CASES = [
-    ("completed stream is relayed",            sse(CREATED_EVENT, TEXT_EVENT, COMPLETED_EVENT), False),
-    ("truncated after reasoning raises",       sse(CREATED_EVENT, REASONING_EVENT)            , True ),
-    ("truncated after text raises",            sse(CREATED_EVENT, TEXT_EVENT)                 , True ),
-    ("truncated before any content raises",    sse(CREATED_EVENT)                             , True ),
+    {
+        "name"   : "completed stream is relayed",
+        "bodies" : [sse(CREATED_EVENT, TEXT_EVENT, COMPLETED_EVENT)],
+        "text"   : "Hello.",
+    },
+    {
+        "name"   : "truncated after reasoning raises",
+        "bodies" : [sse(CREATED_EVENT, REASONING_EVENT)],
+        "error"  : True,
+    },
+    {
+        "name"   : "truncated after text raises",
+        "bodies" : [sse(CREATED_EVENT, TEXT_EVENT)],
+        "error"  : True,
+    },
+    {
+        "name"   : "truncated before any content raises",
+        "bodies" : [sse(CREATED_EVENT)],
+        "error"  : True,
+    },
+    {
+        # The job is still running, so reconnecting picks the rest of it up live.
+        "name"       : "background resumes a running response",
+        "background" : True,
+        "bodies"     : [
+            sse(seq(0, CREATED_EVENT), seq(1, TEXT_EVENT)),
+            sse(seq(2, {"type": "response.output_text.delta", "delta": " More."}), seq(3, COMPLETED_EVENT)),
+        ],
+        "objects"    : [response_object("in_progress")],
+        "text"       : "Hello. More.",
+        "resumed"    : "starting_after=1",
+    },
+    {
+        # It finished while the proxy was away: no events left to stream, only the object.
+        "name"       : "background recovers a finished response from the object",
+        "background" : True,
+        "bodies"     : [sse(seq(0, CREATED_EVENT), seq(1, TEXT_EVENT))],
+        "objects"    : [response_object("completed", text="Hello. The rest.", reasoning="Thinking...")],
+        "text"       : "Hello. The rest.",
+        # Nothing of the reasoning was streamed before the cut, so all of it is recovered.
+        "reasoning"  : "Thinking...",
+    },
+    {
+        # The recovered reply should continue what the client already has. When it does
+        # not, the two cannot be stitched together, and guessing at a join would corrupt
+        # the message -- so the reply is left as it arrived.
+        "name"       : "background will not graft on a reply that does not continue",
+        "background" : True,
+        "bodies"     : [sse(seq(0, CREATED_EVENT), seq(1, TEXT_EVENT))],
+        "objects"    : [response_object("completed", text="Something else entirely.")],
+        "text"       : "Hello.",
+    },
+    {
+        # A replayed number must not become duplicated text.
+        "name"       : "background drops events it has already seen",
+        "background" : True,
+        "bodies"     : [
+            sse(seq(0, CREATED_EVENT), seq(1, TEXT_EVENT)),
+            sse(seq(1, TEXT_EVENT), seq(2, COMPLETED_EVENT)),
+        ],
+        "objects"    : [response_object("in_progress")],
+        "text"       : "Hello.",
+    },
+    {
+        # A job that is still running is not given up on for bringing nothing: that is
+        # what silent reasoning looks like from here. Only the turn timeout ends it, and
+        # then the job is cancelled rather than left running.
+        "name"         : "background keeps resuming a job that is still running",
+        "background"   : True,
+        "turn_timeout" : 0.0,
+        "bodies"       : [sse(seq(0, CREATED_EVENT), seq(1, TEXT_EVENT))] + [[] for _ in range(12)],
+        "objects"      : [response_object("in_progress") for _ in range(12)],
+        "error"        : True,
+        "cancelled"    : True,
+        # Nothing is retried once the budget is already spent, so exactly one cut is seen.
+        "resumes"      : 0,
+    },
+    {
+        # The same job, with room to work: reconnecting continues until it finishes,
+        # however many cuts that takes and however little some of them carry.
+        "name"         : "background outlasts several empty reconnects",
+        "background"   : True,
+        "bodies"       : [
+            sse(seq(0, CREATED_EVENT), seq(1, REASONING_EVENT)),
+            [], [], [],
+            sse(seq(2, TEXT_EVENT), seq(3, COMPLETED_EVENT)),
+        ],
+        "objects"      : [response_object("in_progress") for _ in range(4)],
+        "text"         : "Hello.",
+        "reasoning"    : "Thinking...",
+        "resumes"      : 4,
+    },
+    {
+        # A connection that goes quiet is the same cut in another shape.
+        "name"       : "background recovers a connection that times out",
+        "background" : True,
+        "bodies"     : [sse(seq(0, CREATED_EVENT), seq(1, TEXT_EVENT)), TIMEOUT,
+                        sse(seq(2, COMPLETED_EVENT))],
+        "objects"    : [response_object("in_progress"), response_object("in_progress")],
+        "text"       : "Hello.",
+    },
+    {
+        # Without a background job behind it, a quiet connection is a real failure.
+        "name"    : "a connection that times out without background raises",
+        "bodies"  : [TIMEOUT],
+        "error"   : True,
+    },
+    {
+        # The client hung up. The response would otherwise keep running, and billing.
+        "name"       : "background cancels when the client walks away",
+        "background" : True,
+        "bodies"     : [sse(seq(0, CREATED_EVENT), seq(1, TEXT_EVENT), seq(2, COMPLETED_EVENT))],
+        "abandon"    : True,
+        "cancelled"  : True,
+    },
 ]
 
 
-def test_responses_stream_termination(case: tuple) -> bool:
+def test_responses_stream_termination(case: dict[str, Any]) -> bool:
     global tests_ttl
     tests_ttl += 1
-    label, lines, expect_error = case
-    print(f"Testing /responses stream: {label}... ", end="")
+    print(f"Testing /responses stream: {case['name']}... ", end="")
 
     cfg = make_config()
     cfg.backend   = "gpt"
     cfg.model     = "gpt-5.6-sol"
-    cfg.providers = {"gpt": make_provider(api="responses")}
+    cfg.providers = {"gpt": make_provider(api="responses", background=case.get("background", False))}
+    cfg.responses_poll_seconds          = 0.0
+    # Short on purpose: a recovery loop that fails to terminate should fail the case
+    # quickly rather than sit there until a real timeout expires.
+    cfg.responses_turn_timeout_seconds  = case.get("turn_timeout", 5.0)
 
     prepared = {"messages": [{"role": "user", "content": "hi"}], "system_segments": [],
                 "system_summary_text": "", "lorebook_at_end_text": "", "max_tokens": 64}
 
+    calls  : list[tuple[str, str]] = []
+    chunks : dict[str, list[str]]  = {"text": [], "reasoning": []}
+
     original_httpx, original_headers = resp_api.httpx, resp_api.request_headers
-    resp_api.httpx = SimpleNamespace(Client=lambda **kw: FakeStreamClient(lines))
+    resp_api.httpx = fake_httpx(case["bodies"], list(case.get("objects", [])), calls)
     resp_api.request_headers = lambda provider: {}
     try:
         with contextlib.redirect_stdout(io.StringIO()):
             raised, final = None, None
+            stream = resp_api.generate_stream(prepared)
             try:
-                for kind, data in resp_api.generate_stream(prepared):
-                    if kind == "final": final = data
+                for kind, data in stream:
+                    if kind == "final" : final = data
+                    else               : chunks[kind].append(data)
+                    # Walking away mid-turn is what a disconnected client looks like from
+                    # here: the generator is closed while it is still producing.
+                    if case.get("abandon") and kind == "text":
+                        stream.close()
+                        break
             except Exception as exc:
                 raised = exc
     finally:
         resp_api.httpx, resp_api.request_headers = original_httpx, original_headers
 
-    if expect_error:
-        passed = raised is not None and final is None
-        if not passed:
+    passed = True
+
+    if case.get("error"):
+        if raised is None or final is not None:
             print(f"expected an error, got final={final!r} raised={raised!r} ", end="")
+            passed = False
+    elif case.get("abandon"):
+        if raised is not None:
+            print(f"expected no error on abandon, got {raised!r} ", end="")
+            passed = False
     else:
-        passed = raised is None and final is not None and final["stop_reason"] == "stop"
-        if not passed:
+        if raised is not None or final is None or final["stop_reason"] != "stop":
             print(f"expected a clean final, got final={final!r} raised={raised!r} ", end="")
+            passed = False
+
+    for kind in ("text", "reasoning"):
+        if kind not in case:
+            continue
+        received = "".join(chunks[kind])
+        if received != case[kind]:
+            print(f"expected {kind}={case[kind]!r}, got {received!r} ", end="")
+            passed = False
+
+    if case.get("resumed") and not any(method == "GET" and case["resumed"] in url for method, url in calls):
+        print(f"expected a resume carrying {case['resumed']!r}, got {calls!r} ", end="")
+        passed = False
+
+    if "resumes" in case:
+        resumes = sum(1 for method, url in calls if method == "GET" and "starting_after=" in url)
+        if resumes != case["resumes"]:
+            print(f"expected {case['resumes']} resume attempts, got {resumes} ", end="")
+            passed = False
+
+    cancelled = any(method == "POST" and url.endswith("/cancel") for method, url in calls)
+    if cancelled != bool(case.get("cancelled")):
+        print(f"expected cancelled={bool(case.get('cancelled'))}, got {cancelled} from {calls!r} ", end="")
+        passed = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+# A background request is answered with 'queued' and no reply at all, so the
+# non-streaming path has to wait for the job and collect it. Relaying that first body
+# would hand the client an empty message -- the failure this endpoint is prone to hiding.
+NON_STREAM_CASES = [
+    {
+        "name"       : "background waits for the job and collects the reply",
+        "background" : True,
+        "posts"      : [{"id": "resp_1", "status": "queued"}],
+        "objects"    : [response_object("in_progress"),
+                        response_object("completed", text="Hello.", reasoning="Thinking...")],
+        "text"       : "Hello.",
+        "reasoning"  : "Thinking...",
+    },
+    {
+        "name"       : "background relays a failure instead of an empty reply",
+        "background" : True,
+        "posts"      : [{"id": "resp_1", "status": "queued"}],
+        "objects"    : [{"id": "resp_1", "status": "failed", "error": {"message": "the model gave up"}}],
+        "error"      : True,
+    },
+    {
+        # Without background the POST already carries the whole response, and nothing
+        # about this path changes: no retrieval at all.
+        "name"       : "a finished response is used as it arrives",
+        "posts"      : [response_object("completed", text="Hello.")],
+        "text"       : "Hello.",
+        "retrievals" : 0,
+    },
+]
+
+
+def test_responses_non_stream(case: dict[str, Any]) -> bool:
+    global tests_ttl
+    tests_ttl += 1
+    print(f"Testing /responses non-streaming: {case['name']}... ", end="")
+
+    cfg = make_config()
+    cfg.backend   = "gpt"
+    cfg.model     = "gpt-5.6-sol"
+    cfg.providers = {"gpt": make_provider(api="responses", background=case.get("background", False))}
+    cfg.responses_poll_seconds         = 0.0
+    cfg.responses_turn_timeout_seconds = 600.0
+
+    prepared = {"messages": [{"role": "user", "content": "hi"}], "system_segments": [],
+                "system_summary_text": "", "lorebook_at_end_text": "", "max_tokens": 64}
+
+    calls : list[tuple[str, str]] = []
+
+    original_httpx, original_headers = resp_api.httpx, resp_api.request_headers
+    resp_api.httpx = fake_httpx([], list(case.get("objects", [])), calls, list(case.get("posts", [])))
+    resp_api.request_headers = lambda provider: {}
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            raised, result = None, None
+            try: result = resp_api.generate_non_stream(prepared)
+            except Exception as exc: raised = exc
+    finally:
+        resp_api.httpx, resp_api.request_headers = original_httpx, original_headers
+
+    passed = True
+
+    if case.get("error"):
+        if raised is None or result is not None:
+            print(f"expected an error, got result={result!r} raised={raised!r} ", end="")
+            passed = False
+    elif raised is not None or result is None:
+        print(f"expected a reply, got result={result!r} raised={raised!r} ", end="")
+        passed = False
+    else:
+        for key in ("text", "reasoning"):
+            if key in case and case[key] not in result["text"]:
+                print(f"expected {key}={case[key]!r} in {result['text']!r} ", end="")
+                passed = False
+
+    if "retrievals" in case:
+        retrievals = sum(1 for method, _ in calls if method == "GET")
+        if retrievals != case["retrievals"]:
+            print(f"expected {case['retrievals']} retrievals, got {retrievals} ", end="")
+            passed = False
 
     if passed : print(f"{GREEN}PASS{RESET}")
     else      : print(f"{RED}FAIL{RESET}")
@@ -659,6 +966,9 @@ if __name__ == "__main__":
 
     for stream_case in STREAM_CASES:
         tests_passed += test_responses_stream_termination(stream_case)
+
+    for non_stream_case in NON_STREAM_CASES:
+        tests_passed += test_responses_non_stream(non_stream_case)
 
     body_inputs, body_cases = load_body_cases("provider_bodies.json5")
     for body_case in body_cases:

@@ -3,11 +3,11 @@ Compatibility adapter that takes OpenAI-style `/chat/completions` requests from 
 
 Three upstream protocols are supported, and you say which one a provider speaks by declaring it in the matching list in `.env` (see `env_example.ini`):
 
-| Variable | Endpoint | Providers |
-| --- | --- | --- |
-| `V1_MESSAGES_PROVIDERS` | `/v1/messages` | Anthropic (Claude) |
+| Variable                        | Endpoint               | Providers                         |
+| ------------------------------- | ---------------------- | --------------------------------- |
+| `V1_MESSAGES_PROVIDERS`         | `/v1/messages`         | Anthropic (Claude)                |
 | `V1_CHAT_COMPLETIONS_PROVIDERS` | `/v1/chat/completions` | GLM, Kimi, Aion Labs, most others |
-| `V1_RESPONSES_PROVIDERS` | `/v1/responses` | OpenAI |
+| `V1_RESPONSES_PROVIDERS`        | `/v1/responses`        | OpenAI                            |
 
 Nothing is guessed from the URL, so a provider goes wherever you put it. Every configured provider's models appear in one CLI `model` list; selecting one switches the active backend.
 
@@ -278,23 +278,6 @@ On every backend the thinking is billed as output whether or not you can read it
 OpenAI, GLM and Kimi report that count. Anthropic and Aion do not, and rather than print a zero for thinking that demonstrably happened, those backends keep the plain `Output tokens = N` line.
 
 Because reasoning tokens also count against the output limit, a small `max_tokens` can be consumed entirely by thinking and leave an empty message; the proxy warns when it sees that, but the fix is to raise `max_tokens` in Janitor or lower the effort.
-
-### Seeing GPT's reasoning
-
-`/chat/completions` never returns the reasoning text — not as a field, not as an option. OpenAI exposes it only on its own `/responses` endpoint, so declare OpenAI in `V1_RESPONSES_PROVIDERS` and you get the thoughts. Declaring it in `V1_CHAT_COMPLETIONS_PROVIDERS` works too, and silently costs you the reasoning.
-
-The thoughts arrive in a `<think>` block exactly like the other backends, streaming as they are generated. Two optional settings go with it:
-
-```ini
-GPT_REASONING_SUMMARY=auto   # none|auto|concise|detailed
-GPT_STORE=false              # /responses otherwise retains your chats for 30 days
-```
-
-Three things to expect:
-
-- **What you get is a summary,** not the raw chain of thought. OpenAI does not release the latter.
-- **A `<think>` block is not guaranteed on any given turn.** The `gpt-5.6` family reasons adaptively, so an easy turn may not think at all; and even when it does, the summary is occasionally omitted — most often on very long chains, which is exactly when you wanted it. `concise` and `detailed` are no more reliable than `auto` here, so there is nothing to tune.
-- **Some models need a verified organization** before OpenAI will produce summaries (the o-series does; the `gpt-5` family does not). The proxy prints a warning and retries without the summary rather than failing the turn, so you get a reply either way.
 
 ### Thinking preservation
 
