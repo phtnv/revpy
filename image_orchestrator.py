@@ -16,22 +16,27 @@ every turn would regenerate every image the conversation has ever asked for.
 import json5
 import re
 
-from dataclasses import dataclass, field
 from typing      import Any, Dict, List, Optional, Tuple
 
 from common import cfg
 from v1_images import ImageRequest, ImageRequestError, build_request
 
 
-@dataclass
 class Extraction:
-    messages  : List[Dict[str, Any]] = field(default_factory=list)
-    requests  : List[ImageRequest]   = field(default_factory=list)
-    errors    : List[str]            = field(default_factory=list)
-    # False when the user's turn was nothing but image requests, which is the case that
-    # skips the text model entirely.
-    needs_text : bool                = True
-    found      : bool                = False
+    """
+    What one incoming payload turned into. Built empty and filled in as the messages are
+    walked, so the lists start empty rather than being handed in.
+    """
+    def __init__(self, messages: Optional[List[Dict[str, Any]]] = None, needs_text: bool = True):
+        self.messages = messages if messages is not None else []
+        # False when the user's turn was nothing but image requests, which is the case
+        # that skips the text model entirely.
+        self.needs_text = needs_text
+        self.found      = False
+
+        # Accumulated while the messages are walked.
+        self.requests : List[ImageRequest] = []
+        self.errors   : List[str]          = []
 
 
 def block_pattern() -> re.Pattern:

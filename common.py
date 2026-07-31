@@ -23,6 +23,7 @@ REASONING_SUMMARIES = {"none", "auto", "concise", "detailed"}
 # Image generation enums, as accepted by /images/generations on the gpt-image family.
 # 'transparent' is deliberately absent from the backgrounds: gpt-image-2 does not support
 # it, and offering a value the model will reject is worse than not offering it at all.
+IMAGE_RESPONSE_FORMATS = {"b64_json", "path"}
 IMAGE_QUALITIES   = {"auto", "low", "medium", "high"}
 IMAGE_FORMATS     = {"png", "jpeg", "webp"}
 IMAGE_BACKGROUNDS = {"opaque", "automatic"}
@@ -543,6 +544,13 @@ class RuntimeConfig:
         self.image_retry_attempts         = max(1, getenv_int("IMAGE_RETRY_ATTEMPTS", 3))
         self.image_retry_backoff_seconds  = max(0.0, getenv_float("IMAGE_RETRY_BACKOFF_SECONDS", 5.0))
 
+        # What the HTTP image routes return. The chat path never goes through them, so
+        # every caller here is an external app, and the default is what an OpenAI client
+        # expects. 'path' trims the reply to metadata for local tooling that only wants the
+        # saved file; the saved path is included either way, and the file is written
+        # regardless. A request may override this per call with response_format.
+        self.image_response_format = getenv_choice("IMAGE_RESPONSE_FORMAT", "b64_json", IMAGE_RESPONSE_FORMATS)
+
         self.image_edit_enabled      = getenv_bool("IMAGE_EDIT_ENABLED", True)
         self.image_edit_max_images   = max(1, getenv_int("IMAGE_EDIT_MAX_IMAGES", 4))
         self.image_edit_max_bytes    = max(1, getenv_int("IMAGE_EDIT_MAX_BYTES", 20*1024*1024))
@@ -553,6 +561,15 @@ class RuntimeConfig:
         # proxy is built to sit behind a public tunnel, and a prompt-supplied path is an
         # arbitrary-file-read-and-exfiltrate primitive for anyone who reaches it. The CLI
         # slots need none of this, since paths there come from whoever runs the console.
+        # The ceiling Flask buffers a request body up to. Uploaded edits are the only thing
+        # here that can be large, and without a cap any POST is read into memory whole --
+        # an exhaustion vector on a service meant to sit behind a public tunnel. Derived
+        # from the edit limits plus slack for the form itself, unless set explicitly.
+        self.request_max_bytes = max(
+            1024*1024,
+            getenv_int("REQUEST_MAX_BYTES", self.image_edit_max_images*self.image_edit_max_bytes + 1024*1024),
+        )
+
         self.image_edit_allow_prompt_paths = getenv_bool("IMAGE_EDIT_ALLOW_PROMPT_PATHS", False)
         self.image_edit_roots = [
             os.path.realpath(os.path.expanduser(root.strip()))
@@ -574,7 +591,7 @@ class RuntimeConfig:
 
         # Resolved prices for the selected image model. Populated by
         # v1_images.apply_image_model(); inert until then.
-        self.image_cost_family     = ""
+        self.image_cost_family       = ""
         self.image_text_input_cost   = 0.0
         self.image_image_input_cost  = 0.0
         self.image_cached_input_cost = 0.0

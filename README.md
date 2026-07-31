@@ -384,24 +384,43 @@ Anything else — model, provider, base URL, API key, headers, output path — i
 
 `size` is validated against the model's constraints rather than a list: edges must be multiples of 16 and at most 3840px, the aspect ratio at most 3:1, and the total between 655,360 and 8,294,400 pixels. `auto` is accepted. Note that `background: transparent` is **not** supported by `gpt-image-2` — only `opaque` and `automatic`.
 
-### The direct endpoint
+### The direct endpoints
+
+Two routes, split the way the upstream API splits them, so a client that knows one knows the other:
 
 ```text
-POST /v1/images/generations
-{"prompt": "A gray tabby cat hugging an otter"}
+POST /v1/images/generations    text to image
+POST /v1/images/edits          image to image
 ```
 
-Every omitted field is filled from configuration. The reply is metadata, not Base64 — the images are already on disk:
+Every omitted field is filled from configuration; only `prompt` is required.
 
 ```json
 {
   "created": 1785400000,
   "model": "gpt-image-2",
-  "data": [{"id": "img_8f281a", "path": "generated_images/20260730_105900_8f281a.png"}],
+  "data": [{"id": "img_8f281a", "b64_json": "iVBORw0…",
+            "path": "generated_images/20260730_105900_8f281a.png"}],
   "usage": {"estimated_cost_usd": 0.005945, "cost_is_estimate": false,
             "text_input_tokens": 13, "image_output_tokens": 196}
 }
 ```
+
+The reply carries `b64_json` by default, because chat requests never come through these routes — every caller here is an external app, and an OpenAI client expects the bytes. The saved `path` rides along regardless, and `"response_format": "path"` trims the reply to metadata alone when the file on disk is all you wanted. `IMAGE_RESPONSE_FORMAT` changes the default.
+
+**The OpenAI SDK works against these unmodified:**
+
+```python
+client = OpenAI(base_url="http://127.0.0.1:5001/v1", api_key=PROXY_KEY)
+
+client.images.generate(model="gpt-image-2", prompt="a gray tabby cat")
+client.images.edit(model="gpt-image-2", image=[open("a.png","rb"), open("b.png","rb")],
+                   prompt="put the leaf from the first image on the stone from the second")
+```
+
+A multipart edit carries the caller's own bytes, so it needs no filesystem access on the proxy host and the path allowlist never comes into it — the content checks (magic bytes, size, count) are the same ones a path gets. `REQUEST_MAX_BYTES` caps what the server will buffer, defaulting to `IMAGE_EDIT_MAX_IMAGES × IMAGE_EDIT_MAX_BYTES` plus slack; over that is a 413.
+
+Note that `model` is accepted and **ignored**, exactly as it is for chat — the proxy decides which image model runs, via `IMAGE_MODEL` or `image model <n>`. `user`, `style` and friends are likewise accepted and discarded. A field that is neither honored nor known is still a 400, so a typo is reported rather than silently defaulted, and `stream: true` is refused outright instead of returning something an SSE client cannot read.
 
 Each image also appends a record to `img_generation.json` in the output directory (`IMAGE_MANIFEST_ENABLED`; `IMAGE_MANIFEST_PROMPTS` decides whether the prompt itself is kept, since the manifest outlives the session).
 

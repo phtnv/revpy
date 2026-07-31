@@ -21,6 +21,7 @@ exactly once.
 
 import base64
 import binascii
+import io
 import json
 import os
 import re
@@ -29,7 +30,6 @@ import threading
 import time
 import uuid
 
-from dataclasses import dataclass, field
 from typing      import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -69,6 +69,14 @@ ALLOWED_OVERRIDES = {
     # processes inputs at high fidelity and rejects attempts to set it.
     "images", "mask", "edit", "file_ids",
 }
+
+# Fields an OpenAI client sends that this proxy accepts and then discards. They are not in
+# ALLOWED_OVERRIDES because they are not honoured -- 'model' in particular is proxy policy,
+# exactly as it is for chat, where the model chosen in the frontend has no effect either.
+# Keeping them out of the unknown-field check is what lets client.images.generate() work
+# unmodified; keeping them out of the override list is what stops a caller picking the
+# model. A genuinely unknown field is still an error, so a typo is still reported.
+IGNORED_FIELDS = {"model", "user", "moderation", "style", "output_compression", "partial_images"}
 
 # What a reference image may be. Identified by magic bytes rather than by extension: a
 # '.png' that is really something else must fail here, not at the provider.
@@ -130,75 +138,120 @@ class ImageConfigError(ProviderError):
         super().__init__(500, {"error": {"message": message, "type": "image_configuration_error"}}, message)
 
 
-@dataclass
 class ReferenceImage:
-    """One validated local image to edit from."""
-    path      : str
-    format    : str            # png | jpeg | webp
-    mime      : str
-    size      : int            # bytes on disk
-    width     : int = 0        # 0 when the header could not be read
-    height    : int = 0
-    has_alpha : bool = False   # PNG only; what a mask is required to have
-    slot      : int  = 0       # the slot it came from, 0 for a path
+    """
+    One validated image to edit from, held either as a path on this machine or as bytes
+    uploaded with the request. The two arrive by very different routes -- a path is named
+    from the console or an allowlisted prompt, an upload is posted by a client -- but from
+    the point of validation onwards they are the same thing, so the rest of the module
+    never has to care which it got.
+    """
+    def __init__(self, format: str, mime: str, size: int, path: str = "", data: Optional[bytes] = None,
+                 name: str = "", width: int = 0, height: int = 0, has_alpha: bool = False, slot: int = 0):
+        self.format    = format
+        self.mime      = mime
+        self.size      = size          # bytes
+        self.path      = path          # empty for an upload
+        self.data      = data          # None for a path on disk
+        self.name      = name          # the client's filename, for uploads
+        self.width     = width         # 0 when the header could not be read
+        self.height    = height
+        self.has_alpha = has_alpha     # PNG only; what a mask is required to have
+        self.slot      = slot          # the slot it came from, 0 otherwise
 
     def filename(self) -> str:
-        return os.path.basename(self.path)
+        return os.path.basename(self.path) if self.path else (self.name or f"upload.{self.format}")
+
+    def open(self) -> Any:
+        """A fresh readable stream. Called once per attempt, since a retry re-reads it."""
+        return open(self.path, "rb") if self.path else io.BytesIO(self.data or b"")
+
+    def origin(self) -> str:
+        """How this reference is recorded in the manifest."""
+        return self.path if self.path else f"upload:{self.filename()}"
 
 
-@dataclass
 class ImageRequest:
-    prompt        : str
-    size          : str
-    quality       : str
-    output_format : str
-    background    : str
-    n             : int
-    batch         : bool
-    filename      : str = ""       # sanitized stem, or "" for the timestamped default
-    source        : str = "direct" # "direct" or "chat"; for logging only
+    """
+    One fully validated request. Every field has already been checked against the
+    allowlists by build_request(), so anything downstream can use it without re-testing.
+    """
+    def __init__(self, prompt: str, size: str, quality: str, output_format: str, background: str,
+                 n: int, batch: bool, filename: str = "", source: str = "direct",
+                 images: Optional[List[ReferenceImage]] = None,
+                 mask: Optional[ReferenceImage] = None,
+                 file_ids: Optional[List[str]] = None):
+        self.prompt        = prompt
+        self.size          = size
+        self.quality       = quality
+        self.output_format = output_format
+        self.background    = background
+        self.n             = n
+        self.batch         = batch
+        self.filename      = filename   # sanitized stem, or "" for the timestamped default
+        self.source        = source     # "direct", "chat" or "cli"; for logging only
 
-    # Editing. 'images' and 'file_ids' are mutually exclusive: the first is a multipart
-    # upload of local files, the second names references already held by the provider,
-    # which is the only form the Batch API accepts.
-    images        : List[ReferenceImage]   = field(default_factory=list)
-    mask          : Optional[ReferenceImage] = None
-    file_ids      : List[str]              = field(default_factory=list)
+        # Editing. 'images' and 'file_ids' are mutually exclusive: the first is a multipart
+        # upload of local files, the second names references already held by the provider,
+        # which is the only form the Batch API accepts.
+        self.images   = images or []
+        self.mask     = mask
+        self.file_ids = file_ids or []
 
     @property
     def is_edit(self) -> bool:
         return bool(self.images or self.file_ids)
 
 
-@dataclass
 class SavedImage:
-    image_id : str
-    path     : str
+    """One image written to disk."""
+    def __init__(self, image_id: str, path: str, data: Optional[bytes] = None):
+        self.image_id = image_id
+        self.path     = path
+        # The decoded bytes, kept so a caller asking for b64_json is served without reading
+        # the file back off disk. Saving happens either way; this is only about the reply.
+        self.data     = data
+
+    def b64(self) -> str:
+        if self.data is not None:
+            return base64.b64encode(self.data).decode("ascii")
+        with open(self.path, "rb") as handle:
+            return base64.b64encode(handle.read()).decode("ascii")
 
 
-@dataclass
 class ImageResult:
-    provider  : str
-    model     : str
-    created   : int
-    images    : List[SavedImage]
-    cost_usd  : float
-    usage     : Dict[str, Any]
-    estimated : bool
+    """One completed immediate request: what was made, where it went, what it cost."""
+    def __init__(self, provider: str, model: str, created: int, images: List[SavedImage],
+                 cost_usd: float, usage: Dict[str, Any], estimated: bool):
+        self.provider  = provider
+        self.model     = model
+        self.created   = created
+        self.images    = images
+        self.cost_usd  = cost_usd
+        self.usage     = usage
+        self.estimated = estimated   # True when the cost came from the price table
 
 
-@dataclass
 class ImageBatchResult:
-    provider  : str
-    model     : str
-    batch_id  : str
-    status    : str
-    # The short reference the user sees. 0 for a batch this proxy did not submit.
-    number    : int              = 0
-    images    : List[SavedImage] = field(default_factory=list)
-    cost_usd  : float            = 0.0
-    counts    : Dict[str, int]   = field(default_factory=dict)
-    errors    : List[str]        = field(default_factory=list)
+    """
+    What is known about one batch. Unlike ImageResult this is filled in as retrieval
+    proceeds rather than all at once -- the fields below the line accumulate while the
+    output file is walked -- so the two halves are kept visibly apart.
+    """
+    def __init__(self, provider: str, model: str, batch_id: str, status: str,
+                 number: int = 0, counts: Optional[Dict[str, int]] = None):
+        self.provider = provider
+        self.model    = model
+        self.batch_id = batch_id
+        self.status   = status
+        # The short reference the user sees. 0 for a batch this proxy did not submit.
+        self.number   = number
+        self.counts   = counts or {}
+
+        # Accumulated during retrieve_image_batch().
+        self.images   : List[SavedImage] = []
+        self.cost_usd : float            = 0.0
+        self.errors   : List[str]        = []
 
 
 # Provider and model resolution
@@ -563,6 +616,45 @@ def path_is_allowed(resolved: str) -> bool:
     return False
 
 
+def describe_image(head: bytes, size: int, label: str) -> Tuple[str, str, int, int, bool]:
+    """
+    (format, mime, width, height, has_alpha) for a candidate image, or a rejection.
+
+    The shared half of validation: everything that depends only on the bytes, so an
+    uploaded image and one read off disk are judged by exactly the same rules.
+    """
+    if size <= 0:
+        raise ImageRequestError(f"{label} is empty.")
+    if size > cfg.image_edit_max_bytes:
+        raise ImageRequestError(f"{label} is {size:,} bytes; the limit is {cfg.image_edit_max_bytes:,} (IMAGE_EDIT_MAX_BYTES).")
+
+    sniffed = sniff_image(head)
+    if sniffed is None:
+        raise ImageRequestError(f"{label} is not a PNG, JPEG or WebP image.")
+
+    fmt, mime = sniffed
+    if fmt == "png":
+        width, height, has_alpha = read_png_geometry(head)
+        return fmt, mime, width, height, has_alpha
+    return fmt, mime, 0, 0, False
+
+
+def load_uploaded_reference(name: str, data: bytes) -> ReferenceImage:
+    """
+    One reference image from bytes posted with the request.
+
+    Needs no filesystem access at all, so none of the path machinery applies: there is
+    nothing to traverse, no allowlist to consult, and no way to reach a file the caller
+    was not already holding. The content checks are the same ones a path gets.
+    """
+    label = f"uploaded file {name!r}" if name else "uploaded file"
+    fmt, mime, width, height, has_alpha = describe_image(data[:4096], len(data), label)
+
+    return ReferenceImage(format=fmt, mime=mime, size=len(data), data=data,
+                          name=os.path.basename(name or ""), width=width, height=height,
+                          has_alpha=has_alpha)
+
+
 def load_reference(spec: Any, from_prompt: bool, slot: int = 0) -> ReferenceImage:
     """
     One validated reference image, from a slot number or a filesystem path.
@@ -571,6 +663,11 @@ def load_reference(spec: Any, from_prompt: bool, slot: int = 0) -> ReferenceImag
     be readable, be an image by its magic bytes, and fit the size cap. A caller that
     named something unusable should be told so, not quietly handed a shorter list.
     """
+    # An upload arrives already validated, since its bytes never came from the filesystem
+    # and there is nothing left to resolve.
+    if isinstance(spec, ReferenceImage):
+        return spec
+
     if isinstance(spec, bool):
         raise ImageRequestError(f"an image reference must be a slot number or a path, got {spec!r}.")
 
@@ -605,29 +702,15 @@ def load_reference(spec: Any, from_prompt: bool, slot: int = 0) -> ReferenceImag
     if not os.path.isfile(resolved)    : raise ImageRequestError(f"{spec!r} is not a regular file.")
     if not os.access(resolved, os.R_OK): raise ImageRequestError(f"{spec!r} is not readable.")
 
-    size = os.path.getsize(resolved)
-    if size <= 0:
-        raise ImageRequestError(f"{spec!r} is empty.")
-    if size > cfg.image_edit_max_bytes:
-        raise ImageRequestError(f"{spec!r} is {size:,} bytes; the limit is {cfg.image_edit_max_bytes:,} (IMAGE_EDIT_MAX_BYTES).")
-
     try:
         with open(resolved, "rb") as handle:
             head = handle.read(4096)
     except OSError as exc:
         raise ImageRequestError(f"could not read {spec!r}: {exc}")
 
-    sniffed = sniff_image(head)
-    if sniffed is None:
-        raise ImageRequestError(f"{spec!r} is not a PNG, JPEG or WebP image.")
+    fmt, mime, width, height, has_alpha = describe_image(head, os.path.getsize(resolved), repr(spec))
 
-    fmt, mime = sniffed
-    width = height = 0
-    has_alpha = False
-    if fmt == "png":
-        width, height, has_alpha = read_png_geometry(head)
-
-    return ReferenceImage(path=resolved, format=fmt, mime=mime, size=size,
+    return ReferenceImage(path=resolved, format=fmt, mime=mime, size=os.path.getsize(resolved),
                           width=width, height=height, has_alpha=has_alpha, slot=slot)
 
 
@@ -770,6 +853,18 @@ def build_request(overrides: Optional[Dict[str, Any]] = None, source: str = "dir
 
     fields = dict(overrides or {})
 
+    # Streaming image generation cannot be relayed, and silently returning a whole
+    # response to a client waiting for events fails later and less clearly than saying so.
+    if str(fields.get("stream", "")).strip().lower() in {"true", "1", "yes"}:
+        raise ImageRequestError("streaming image generation is not supported by this proxy.")
+
+    requested_model = fields.get("model")
+    if requested_model and str(requested_model).strip() != cfg.image_model:
+        print(f"NOTE: image request asked for model '{requested_model}'; using the configured '{cfg.image_model}'.")
+
+    for name in IGNORED_FIELDS | {"stream"}:
+        fields.pop(name, None)
+
     unknown = sorted(set(fields) - ALLOWED_OVERRIDES)
     if unknown:
         raise ImageRequestError(f"unsupported field(s) {unknown}; allowed: {sorted(ALLOWED_OVERRIDES)}.")
@@ -873,11 +968,11 @@ def build_edit_form(req: ImageRequest) -> Tuple[Dict[str, str], List[Tuple[str, 
     if req.quality != "auto" : data["quality"] = req.quality
 
     files: List[Tuple[str, Any]] = [
-        ("image[]", (reference.filename(), open(reference.path, "rb"), reference.mime))
+        ("image[]", (reference.filename(), reference.open(), reference.mime))
         for reference in req.images
     ]
     if req.mask is not None:
-        files.append(("mask", (req.mask.filename(), open(req.mask.path, "rb"), req.mask.mime)))
+        files.append(("mask", (req.mask.filename(), req.mask.open(), req.mask.mime)))
 
     return data, files
 
@@ -955,7 +1050,7 @@ def save_image_bytes(req: ImageRequest, data: bytes, image_id: str) -> SavedImag
             except OSError: pass
             raise
 
-    return SavedImage(image_id=image_id, path=os.path.relpath(path, os.getcwd()))
+    return SavedImage(image_id=image_id, path=os.path.relpath(path, os.getcwd()), data=data)
 
 
 def decode_image(b64_data: Any, index: int) -> bytes:
@@ -1011,9 +1106,9 @@ def append_manifest(req: ImageRequest, saved: List[SavedImage], cost_usd: float,
         # An edit driven by 'edit: true' resolves against whatever the slots held at the
         # time, so the inputs are recorded here or the result is unreproducible.
         if req.images:
-            record["source_images"] = [reference.path for reference in req.images]
+            record["source_images"] = [reference.origin() for reference in req.images]
         if req.mask is not None:
-            record["mask"] = req.mask.path
+            record["mask"] = req.mask.origin()
         if req.file_ids:
             record["source_references"] = list(req.file_ids)
         if cfg.image_manifest_prompts:
@@ -1102,6 +1197,8 @@ def estimate_image_cost(model: str, quality: str, size: str, n: int) -> float:
             continue
 
         price = by_size.get(size, by_size.get("*"))
+        if price is None:
+            return 0.0
         try: return float(price)*n
         except (TypeError, ValueError):
             return 0.0

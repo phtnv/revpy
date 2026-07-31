@@ -1,3 +1,4 @@
+import base64
 import builtins
 import contextlib
 import importlib
@@ -1001,7 +1002,7 @@ IMAGE_EXTRACTION_CASES = [
     },
     {
         "name"       : "an unsupported field is reported, not silently defaulted",
-        "messages"   : [{"role": "user", "content": "<image_generation>prompt: \"x\", model: \"gpt-4o\"</image_generation>"}],
+        "messages"   : [{"role": "user", "content": "<image_generation>prompt: \"x\", qualtiy: \"high\"</image_generation>"}],
         "prompts"    : [],
         "needs_text" : False,
         "errors"     : 1,
@@ -1093,8 +1094,10 @@ IMAGE_VALIDATION_CASES = [
     ({"prompt": "x", "n": 0}                            , "n must be between"),
     ({"prompt": "x", "n": 5}                            , "n must be between"),
     ({"prompt": "x", "n": "two"}                        , "n must be an integer"),
-    # Everything the caller must never choose.
-    ({"prompt": "x", "model": "gpt-4o"}                 , "unsupported field"),
+    # Everything the caller must never choose. 'model' is absent on purpose: an OpenAI
+    # client always sends it, so it is accepted and discarded rather than rejected --
+    # see test_image_client_fields for the proof it is not honoured.
+    ({"prompt": "x", "qualtiy": "low"}                  , "unsupported field"),
     ({"prompt": "x", "provider": "gpt"}                 , "unsupported field"),
     ({"prompt": "x", "base_url": "http://evil.test"}    , "unsupported field"),
     ({"prompt": "x", "api_key": "sk-test"}              , "unsupported field"),
@@ -1750,6 +1753,207 @@ def test_image_mask_validation() -> bool:
     return passed
 
 
+def test_image_uploaded_references() -> bool:
+    """
+    Uploaded bytes are validated by the same content rules as a path, and touch the
+    filesystem not at all -- which is why the path allowlist does not apply to them.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing uploaded references: same checks, no filesystem... ", end="")
+
+    make_image_config()
+    # Deliberately hostile settings for a *path*: nothing is readable from a prompt.
+    common.cfg.image_edit_allow_prompt_paths = False
+    common.cfg.image_edit_roots              = []
+    passed = True
+
+    good = v1_images.load_uploaded_reference("shot.png", make_png(64, 32))
+    if (good.format, good.width, good.height, good.path, good.slot) != ("png", 64, 32, "", 0):
+        print(f"exp=png 64x32 with no path, rec={(good.format, good.width, good.height, good.path)} ", end="")
+        passed = False
+    if good.origin() != "upload:shot.png":
+        print(f"exp=upload:shot.png, rec={good.origin()} ", end="")
+        passed = False
+    # The bytes must be readable twice, since a retry rebuilds the form.
+    if good.open().read() != good.open().read() or not good.open().read():
+        print("exp=stream re-readable, rec=exhausted ", end="")
+        passed = False
+
+    rejections = [
+        ("liar.png" , b"#!/bin/sh\nrm -rf /", "not a PNG, JPEG or WebP"),
+        ("empty.png", b""                   , "is empty"),
+    ]
+    for name, payload, expected in rejections:
+        try:
+            v1_images.load_uploaded_reference(name, payload)
+            print(f"exp={expected!r} rejected, rec=accepted ", end="")
+            passed = False
+        except v1_images.ImageRequestError as exc:
+            if expected not in str(exc):
+                print(f"exp contains {expected!r}, rec={exc} ", end="")
+                passed = False
+
+    common.cfg.image_edit_max_bytes = 100
+    try:
+        v1_images.load_uploaded_reference("big.png", make_png(64, 64))
+        print("exp=size cap enforced on uploads, rec=accepted ", end="")
+        passed = False
+    except v1_images.ImageRequestError:
+        pass
+    common.cfg.image_edit_max_bytes = 20*1024*1024
+
+    # An already-validated upload passes straight through build_request.
+    request = v1_images.build_request({"prompt": "x", "images": [good]}, source="direct")
+    if not request.is_edit or request.images[0] is not good:
+        print("exp=upload passed through, rec=re-resolved ", end="")
+        passed = False
+
+    # A mask may be uploaded too, and is held to the same alpha rule.
+    alpha = v1_images.load_uploaded_reference("m.png", make_png(64, 32, alpha=True))
+    flat  = v1_images.load_uploaded_reference("f.png", make_png(64, 32))
+    try:
+        v1_images.build_request({"prompt": "x", "images": [good], "mask": alpha}, source="direct")
+    except Exception as exc:
+        print(f"exp=uploaded mask accepted, rec={exc} ", end="")
+        passed = False
+    try:
+        v1_images.build_request({"prompt": "x", "images": [good], "mask": flat}, source="direct")
+        print("exp=alpha-less uploaded mask rejected, rec=accepted ", end="")
+        passed = False
+    except v1_images.ImageRequestError:
+        pass
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_image_client_fields() -> bool:
+    """
+    An OpenAI client sends fields this proxy does not honour. They must be accepted so
+    client.images.generate() works unmodified, without becoming overridable -- and a
+    genuine typo must still be an error.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing client fields: accepted, not honoured, typos still caught... ", end="")
+
+    make_image_config()
+    passed = True
+
+    # 'model' is proxy policy, exactly as it is for chat.
+    with contextlib.redirect_stdout(io.StringIO()):
+        request = v1_images.build_request({"prompt": "x", "model": "dall-e-3", "user": "u"}, source="direct")
+    if request.prompt != "x":
+        print("exp=request built, rec=failed ", end="")
+        passed = False
+
+    cases = [
+        ({"prompt": "x", "qualtiy": "low"}, "unsupported field"),
+        ({"prompt": "x", "stream": True}  , "streaming image generation is not supported"),
+    ]
+    for fields, expected in cases:
+        try:
+            v1_images.build_request(fields, source="direct")
+            print(f"exp={expected!r} rejected, rec=accepted ", end="")
+            passed = False
+        except v1_images.ImageRequestError as exc:
+            if expected not in str(exc):
+                print(f"exp contains {expected!r}, rec={exc} ", end="")
+                passed = False
+
+    # Ignoring a field must not make it settable.
+    if "model" in v1_images.ALLOWED_OVERRIDES:
+        print("exp=model not overridable, rec=in the allowlist ", end="")
+        passed = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_image_http_routes() -> bool:
+    """
+    The HTTP surface: generations and edits are split the way the upstream API splits
+    them, and the reply carries what an OpenAI client expects.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing image routes: split surface and response formats... ", end="")
+
+    make_config()
+    make_image_config()
+    common.cfg.image_response_format = "b64_json"
+    passed = True
+
+    saved = v1_images.SavedImage(image_id="img_dead", path="generated_images/x.png", data=b"\x89PNG-bytes")
+    fake  = v1_images.ImageResult(provider="testimg", model="gpt-image-2", created=CREATED,
+                                  images=[saved], cost_usd=0.01, usage={"reported": False}, estimated=False)
+
+    original = v1_images.generate_image
+    v1_images.generate_image = lambda request: fake
+    client = server.app.test_client()
+    headers = {"Authorization": "Bearer test-proxy-key"}
+    common.cfg.require_proxy_key = False
+    try:
+        # Editing fields on the generations route are refused, with a pointer.
+        r = client.post("/v1/images/generations", json={"prompt": "x", "images": [1]}, headers=headers)
+        if r.status_code != 400 or "/v1/images/edits" not in r.get_json()["error"]["message"]:
+            print(f"exp=400 pointing at edits, rec={r.status_code} {r.get_json()} ", end="")
+            passed = False
+
+        # The edits route needs references.
+        r = client.post("/v1/images/edits", json={"prompt": "x"}, headers=headers)
+        if r.status_code != 400 or "reference images" not in r.get_json()["error"]["message"]:
+            print(f"exp=400 needing references, rec={r.status_code} ", end="")
+            passed = False
+
+        # b64_json by default, since every caller here is an external client.
+        r = client.post("/v1/images/generations", json={"prompt": "x"}, headers=headers)
+        entry = r.get_json()["data"][0]
+        if r.status_code != 200 or "b64_json" not in entry or entry.get("path") != "generations/x.png".replace("generations", "generated_images"):
+            print(f"exp=b64_json + path, rec={r.status_code} {sorted(entry)} ", end="")
+            passed = False
+        if entry["b64_json"] != base64.b64encode(b"\x89PNG-bytes").decode():
+            print("exp=encoded bytes, rec=wrong payload ", end="")
+            passed = False
+
+        # ...and metadata only when asked.
+        r = client.post("/v1/images/generations", json={"prompt": "x", "response_format": "path"}, headers=headers)
+        if sorted(r.get_json()["data"][0]) != ["id", "path"]:
+            print(f"exp=['id', 'path'], rec={sorted(r.get_json()['data'][0])} ", end="")
+            passed = False
+
+        r = client.post("/v1/images/generations", json={"prompt": "x", "response_format": "jpeg"}, headers=headers)
+        if r.status_code != 400:
+            print(f"exp=400 for a bad response_format, rec={r.status_code} ", end="")
+            passed = False
+
+        # A multipart upload reaches the edits route without any path being involved.
+        r = client.post(
+            "/v1/images/edits",
+            data={"prompt": "x", "image": (io.BytesIO(make_png(64, 64)), "a.png")},
+            content_type="multipart/form-data",
+            headers=headers,
+        )
+        if r.status_code != 200 or "b64_json" not in r.get_json()["data"][0]:
+            print(f"exp=200 with b64_json, rec={r.status_code} {r.get_json()} ", end="")
+            passed = False
+
+        # A multipart edit with no file at all is a clear error, not a crash.
+        r = client.post("/v1/images/edits", data={"prompt": "x"}, content_type="multipart/form-data", headers=headers)
+        if r.status_code != 400:
+            print(f"exp=400 for a fileless multipart edit, rec={r.status_code} ", end="")
+            passed = False
+    finally:
+        v1_images.generate_image = original
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
 def test_image_batch_numbering() -> bool:
     """
     Batches are referenced by a short number, not the provider's hash: numbers are
@@ -2104,6 +2308,9 @@ if __name__ == "__main__":
         tests_passed += test_image_usage(image_usage_case)
 
     tests_passed += test_image_reference_validation()
+    tests_passed += test_image_uploaded_references()
+    tests_passed += test_image_client_fields()
+    tests_passed += test_image_http_routes()
     tests_passed += test_image_edit_path_security()
     tests_passed += test_image_edit_detection()
     tests_passed += test_image_edit_batch_rules()

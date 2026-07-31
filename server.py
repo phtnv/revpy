@@ -10,6 +10,7 @@ from flask      import Flask, Response, abort, jsonify, request, stream_with_con
 from flask_cors import CORS
 from typing     import Any, Dict, List, Optional, Tuple
 from waitress   import serve
+from werkzeug.exceptions import RequestEntityTooLarge
 
 import image_orchestrator
 import v1_messages
@@ -19,6 +20,7 @@ import v1_images
 import v1_responses
 
 from common import (
+    IMAGE_RESPONSE_FORMATS,
     DISABLE_VALUES,
     ENABLE_VALUES,
     INF_VALUES,
@@ -61,6 +63,31 @@ def model_label() -> str:
 # Flask app
 app = Flask(__name__)
 CORS(app)
+
+
+@app.before_request
+def enforce_request_size() -> None:
+    """
+    Caps the body Flask will buffer. Without this any POST is read into memory whole,
+    which uploaded image edits turn from a theoretical concern into a real one -- this
+    proxy is meant to sit behind a public tunnel. Applied per request rather than once at
+    startup so 'reload' can change it.
+    """
+    app.config["MAX_CONTENT_LENGTH"] = cfg.request_max_bytes
+
+
+@app.errorhandler(413)
+def request_too_large(exc: Exception):
+    """A refused upload should say what the limit is, not just fail."""
+    return Response(
+        json.dumps({"error": {
+            "message": f"Request body exceeds REQUEST_MAX_BYTES ({cfg.request_max_bytes:,} bytes).",
+            "type"   : "request_too_large",
+            "code"   : 413,
+        }}),
+        status=413,
+        content_type="application/json",
+    )
 
 # Runtime CLI config
 def reload_runtime_env() -> None:
@@ -1657,11 +1684,37 @@ def chat_snapshot():
     )
 
 
-def make_image_response(result: v1_images.ImageResult) -> Dict[str, Any]:
+# Image HTTP surface
+#
+# Two request encodings reach these routes:
+#   multipart  a client posting its own image bytes (what the OpenAI SDK sends)
+#   JSON       slots, allowlisted paths, or provider file ids for a batch
+#
+# The reply defaults to b64_json for both, because the chat path never comes through here
+# -- every caller on these routes is an external app, and an OpenAI client expects the
+# bytes. Encoding is deliberately not used to guess intent: images.generate() is JSON and
+# still wants b64_json, so that heuristic would break the case it was meant to serve.
+# The saved path rides along in either format, and response_format overrides per call.
+IMAGE_UPLOAD_FIELDS = ("image", "image[]", "image[0]")
+
+
+def resolve_response_format(requested: Any) -> str:
+    if requested:
+        value = str(requested).strip().lower()
+        if value not in IMAGE_RESPONSE_FORMATS:
+            abort(400, description=f"response_format must be one of {sorted(IMAGE_RESPONSE_FORMATS)}, got {requested!r}.")
+        return value
+    return cfg.image_response_format
+
+
+def make_image_response(result: v1_images.ImageResult, response_format: str = "path") -> Dict[str, Any]:
     """
-    The direct endpoint's reply. Metadata rather than Base64: the images are already on
-    disk, and echoing several megabytes of b64_json back to a caller that asked the proxy
-    to save them serves no one.
+    The direct endpoint's reply.
+
+    'path' returns metadata only: the images are already on disk, and echoing megabytes of
+    Base64 back to a caller that asked the proxy to save them serves no one. 'b64_json'
+    additionally carries the bytes, which is what an OpenAI SDK client expects -- the file
+    is still written either way, and 'path' rides along so a local caller can find it.
     """
     usage: Dict[str, Any] = {"estimated_cost_usd": round(result.cost_usd, 6), "cost_is_estimate": result.estimated}
     if result.usage.get("reported"):
@@ -1671,27 +1724,140 @@ def make_image_response(result: v1_images.ImageResult) -> Dict[str, Any]:
             "image_output_tokens" : result.usage["output"],
         })
 
+    data = []
+    for image in result.images:
+        entry: Dict[str, Any] = {"id": image.image_id, "path": image.path}
+        if response_format == "b64_json":
+            entry["b64_json"] = image.b64()
+        data.append(entry)
+
     return {
         "created" : result.created,
         "model"   : result.model,
-        "data"    : [{"id": image.image_id, "path": image.path} for image in result.images],
+        "data"    : data,
         "usage"   : usage,
     }
+
+
+EDIT_FIELDS = ("images", "edit", "mask", "file_ids")
+
+def multipart_edit_fields() -> Dict[str, Any]:
+    """
+    Turns a multipart edit into the same override dict a JSON request produces.
+
+    Uploaded bytes go straight to the validator without ever touching the filesystem, so
+    none of the path machinery -- allowlists, traversal checks, slots -- is involved or
+    needed. Scalars arrive as strings, which build_request already copes with.
+    """
+    uploads: List[Any] = []
+    try:
+        for field_name in IMAGE_UPLOAD_FIELDS:
+            uploads.extend(request.files.getlist(field_name))
+    except RequestEntityTooLarge:
+        # Touching request.files is what parses the body, so an oversized upload surfaces
+        # here rather than at the app's 413 handler. Werkzeug's own wording never mentions
+        # the limit, which is the one thing the caller needs to know.
+        abort(413, description=f"Upload exceeds REQUEST_MAX_BYTES ({cfg.request_max_bytes:,} bytes).")
+
+    if not uploads:
+        abort(400, description=f"a multipart edit must include at least one image file (field 'image' or 'image[]').")
+    if len(uploads) > cfg.image_edit_max_images:
+        abort(400, description=f"{len(uploads)} images uploaded; the limit is {cfg.image_edit_max_images} (IMAGE_EDIT_MAX_IMAGES).")
+
+    fields: Dict[str, Any] = {
+        "images": [v1_images.load_uploaded_reference(item.filename or "", item.read()) for item in uploads]
+    }
+
+    mask = (request.files.get("mask"))
+    if mask is not None:
+        fields["mask"] = v1_images.load_uploaded_reference(mask.filename or "mask.png", mask.read())
+
+    for name in ("prompt", "n", "size", "quality", "output_format", "background", "filename"):
+        if name in request.form:
+            fields[name] = request.form[name]
+
+    return fields
+
+
+def run_image_request(fields: Dict[str, Any], response_format: str):
+    """The shared tail of both image routes: build, dispatch, reply."""
+    req = v1_images.build_request(fields, source="direct")
+
+    if req.batch:
+        batch = v1_images.submit_image_batch([req])
+        return jsonify({
+            "number"            : batch.number,
+            "batch_id"          : batch.batch_id,
+            "status"            : batch.status,
+            "model"             : batch.model,
+            "completion_window" : cfg.image_batch_window,
+            "auto_retrieved"    : cfg.image_batch_auto_poll,
+        })
+
+    return jsonify(make_image_response(v1_images.generate_image(req), response_format))
+
+
+@app.route("/images/edits"   , methods=["POST"])
+@app.route("/v1/images/edits", methods=["POST"])
+def images_edits():
+    """
+    Image editing, in either of the two encodings the upstream endpoint accepts.
+
+    multipart/form-data carries the caller's own image bytes, which is what an OpenAI SDK
+    client sends and what an app that holds its own files needs -- it requires no
+    filesystem access on this machine and so bypasses the path allowlist entirely.
+    JSON carries slot numbers, allowlisted paths, or provider file ids for a batch.
+    """
+    uploaded = request.mimetype == "multipart/form-data"
+
+    try:
+        if uploaded:
+            fields = multipart_edit_fields()
+        else:
+            payload = request.get_json(silent=True)
+            if not isinstance(payload, dict):
+                return Response(json.dumps({"error": {"message": "Invalid JSON body."}}), status=400, content_type="application/json")
+            fields = dict(payload)
+
+        response_format = resolve_response_format(fields.pop("response_format", None))
+
+        # This route always edits, so a bare reference set with no explicit flag still
+        # means an edit -- and a caller who posted to it expecting a generation is told so.
+        if not any(fields.get(name) for name in EDIT_FIELDS):
+            return Response(json.dumps({"error": {"message":
+                "an edit needs reference images: upload them as multipart, or name slots/paths in 'images', "
+                "or provider ids in 'file_ids'. For text-to-image use /v1/images/generations."}}),
+                status=400, content_type="application/json")
+
+        return run_image_request(fields, response_format)
+
+    except Exception as exc:
+        return make_error_response(exc, None if uploaded else request.get_json(silent=True))
 
 
 @app.route("/images/generations"   , methods=["POST"])
 @app.route("/v1/images/generations", methods=["POST"])
 def images_generations():
     """
-    Direct image generation, sharing every default, validator, storage rule and cost
-    path with the chat-triggered route. Only 'prompt' is required.
+    Direct text-to-image generation, sharing every default, validator, storage rule and
+    cost path with the chat-triggered route. Only 'prompt' is required.
+
+    Editing lives at /v1/images/edits, mirroring the upstream API rather than overloading
+    this URL, so a client that knows one knows the other.
     """
     payload = request.get_json(silent=True)
 
     if not isinstance(payload, dict):
         return Response(json.dumps({"error": {"message": "Invalid JSON body."}}), status=400, content_type="application/json")
 
+    present = [name for name in EDIT_FIELDS if payload.get(name)]
+    if present:
+        return Response(json.dumps({"error": {"message":
+            f"{present} {'is' if len(present) == 1 else 'are'} an editing field; post to /v1/images/edits instead."}}),
+            status=400, content_type="application/json")
+
     try:
+        response_format = resolve_response_format(payload.pop("response_format", None))
         req = v1_images.build_request(payload, source="direct")
 
         if req.batch:
@@ -1707,7 +1873,7 @@ def images_generations():
                 "auto_retrieved"    : cfg.image_batch_auto_poll,
             })
 
-        return jsonify(make_image_response(v1_images.generate_image(req)))
+        return jsonify(make_image_response(v1_images.generate_image(req), response_format))
 
     except Exception as exc:
         return make_error_response(exc, payload)
