@@ -2036,6 +2036,201 @@ def test_image_batch_numbering() -> bool:
     return passed
 
 
+def test_image_source_files() -> bool:
+    """
+    Declared lineage outlives the reference it describes.
+
+    A batched edit names its inputs by provider file id, and those ids expire and are
+    deleted -- so the manifest records which file on this machine each one stood for.
+    Declared by the caller when only the caller can know, derived from the references
+    otherwise, and carried through the batch wait either way.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing image source files: lineage the ids cannot carry... ", end="")
+
+    make_image_config()
+    passed = True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base_path = write_file(tmp, "base.png", make_png(16, 16))
+
+        # An object names all three parts; a bare string is a path only when it looks like
+        # one, because reading "base.png" as a path would invent a location it never had.
+        received = v1_images.validate_source_files([
+            {"file_id": "file-abc", "file": "base.png", "path": base_path},
+            base_path,
+            "base.png",
+        ])
+        expected = [
+            {"file_id": "file-abc", "path": base_path, "file": "base.png"},
+            {"path": os.path.realpath(base_path), "file": "base.png"},
+            {"file": "base.png"},
+        ]
+        if not check_equal(expected, received):
+            passed = False
+
+        # A path that no longer resolves is kept as given: the file may have moved, and a
+        # stale link beats no link.
+        moved = v1_images.validate_source_files(["/gone/away/old.png"])
+        if moved != [{"path": "/gone/away/old.png", "file": "old.png"}]:
+            print(f"exp=unresolvable path kept, rec={moved} ", end="")
+            passed = False
+
+        for bad in ([{"nope": "x"}], [""], [123], [{}]):
+            try:
+                v1_images.validate_source_files(bad)
+                print(f"exp={bad} rejected, rec=accepted ", end="")
+                passed = False
+            except v1_images.ImageRequestError:
+                pass
+
+        # Listing the same references in both fields pairs them positionally, so the
+        # caller does not repeat every id inside the entry it already lines up with.
+        request = v1_images.build_request({
+            "prompt"       : "restyle these",
+            "batch"        : True,
+            "file_ids"     : ["file-a", "file-b"],
+            "source_files" : ["a.png", "b.png"],
+        }, source="direct")
+        expected = [{"file": "a.png", "file_id": "file-a"}, {"file": "b.png", "file_id": "file-b"}]
+        if not check_equal(expected, request.source_files):
+            passed = False
+
+        # An id the caller paired itself is left alone, even when the counts line up.
+        paired = v1_images.build_request({
+            "prompt"       : "x",
+            "batch"        : True,
+            "file_ids"     : ["file-a", "file-b"],
+            "source_files" : [{"file_id": "file-b", "file": "b.png"}, {"file": "a.png"}],
+        }, source="direct").source_files
+        if paired[0].get("file_id") != "file-b" or "file_id" in paired[1]:
+            print(f"exp=caller's own pairing kept, rec={paired} ", end="")
+            passed = False
+
+        # Nothing declared: an immediate edit still gets the field, derived from what it
+        # actually carried. A path knows where it came from, an upload only its name.
+        derived = v1_images.manifest_source_files(v1_images.ImageRequest(
+            prompt="x", size="auto", quality="auto", output_format="png",
+            background="opaque", n=1, batch=False,
+            images=[
+                v1_images.load_reference(base_path, from_prompt=False),
+                v1_images.load_uploaded_reference("dropped.png", make_png(8, 8)),
+            ],
+        ))
+        expected = [
+            {"path": os.path.realpath(base_path), "file": "base.png"},
+            {"file": "dropped.png"},
+        ]
+        if not check_equal(expected, derived):
+            passed = False
+
+        # The manifest is written when a batch is retrieved, hours after the request that
+        # declared the lineage is gone -- so the state file has to carry it.
+        restored = v1_images.state_to_request(v1_images.request_to_state(request))
+        if not check_equal(request.source_files, restored.source_files):
+            passed = False
+
+        # The record itself: a basename that joins it to a directory listing, its size,
+        # and the lineage. 'path' is relative to the proxy's cwd and cannot serve as the
+        # join key, which is the whole reason 'file' exists.
+        common.cfg.image_output_dir      = tmp
+        common.cfg.image_manifest_enabled = True
+        common.cfg.image_manifest_prompts = True
+
+        payload = make_png(16, 16)
+        saved   = v1_images.save_image_bytes(request, payload, "img_abcdef0123456789")
+        v1_images.append_manifest(request, [saved], 0.04, {"reported": False}, True, batch_id="batch_x")
+
+        with open(os.path.join(tmp, v1_images.MANIFEST_FILE), "r", encoding="utf-8") as handle:
+            records = json.load(handle)
+
+        record   = records[0] if records else {}
+        received = {
+            "file"         : record.get("file"),
+            "bytes"        : record.get("bytes"),
+            "source_files" : record.get("source_files"),
+            "size"         : (record.get("request_parameters") or {}).get("size"),
+            "joins"        : record.get("file") in os.listdir(tmp),
+        }
+        expected = {
+            "file"         : os.path.basename(saved.path),
+            "bytes"        : len(payload),
+            "source_files" : [{"file": "a.png", "file_id": "file-a"},
+                              {"file": "b.png", "file_id": "file-b"}],
+            # The size that was *asked* for, recorded as given -- including 'auto'.
+            "size"         : request.size,
+            "joins"        : True,
+        }
+        if not check_equal(expected, received):
+            passed = False
+
+        common.cfg.image_manifest_enabled = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_image_batch_listing() -> bool:
+    """
+    The listing a client rebuilds its job list from: recorded state only, newest first.
+
+    It must not ask the provider about anything. A listing is polled, and one that fanned
+    out would both cost and, through retrieval, bill.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing image batch listing: recorded state, no provider call... ", end="")
+
+    make_image_config()
+    passed = True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        common.cfg.image_output_dir = tmp
+        v1_images.write_batch_state({
+            "batch_aaa": {"number": 1, "retrieved": True, "final_status": "completed",
+                          "model": "gpt-image-2", "submitted_at": "2026-07-31T10:00:00+0000",
+                          "images": ["generated_images/one.png"],
+                          "requests": {"img_0000_aa": {"prompt": "a cat", "size": "1024x1024",
+                                                       "n": 1, "file_ids": ["file-a"],
+                                                       "source_files": [{"file": "base.png", "file_id": "file-a"}]}}},
+            "batch_bbb": {"number": 2, "retrieved": False, "model": "gpt-image-2",
+                          "submitted_at": "2026-07-31T11:00:00+0000",
+                          "requests": {"img_0000_bb": {"prompt": "a dog", "n": 2}}},
+            # Retrieved without a final status: settled, but not by any provider word.
+            "batch_ccc": {"number": 3, "retrieved": True, "model": "gpt-image-2"},
+        })
+
+        listing  = v1_images.list_batches()
+        received = {
+            "order"    : [entry["number"] for entry in listing],
+            "statuses" : {entry["number"]: entry["status"] for entry in listing},
+            "lineage"  : listing[-1]["requests"][0]["source_files"],
+            "prompt"   : listing[-1]["requests"][0]["prompt"],
+            "images"   : listing[-1]["images"],
+        }
+        expected = {
+            "order"    : [3, 2, 1],
+            "statuses" : {1: "completed", 2: "pending", 3: "settled"},
+            "lineage"  : [{"file": "base.png", "file_id": "file-a"}],
+            "prompt"   : "a cat",
+            "images"   : ["generated_images/one.png"],
+        }
+        if not check_equal(expected, received):
+            passed = False
+
+        # A directory nobody has submitted from lists nothing rather than failing.
+        common.cfg.image_output_dir = os.path.join(tmp, "empty")
+        if v1_images.list_batches() != []:
+            print("exp=empty listing, rec=entries ", end="")
+            passed = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
 def test_image_batch_polling() -> bool:
     """
     The poller settles finished batches, leaves running ones alone, keeps going past a
@@ -2317,8 +2512,10 @@ if __name__ == "__main__":
     tests_passed += test_image_edit_form()
     tests_passed += test_image_mask_validation()
 
+    tests_passed += test_image_source_files()
     tests_passed += test_image_batch_accounting()
     tests_passed += test_image_batch_numbering()
+    tests_passed += test_image_batch_listing()
     tests_passed += test_image_batch_polling()
     tests_passed += test_image_storage_confinement()
     tests_passed += test_image_chat_integration()

@@ -20,7 +20,15 @@ import v1_images
 import v1_responses
 
 from common import (
+    IMAGE_BACKGROUNDS,
+    IMAGE_FORMATS,
+    IMAGE_QUALITIES,
     IMAGE_RESPONSE_FORMATS,
+    IMAGE_SIZE_EDGE_MULTIPLE,
+    IMAGE_SIZE_MAX_ASPECT,
+    IMAGE_SIZE_MAX_EDGE,
+    IMAGE_SIZE_MAX_PIXELS,
+    IMAGE_SIZE_MIN_PIXELS,
     DISABLE_VALUES,
     ENABLE_VALUES,
     INF_VALUES,
@@ -1638,6 +1646,11 @@ def running():
                 "provider"             : cfg.image_provider,
                 "model"                : cfg.image_model,
                 "output_dir"           : cfg.image_output_dir,
+                # The configured value is routinely relative, and relative to *this*
+                # process's working directory, which a client cannot know. A local app
+                # browsing the output folder needs the resolved one.
+                "output_dir_abs"       : os.path.abspath(cfg.image_output_dir),
+                "manifest_file"        : v1_images.MANIFEST_FILE,
                 "cost_family"          : cfg.image_cost_family,
                 "batch_auto_poll"      : cfg.image_batch_auto_poll,
                 "batch_poll_seconds"   : cfg.image_batch_poll_seconds,
@@ -1648,6 +1661,29 @@ def running():
                     "background" : cfg.image_default_background,
                     "n"          : cfg.image_default_n,
                     "batch"      : cfg.image_default_batch,
+                },
+                # Enough for a client to reject a bad request before sending it, rather
+                # than learning the rules one 400 at a time. Sizes are a constraint set
+                # rather than a list because validate_size() checks bounds, not an enum.
+                "limits"               : {
+                    "max_n"            : cfg.image_max_n,
+                    "max_prompt_chars" : cfg.image_max_prompt_chars,
+                    "edit_enabled"     : cfg.image_edit_enabled,
+                    "edit_max_images"  : cfg.image_edit_max_images,
+                    "edit_max_bytes"   : cfg.image_edit_max_bytes,
+                    "request_max_bytes": cfg.request_max_bytes,
+                    "size"             : {
+                        "edge_multiple" : IMAGE_SIZE_EDGE_MULTIPLE,
+                        "max_edge"      : IMAGE_SIZE_MAX_EDGE,
+                        "max_aspect"    : IMAGE_SIZE_MAX_ASPECT,
+                        "min_pixels"    : IMAGE_SIZE_MIN_PIXELS,
+                        "max_pixels"    : IMAGE_SIZE_MAX_PIXELS,
+                    },
+                },
+                "options"              : {
+                    "qualities"   : sorted(IMAGE_QUALITIES),
+                    "formats"     : sorted(IMAGE_FORMATS),
+                    "backgrounds" : sorted(IMAGE_BACKGROUNDS),
                 },
                 "session"              : images,
             },
@@ -1877,6 +1913,22 @@ def images_generations():
 
     except Exception as exc:
         return make_error_response(exc, payload)
+
+
+@app.route("/images/batches"   , methods=["GET"])
+@app.route("/v1/images/batches", methods=["GET"])
+def images_batch_list():
+    """
+    Every batch this proxy has submitted from its output directory.
+
+    Reads recorded state only -- no provider call, and so no retrieval and no billing.
+    A client rebuilding a job list after a restart wants exactly this, and wants it to
+    stay cheap enough to poll.
+    """
+    try:
+        return jsonify({"data": v1_images.list_batches()})
+    except Exception as exc:
+        return make_error_response(exc, None)
 
 
 @app.route("/images/batches/<token>"   , methods=["GET"])

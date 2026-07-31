@@ -68,6 +68,10 @@ ALLOWED_OVERRIDES = {
     # API request can carry. 'input_fidelity' is deliberately absent: gpt-image-2 always
     # processes inputs at high fidelity and rejects attempts to set it.
     "images", "mask", "edit", "file_ids",
+    # Lineage the caller declares rather than the proxy derives: which file on this
+    # machine each reference came from. Recorded in the manifest, never sent upstream.
+    # See validate_source_files() for why it exists at all.
+    "source_files",
 }
 
 # Fields an OpenAI client sends that this proxy accepts and then discards. They are not in
@@ -89,6 +93,11 @@ WEBP_TAG    = b"WEBP"
 
 # Extension per output_format. 'jpeg' is the API's spelling; '.jpg' is the file's.
 FORMAT_EXTENSIONS = {"png": ".png", "jpeg": ".jpg", "webp": ".webp"}
+
+# What one 'source_files' entry may carry. 'file' is the basename, which is what joins a
+# manifest record to a directory listing; 'path' is where it was at request time; and
+# 'file_id' is the provider handle the job used, which outlives nothing.
+SOURCE_FILE_KEYS = {"file_id", "path", "file"}
 
 SIZE_RE     = re.compile(r"^(\d{1,5})\s*[x×]\s*(\d{1,5})$")
 # A filename override is a *name*, never a path: no separators, no traversal, no
@@ -180,7 +189,8 @@ class ImageRequest:
                  n: int, batch: bool, filename: str = "", source: str = "direct",
                  images: Optional[List[ReferenceImage]] = None,
                  mask: Optional[ReferenceImage] = None,
-                 file_ids: Optional[List[str]] = None):
+                 file_ids: Optional[List[str]] = None,
+                 source_files: Optional[List[Dict[str, str]]] = None):
         self.prompt        = prompt
         self.size          = size
         self.quality       = quality
@@ -197,6 +207,11 @@ class ImageRequest:
         self.images   = images or []
         self.mask     = mask
         self.file_ids = file_ids or []
+
+        # Declared lineage. Empty means "derive it from the references", which
+        # manifest_source_files() does; it is only supplied explicitly when the
+        # references are provider ids and the proxy has no other way to know.
+        self.source_files = source_files or []
 
     @property
     def is_edit(self) -> bool:
@@ -765,6 +780,67 @@ def validate_file_ids(specs: Any) -> List[str]:
     return ids
 
 
+def validate_source_files(specs: Any) -> List[Dict[str, str]]:
+    """
+    Caller-declared lineage: the file on this machine each reference of this request came
+    from. Recorded in the manifest and never sent to the provider.
+
+    It exists because a batched edit names its references by provider file id, and those
+    ids expire and are deleted -- the copy on this machine is what survives, so the
+    manifest has to name it. The id is recorded too, but only as the handle the job
+    happened to use.
+
+    An entry is either an object with any of file_id / path / file, or a bare string,
+    which is read as a path when it looks like one and as a name otherwise. A path that
+    does not resolve is recorded as given rather than rejected: the file may have been
+    moved since, and a stale link is worth more than no link at all.
+    """
+    if not isinstance(specs, list):
+        specs = [specs]
+
+    sources: List[Dict[str, str]] = []
+    for spec in specs:
+        if isinstance(spec, dict):
+            unknown = sorted(set(spec) - SOURCE_FILE_KEYS)
+            if unknown:
+                raise ImageRequestError(f"unsupported source_files field(s) {unknown}; allowed: {sorted(SOURCE_FILE_KEYS)}.")
+            file_id = str(spec.get("file_id") or "").strip()
+            raw     = str(spec.get("path")    or "").strip()
+            name    = str(spec.get("file")    or "").strip()
+        elif isinstance(spec, str):
+            value   = spec.strip()
+            file_id = ""
+            # A separator is the only thing distinguishing "D:/img/a.png" from "a.png",
+            # and treating a bare name as a path would invent a location it never had.
+            raw     = value if (os.sep in value or "/" in value) else ""
+            name    = "" if raw else value
+        else:
+            raise ImageRequestError(f"a source_files entry must be a string or an object, got {spec!r}.")
+
+        if not (file_id or raw or name):
+            raise ImageRequestError("a source_files entry must name at least one of file_id, path or file.")
+
+        entry: Dict[str, str] = {}
+        if file_id:
+            entry["file_id"] = file_id
+        if raw:
+            expanded = os.path.expanduser(raw)
+            try:
+                resolved = os.path.realpath(expanded) if os.path.exists(expanded) else raw
+            except OSError:
+                resolved = raw
+            entry["path"] = resolved
+            entry["file"] = name or os.path.basename(resolved)
+        elif name:
+            entry["file"] = name
+
+        sources.append(entry)
+
+    if len(sources) > cfg.image_edit_max_images:
+        raise ImageRequestError(f"{len(sources)} source_files entries; the limit is {cfg.image_edit_max_images} (IMAGE_EDIT_MAX_IMAGES).")
+    return sources
+
+
 def resolve_edit_inputs(fields: Dict[str, Any], source: str, batch: bool) -> Tuple[List[ReferenceImage], Optional[ReferenceImage], List[str]]:
     """
     Decides whether this request edits, and against what.
@@ -896,6 +972,16 @@ def build_request(overrides: Optional[Dict[str, Any]] = None, source: str = "dir
 
     filename = sanitize_filename_stem(fields["filename"]) if fields.get("filename") else ""
 
+    source_files = validate_source_files(fields["source_files"]) if fields.get("source_files") else []
+
+    # Positional pairing, so a caller listing the same references in both fields does not
+    # have to repeat each id inside the lineage entry it already lines up with. Only done
+    # when the counts match and no entry named an id itself, since either of those means
+    # the caller had a pairing of its own in mind.
+    if file_ids and len(source_files) == len(file_ids) and not any(entry.get("file_id") for entry in source_files):
+        for entry, file_id in zip(source_files, file_ids):
+            entry["file_id"] = file_id
+
     return ImageRequest(
         prompt        = prompt,
         size          = size,
@@ -909,6 +995,7 @@ def build_request(overrides: Optional[Dict[str, Any]] = None, source: str = "dir
         images        = images,
         mask          = mask,
         file_ids      = file_ids,
+        source_files  = source_files,
     )
 
 
@@ -1050,7 +1137,15 @@ def save_image_bytes(req: ImageRequest, data: bytes, image_id: str) -> SavedImag
             except OSError: pass
             raise
 
-    return SavedImage(image_id=image_id, path=os.path.relpath(path, os.getcwd()), data=data)
+    # Reported relative to the working directory, which is the short form worth reading in
+    # a console. On Windows two drives share no common prefix at all and relpath raises
+    # rather than returning something absolute, so the absolute path stands in -- an output
+    # directory on another drive is a configuration, not an error.
+    try: reported = os.path.relpath(path, os.getcwd())
+    except ValueError:
+        reported = path
+
+    return SavedImage(image_id=image_id, path=reported, data=data)
 
 
 def decode_image(b64_data: Any, index: int) -> bytes:
@@ -1062,6 +1157,28 @@ def decode_image(b64_data: Any, index: int) -> bytes:
     except (binascii.Error, ValueError) as exc:
         raise ProviderError(502, {"error": {"message": f"image {index} was not valid Base64: {exc}"}},
                             "invalid Base64 in image response")
+
+
+def manifest_source_files(req: ImageRequest) -> List[Dict[str, str]]:
+    """
+    The lineage recorded for one request, in one shape whichever route produced it.
+
+    A caller that declared its own wins, because only it knows which local file a
+    provider file id stands for. Otherwise it is derived from the references the request
+    actually carried, so an immediate edit gets the same field without anyone supplying
+    it. An upload has a name but no location on this machine, which is exactly what the
+    entry then says.
+    """
+    if req.source_files:
+        return [dict(entry) for entry in req.source_files]
+
+    sources: List[Dict[str, str]] = []
+    for reference in req.images:
+        if reference.path:
+            sources.append({"path": reference.path, "file": os.path.basename(reference.path)})
+        else:
+            sources.append({"file": reference.filename()})
+    return sources
 
 
 def append_manifest(req: ImageRequest, saved: List[SavedImage], cost_usd: float, usage: Dict[str, Any], estimated: bool, batch_id: str = "") -> None:
@@ -1085,6 +1202,12 @@ def append_manifest(req: ImageRequest, saved: List[SavedImage], cost_usd: float,
         record: Dict[str, Any] = {
             "image_id"           : image.image_id,
             "path"               : image.path,
+            # 'path' is relative to the proxy's working directory, which a client reading
+            # this file out of the output directory has no way to resolve. The basename
+            # is what joins a record to a directory listing, and allocate_path() has
+            # already made it unique within that directory.
+            "file"               : os.path.basename(image.path),
+            "bytes"              : len(image.data) if image.data is not None else 0,
             "provider"           : cfg.image_provider,
             "model"              : cfg.image_model,
             "request_parameters" : {
@@ -1111,6 +1234,11 @@ def append_manifest(req: ImageRequest, saved: List[SavedImage], cost_usd: float,
             record["mask"] = req.mask.origin()
         if req.file_ids:
             record["source_references"] = list(req.file_ids)
+        # The durable half of the above: 'source_references' names ids that expire, this
+        # names the files on this machine they stood for.
+        sources = manifest_source_files(req)
+        if sources:
+            record["source_files"] = sources
         if cfg.image_manifest_prompts:
             record["prompt"] = req.prompt
         records.append(record)
@@ -1467,6 +1595,9 @@ def request_to_state(req: ImageRequest) -> Dict[str, Any]:
         "filename"      : req.filename,
         "source"        : req.source,
         "file_ids"      : list(req.file_ids),
+        # Carried through the wait: the manifest is written at retrieval, by which time
+        # the request that declared this lineage is long gone.
+        "source_files"  : [dict(entry) for entry in req.source_files],
     }
 
 
@@ -1482,6 +1613,10 @@ def state_to_request(entry: Dict[str, Any]) -> ImageRequest:
         filename      = str(entry.get("filename", "")),
         source        = str(entry.get("source", "batch")),
         file_ids      = [str(value) for value in (entry.get("file_ids") or [])],
+        source_files  = [
+            {str(key): str(value) for key, value in item.items() if key in SOURCE_FILE_KEYS}
+            for item in (entry.get("source_files") or []) if isinstance(item, dict)
+        ],
     )
 
 
@@ -1731,6 +1866,54 @@ def pending_batches() -> List[Tuple[int, str]]:
         if not entry.get("retrieved")
     ]
     return sorted(pending)
+
+
+def list_batches() -> List[Dict[str, Any]]:
+    """
+    Every batch submitted from this output directory, newest first.
+
+    Reports the state file rather than asking the provider about each batch in turn: a
+    listing is a cheap call a client makes often, and one that fanned out to the provider
+    would not be. An unsettled batch therefore reports 'pending' -- its live status comes
+    from retrieving it, which is what GET /v1/images/batches/<n> does.
+    """
+    with BATCH_LOCK:
+        state = read_batch_state()
+
+    listing: List[Dict[str, Any]] = []
+    for batch_id, entry in state.items():
+        entry     = entry if isinstance(entry, dict) else {}
+        retrieved = bool(entry.get("retrieved"))
+        requests  = entry.get("requests") or {}
+
+        listing.append({
+            "number"        : int(entry.get("number") or 0),
+            "batch_id"      : batch_id,
+            "provider"      : entry.get("provider") or "",
+            "model"         : entry.get("model") or "",
+            "submitted_at"  : entry.get("submitted_at") or "",
+            "retrieved"     : retrieved,
+            "retrieved_at"  : entry.get("retrieved_at") or "",
+            # 'pending' is this proxy's word, not the provider's: nothing here has asked
+            # the provider, so claiming one of its statuses would be inventing it.
+            "status"        : str(entry.get("final_status") or ("settled" if retrieved else "pending")),
+            "images"        : list(entry.get("images") or []),
+            "requests"      : [
+                {
+                    "custom_id"     : custom_id,
+                    "prompt"        : item.get("prompt", ""),
+                    "size"          : item.get("size", ""),
+                    "quality"       : item.get("quality", ""),
+                    "output_format" : item.get("output_format", ""),
+                    "n"             : item.get("n", 1),
+                    "file_ids"      : list(item.get("file_ids") or []),
+                    "source_files"  : list(item.get("source_files") or []),
+                }
+                for custom_id, item in requests.items() if isinstance(item, dict)
+            ],
+        })
+
+    return sorted(listing, key=lambda item: item["number"], reverse=True)
 
 
 def poll_batches_once() -> List[ImageBatchResult]:

@@ -378,7 +378,7 @@ A failed generation never costs you the turn. The model's prose still arrives, w
 
 ### Overridable fields
 
-`prompt`, `size`, `quality`, `output_format`, `background`, `n`, `batch`, `filename`, and for editing `images`, `edit`, `mask`, `file_ids`.
+`prompt`, `size`, `quality`, `output_format`, `background`, `n`, `batch`, `filename`, and for editing `images`, `edit`, `mask`, `file_ids`, `source_files`.
 
 Anything else — model, provider, base URL, API key, headers, output path — is proxy policy and is rejected rather than ignored, so a typo is reported instead of silently taking a default. `filename` is a *name*, never a path: separators, traversal and unusual characters are refused, the extension comes from `output_format`, and an existing file is never overwritten (a linear index is appended instead).
 
@@ -391,6 +391,8 @@ Two routes, split the way the upstream API splits them, so a client that knows o
 ```text
 POST /v1/images/generations    text to image
 POST /v1/images/edits          image to image
+GET  /v1/images/batches        every batch submitted from this output directory
+GET  /v1/images/batches/<n>    one batch, retrieving it if it has completed
 ```
 
 Every omitted field is filled from configuration; only `prompt` is required.
@@ -422,7 +424,30 @@ A multipart edit carries the caller's own bytes, so it needs no filesystem acces
 
 Note that `model` is accepted and **ignored**, exactly as it is for chat — the proxy decides which image model runs, via `IMAGE_MODEL` or `image model <n>`. `user`, `style` and friends are likewise accepted and discarded. A field that is neither honored nor known is still a 400, so a typo is reported rather than silently defaulted, and `stream: true` is refused outright instead of returning something an SSE client cannot read.
 
-Each image also appends a record to `img_generation.json` in the output directory (`IMAGE_MANIFEST_ENABLED`; `IMAGE_MANIFEST_PROMPTS` decides whether the prompt itself is kept, since the manifest outlives the session).
+`GET /` reports the image defaults, the limits and the resolved output directory, so a client can fill its own controls and reject a bad request before sending it rather than learning the rules one 400 at a time.
+
+### The manifest
+
+Each image appends a record to `img_generation.json` in the output directory (`IMAGE_MANIFEST_ENABLED`; `IMAGE_MANIFEST_PROMPTS` decides whether the prompt itself is kept, since the manifest outlives the session).
+
+```json
+{
+  "image_id": "img_8f281a…", "file": "20260730_105900_8f281a.png",
+  "path": "generated_images/20260730_105900_8f281a.png", "bytes": 1857293,
+  "provider": "openai", "model": "gpt-image-2",
+  "request_parameters": {"size": "1024x1024", "quality": "high",
+                         "output_format": "png", "background": "opaque", "n": 1},
+  "operation": "edit", "source": "direct", "created_at": "2026-07-30T10:59:00+0300",
+  "source_files": [{"file": "base.png", "path": "D:\\img\\base.png", "file_id": "file-HT2dMq…"}],
+  "estimated_cost_usd": 0.005945, "cost_is_estimate": false, "usage": {}
+}
+```
+
+`file` is the basename and `path` is relative to the proxy's working directory. A client reading the manifest out of the output directory has no way to resolve the latter, so **`file` is the key that joins a record to a directory listing** — `allocate_path` has already made it unique there.
+
+`request_parameters.size` is the size that was *asked* for, recorded as given, including the literal `"auto"`.
+
+`source_files` is the lineage: which file on this machine each reference came from. For an edit against paths or uploads the proxy derives it (a path knows where it came from; an upload only its name). For a batched edit it has to be declared, because the request names its inputs by provider file id and nothing else connects those to a local file — see below.
 
 ### Editing images
 
@@ -517,6 +542,8 @@ image batch poll           Check everything unsettled now, instead of waiting ou
 
 `GET /v1/images/batches/2` works the same way, and both forms still accept a raw provider id so a batch this proxy never submitted can be fetched.
 
+`GET /v1/images/batches` lists them all instead, newest first, from the recorded state alone — it asks the provider nothing, so it neither costs anything nor retrieves anything, and a client can poll it to rebuild a job list after a restart. An unsettled batch reports `pending`, which is this proxy's word rather than one of the provider's; its live status comes from retrieving it.
+
 The parameters each batch was submitted with are kept in `img_batches.json` in the output directory, because the provider returns only the images and the id it was given. Retrieving a completed batch saves its images once and records that it did, so neither a second retrieval nor the poller racing you can write a duplicate or bill you twice. A batch that failed, expired or was cancelled is settled too, so the poller stops asking about it.
 
 A batch reports the same token counts as an immediate request, so nothing in the response reveals the discount — set `IMAGE_BATCH_COST_MULTIPLIER` to state it. It defaults to `1.0` (no discount assumed, so a budget is never quietly understated); OpenAI bills the Batch API at 50%, so `0.5` is right for that provider.
@@ -529,9 +556,12 @@ The Batch API accepts no multipart upload, so a batched edit cannot send local f
 {
   "prompt": "Give her the red coat.",
   "batch": true,
-  "file_ids": ["file-HT2dMq...", "https://example.com/coat.png"]
+  "file_ids": ["file-HT2dMq...", "https://example.com/coat.png"],
+  "source_files": ["D:\\img\\portrait.png", "coat.png"]
 }
 ```
+
+`source_files` is optional and never reaches the provider — it is recorded in the manifest so the result can still be traced back to its inputs once the ids are gone. That matters here more than anywhere else: **a provider file id expires and is deleted, while the copy on your disk does not**, so the local file is the durable name for a reference and the id is only the handle this particular job used. An entry may be a bare string — read as a path when it looks like one, as a name otherwise — or an object with any of `file_id`, `path` and `file`. Given the same number of entries as `file_ids` and no ids of its own, the two are paired positionally, so the ids do not have to be repeated. A path that no longer resolves is recorded as given rather than rejected: the file may have moved, and a stale link is worth more than none.
 
 Entries may be provider file ids or URLs, and several references work — two were confirmed to consume 2048 image input tokens, the same as an immediate two-reference edit. A URL entry is accepted by the schema, but the provider then has to fetch it, and a host that refuses non-browser requests fails the line with `Error while downloading file. Upstream status code: 400` rather than anything about the URL being wrong (Wikimedia does exactly this). A `file-` id avoids the whole question. Upload the files yourself (the proxy does not manage the Files API); anything else is rejected before submission:
 
