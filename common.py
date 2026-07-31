@@ -535,6 +535,31 @@ class RuntimeConfig:
         self.image_batch_auto_poll    = getenv_bool("IMAGE_BATCH_AUTO_POLL", True)
         self.image_batch_poll_seconds = max(10.0, getenv_float("IMAGE_BATCH_POLL_SECONDS", 300.0))
 
+        # Image editing. Reference images are read off this machine and uploaded to the
+        # provider, which makes every path here a read primitive -- hence the allowlist.
+        # Gateway failures (Cloudflare 520s in front of the provider) are common enough to
+        # make a single-attempt image call unreliable. Only failures that produced no image
+        # are retried, so this never pays for the same picture twice.
+        self.image_retry_attempts         = max(1, getenv_int("IMAGE_RETRY_ATTEMPTS", 3))
+        self.image_retry_backoff_seconds  = max(0.0, getenv_float("IMAGE_RETRY_BACKOFF_SECONDS", 5.0))
+
+        self.image_edit_enabled      = getenv_bool("IMAGE_EDIT_ENABLED", True)
+        self.image_edit_max_images   = max(1, getenv_int("IMAGE_EDIT_MAX_IMAGES", 4))
+        self.image_edit_max_bytes    = max(1, getenv_int("IMAGE_EDIT_MAX_BYTES", 20*1024*1024))
+        # Edits usually want the source geometry kept, which is what 'auto' asks for.
+        self.image_edit_default_size = os.getenv("IMAGE_EDIT_DEFAULT_SIZE", "auto").strip().lower() or "auto"
+
+        # Whether a path written in a chat block may be read at all. Off by default: this
+        # proxy is built to sit behind a public tunnel, and a prompt-supplied path is an
+        # arbitrary-file-read-and-exfiltrate primitive for anyone who reaches it. The CLI
+        # slots need none of this, since paths there come from whoever runs the console.
+        self.image_edit_allow_prompt_paths = getenv_bool("IMAGE_EDIT_ALLOW_PROMPT_PATHS", False)
+        self.image_edit_roots = [
+            os.path.realpath(os.path.expanduser(root.strip()))
+            for root in os.getenv("IMAGE_EDIT_ROOTS", "").split(",")
+            if root.strip()
+        ]
+
         # Fallback per-image price estimates, for providers that return no usage object.
         # {"model-regex": {quality: {size: usd}}}, with "*" accepted for either key.
         self.image_price_table: Dict[str, Any] = {}
@@ -548,7 +573,7 @@ class RuntimeConfig:
                 print(f"WARNING: IMAGE_PRICE_TABLE is not valid json5 ({exc}). Ignoring.")
 
         # Resolved prices for the selected image model. Populated by
-        # v1_images_generation.apply_image_model(); inert until then.
+        # v1_images.apply_image_model(); inert until then.
         self.image_cost_family     = ""
         self.image_text_input_cost   = 0.0
         self.image_image_input_cost  = 0.0
@@ -1117,7 +1142,7 @@ def track_image_usage(counts: Dict[str, Any], images: int, batch: bool, model: s
 
     'counts' carries text_input, image_input, output and an 'estimated' flag. The
     providers seen so far return an exact usage object, so estimation is the fallback
-    path for those that do not (see v1_images_generation.estimate_image_cost).
+    path for those that do not (see v1_images.estimate_image_cost).
     """
     text_input_tok  = max(0, int(counts.get("text_input" , 0) or 0))
     image_input_tok = max(0, int(counts.get("image_input", 0) or 0))

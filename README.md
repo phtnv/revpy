@@ -378,7 +378,7 @@ A failed generation never costs you the turn. The model's prose still arrives, w
 
 ### Overridable fields
 
-`prompt`, `size`, `quality`, `output_format`, `background`, `n`, `batch`, `filename`.
+`prompt`, `size`, `quality`, `output_format`, `background`, `n`, `batch`, `filename`, and for editing `images`, `edit`, `mask`, `file_ids`.
 
 Anything else — model, provider, base URL, API key, headers, output path — is proxy policy and is rejected rather than ignored, so a typo is reported instead of silently taking a default. `filename` is a *name*, never a path: separators, traversal and unusual characters are refused, the extension comes from `output_format`, and an existing file is never overwritten (a linear index is appended instead).
 
@@ -404,6 +404,73 @@ Every omitted field is filled from configuration. The reply is metadata, not Bas
 ```
 
 Each image also appends a record to `img_generation.json` in the output directory (`IMAGE_MANIFEST_ENABLED`; `IMAGE_MANIFEST_PROMPTS` decides whether the prompt itself is kept, since the manifest outlives the session).
+
+### Editing images
+
+The proxy can edit existing images as well as make new ones — including the common case of taking a feature from one picture and applying it to another, which is what several reference images are for.
+
+**Reference images are named from the console, not from the chat.** Fill numbered slots:
+
+```text
+image edit set 1 /home/you/pictures/cassia.png
+image edit add /home/you/pictures/coat.png     # next free slot
+image edit                                     # list them
+image edit clear                               # empty every slot
+```
+
+Then edit, either from the CLI or from a chat block:
+
+```xml
+<image_generation>
+prompt : "Give her the red coat from the second image.",
+edit   : true
+</image_generation>
+```
+
+`edit: true` means "use whatever the slots hold". You can also name references inline as slot numbers:
+
+```xml
+<image_generation>
+prompt : "Give her the red coat from the second image.",
+images : [1, 2]
+</image_generation>
+```
+
+A block with neither `images` nor `edit` is an ordinary generation, exactly as before — nothing about the existing behaviour changes.
+
+Because `edit: true` resolves against mutable console state, the manifest records the absolute source paths for every generated image, so a result can always be traced back to its inputs.
+
+#### Paths in chat blocks are off by default
+
+A path written inside a chat message is a request for this proxy to read a file off your machine and upload it to the provider. Since the proxy is built to sit behind a public tunnel, that is disabled unless you turn it on *and* nominate the directories it may read:
+
+```ini
+IMAGE_EDIT_ALLOW_PROMPT_PATHS=true
+IMAGE_EDIT_ROOTS=/home/you/pictures,/home/you/refs
+```
+
+Paths are resolved with `realpath` before the check, so a symlink sitting inside an allowed root but pointing outside it is refused. Slot numbers work regardless of this setting, and the CLI is always allowed to name paths — that is the point of slots.
+
+Every reference is validated before anything is sent: it must exist, be a regular readable file, be a PNG, JPEG or WebP **by its leading bytes rather than its extension**, and fit `IMAGE_EDIT_MAX_BYTES`. Anything that fails is rejected outright rather than quietly dropped from the list.
+
+#### Masks
+
+A mask marks the region the model may repaint — transparent pixels are editable, opaque ones are preserved. It must be a PNG with an alpha channel, matching the first reference's dimensions:
+
+```text
+image edit mask /home/you/pictures/coat_area.png
+image edit mask clear
+```
+
+A mask set this way applies to slot-driven edits automatically. Note that masking with GPT Image is prompt-guided: the model treats the mask as guidance rather than a precise stencil. A JPEG mask is rejected up front, since JPEG has no alpha channel — the provider's own docs call that the most common cause of edit failures.
+
+#### What edits cost
+
+Reference images are billed as image input tokens, and gpt-image-2 always processes them at high fidelity, so an edit costs noticeably more on input than a generation. In practice one 1024×1024 reference is about 1024 input image tokens, and they add up linearly — two references measured 2048. At the configured $8/MTok that is roughly $0.008 per reference on top of the output cost. The proxy reports it exactly, since the provider returns the split.
+
+#### Reliability
+
+Image calls retry gateway-class failures (502/503/504/520/522/524 and dropped connections), which the provider's front end produces often enough to matter. Only failures that produced no image are retried, so a retry never pays for the same picture twice; a refusal or a bad request is never repeated. Tune with `IMAGE_RETRY_ATTEMPTS` (1 disables) and `IMAGE_RETRY_BACKOFF_SECONDS`.
 
 ### Batch API
 
@@ -435,6 +502,28 @@ The parameters each batch was submitted with are kept in `img_batches.json` in t
 
 A batch reports the same token counts as an immediate request, so nothing in the response reveals the discount — set `IMAGE_BATCH_COST_MULTIPLIER` to state it. It defaults to `1.0` (no discount assumed, so a budget is never quietly understated); OpenAI bills the Batch API at 50%, so `0.5` is right for that provider.
 
+#### Batching an edit
+
+The Batch API accepts no multipart upload, so a batched edit cannot send local files. Reference images have to already live on the provider, named by `file_ids` instead of `images`:
+
+```json
+{
+  "prompt": "Give her the red coat.",
+  "batch": true,
+  "file_ids": ["file-HT2dMq...", "https://example.com/coat.png"]
+}
+```
+
+Entries may be provider file ids or URLs, and several references work — two were confirmed to consume 2048 image input tokens, the same as an immediate two-reference edit. A URL entry is accepted by the schema, but the provider then has to fetch it, and a host that refuses non-browser requests fails the line with `Error while downloading file. Upstream status code: 400` rather than anything about the URL being wrong (Wikimedia does exactly this). A `file-` id avoids the whole question. Upload the files yourself (the proxy does not manage the Files API); anything else is rejected before submission:
+
+- `file_ids` without `batch: true` — it exists only for batching
+- `images` with `batch: true` — local files cannot be batched; upload them and use `file_ids`
+- `images` and `file_ids` together — mutually exclusive
+- a `mask` with `batch: true` — a mask would have to be uploaded too
+- a batch mixing edits and generations — a batch names one endpoint for all its lines
+
+One provider note worth recording, since the published batch guide is misleading here: batched edits take `images` as **an array of objects** (`[{"file_id": "..."}]`) — always an array, even for one reference, and never bare id strings. The `input_reference` field the guide describes belongs to image-guided *generation*, and sending it to `/v1/images/edits` fails with `Missing required parameter: 'images'`.
+
 ### CLI
 
 ```text
@@ -442,6 +531,7 @@ image                  Show image status.
 image gen <prompt>     Generate now, using the configured defaults.
 image model            List the image provider's image models.
 image model <number>   Select one. Your chat model is untouched.
+image edit ...         Reference images for editing ('image edit help').
 image batch <prompt>   Submit a one-request batch.
 image batch get <n>    Retrieve batch number <n> and save its images.
 image batch list       List batches submitted from this output directory.
@@ -489,8 +579,8 @@ Around them:
 
 Image generation sits beside them rather than among them, since it is a secondary service the chat backends never call:
 
-- **`v1_images_generation.py`** — the `/images/generations` adapter: provider and price resolution, validation, transport, Base64 decoding, atomic file saving, the manifest, and the Batch API. It never writes to `cfg.backend`, `cfg.model` or the text price fields.
-- **`image_orchestrator.py`** — finds, parses and strips `<image_generation>` blocks in user messages, and decides whether the turn still needs the text model. It decides *whether*; `v1_images_generation.py` decides *how*.
+- **`v1_images.py`** — the `/v1/images/*` adapter: provider and price resolution, validation, both transports (JSON for generation, multipart for editing), Base64 decoding, atomic file saving, reference-image slots, the manifest, and the Batch API. One module rather than one per endpoint, because generating and editing share everything except the transport — the `v1_*` files above are split by *protocol*, which is a dispatch boundary, not by URL. It never writes to `cfg.backend`, `cfg.model` or the text price fields.
+- **`image_orchestrator.py`** — finds, parses and strips `<image_generation>` blocks in user messages, and decides whether the turn still needs the text model. It decides *whether*; `v1_images.py` decides *how*.
 
 Both the direct endpoint and the chat trigger build the same `ImageRequest` and hand it to the same module, so validation, storage and accounting exist exactly once.
 

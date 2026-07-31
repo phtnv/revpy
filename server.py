@@ -15,7 +15,7 @@ import image_orchestrator
 import v1_messages
 import providers
 import v1_chat_completions
-import v1_images_generation
+import v1_images
 import v1_responses
 
 from common import (
@@ -83,11 +83,11 @@ def reload_runtime_env() -> None:
 
     # Image generation is configured independently of the text model, so it is resolved
     # again here rather than riding along with the model switch below.
-    v1_images_generation.resolve_image_config()
-    v1_images_generation.refresh_image_models(cfg.model_list_timeout_seconds)
+    v1_images.resolve_image_config()
+    v1_images.refresh_image_models(cfg.model_list_timeout_seconds)
     # Idempotent: arms the poller if this reload switched it on, and does nothing if one
     # is already running (it re-reads the interval by itself).
-    v1_images_generation.start_batch_poller()
+    v1_images.start_batch_poller()
 
     print("Reloaded runtime configuration from .env.")
     print("HOST and PORT were not changed; restart the process to change bind address.")
@@ -176,6 +176,8 @@ CLI_CMD_IMAGE_INFO = """\
     image                     Show image generation status.
     image gen <prompt>        Generate an image now, using the configured defaults.
       Alias: g, generate
+    image edit ...            Reference images for editing. 'image edit help' for more.
+      Alias: e
     image model               List the image models of the image provider.
     image model <uint>        Select an image model. Does not change the chat model.
     image model refresh       Request the image model list again.
@@ -207,12 +209,12 @@ def cli_print_image_cost() -> None:
 def cli_generate_image(prompt: str, batch: bool) -> None:
     """Runs one CLI image request. Errors are reported, never raised into the CLI loop."""
     try:
-        req = v1_images_generation.build_request({"prompt": prompt, "batch": batch}, source="cli")
+        req = v1_images.build_request({"prompt": prompt, "batch": batch}, source="cli")
         if batch:
-            result = v1_images_generation.submit_image_batch([req])
+            result = v1_images.submit_image_batch([req])
             print(f"Batch #{result.number} is {result.status}.")
             return
-        result = v1_images_generation.generate_image(req)
+        result = v1_images.generate_image(req)
         for image in result.images:
             print(f"Saved {image.image_id} -> {image.path}")
         print(f"Cost: {fmt_usd(result.cost_usd)}{' (estimated)' if result.estimated else ''}")
@@ -224,8 +226,8 @@ def cli_generate_image(prompt: str, batch: bool) -> None:
 def cli_retrieve_batch(token: str) -> None:
     """Retrieves a batch by its short number (or by a raw provider id)."""
     try:
-        batch_id = v1_images_generation.resolve_batch_id(token)
-        result   = v1_images_generation.retrieve_image_batch(batch_id)
+        batch_id = v1_images.resolve_batch_id(token)
+        result   = v1_images.retrieve_image_batch(batch_id)
         label    = f"#{result.number}" if result.number else result.batch_id
         print(f"Batch {label} is {result.status}. {result.counts}")
         for image in result.images:
@@ -239,16 +241,157 @@ def cli_retrieve_batch(token: str) -> None:
         write_error_log({"error": str(exc), "traceback": traceback.format_exc()})
 
 
+CLI_CMD_IMAGE_EDIT_INFO = """\
+  image edit command. Alias: e.
+    image edit                  Show the reference image slots.
+    image edit set <uint> <path>  Point slot <uint> at a file.
+      Alias: s
+    image edit add <path>       Fill the next free slot.
+      Alias: a
+    image edit mask <path>      Set the mask (PNG with alpha). 'mask clear' to remove.
+      Alias: m
+    image edit clear [uint]     Clear one slot, or every slot.
+      Alias: c
+    image edit <prompt>         Edit using the filled slots.
+"""
+
+
+def cli_show_slots() -> None:
+    slots = v1_images.read_slots()
+    if not slots:
+        print("No reference image slots are filled. Use 'image edit set 1 <path>'.")
+        return
+
+    for number in v1_images.numbered_slots(slots):
+        try:
+            reference = v1_images.resolve_slot(number)
+            geometry  = f"{reference.width}x{reference.height}" if reference.width else "?"
+            print(f"  {number:>3}  {reference.format:<5} {geometry:>11}  {reference.size:>10,}B  {reference.path}")
+        except Exception as exc:
+            # Slots are re-validated on use, so a file that has since vanished or been
+            # replaced shows up here rather than surprising the next chat turn.
+            print(f"  {number:>3}  UNUSABLE  {slots[str(number)]}  ({exc})")
+
+    if slots.get(v1_images.MASK_KEY):
+        print(f"  mask  {slots[v1_images.MASK_KEY]}")
+
+
+def cli_set_slot(number: int, path: str) -> None:
+    try:
+        reference = v1_images.set_slot(number, path)
+        geometry  = f" {reference.width}x{reference.height}" if reference.width else ""
+        print(f"Slot {number} -> {reference.path} ({reference.format},{geometry} {reference.size:,}B)")
+    except Exception as exc:
+        print_error(exc)
+
+
+def cli_clear_slots(number: Optional[int]) -> None:
+    try:
+        cleared = v1_images.clear_slot(number)
+        if number is None : print(f"Cleared {cleared} slot(s).")
+        elif cleared      : print(f"Cleared slot {number}.")
+        else              : print(f"Slot {number} was already empty.")
+    except Exception as exc:
+        print_error(exc)
+
+
+def cli_edit_image(prompt: str) -> None:
+    """Edits using whatever the slots hold, which is what 'edit: true' means in chat too."""
+    try:
+        request = v1_images.build_request({"prompt": prompt, "edit": True}, source="cli")
+        print(f"Editing with {len(request.images)} reference image(s).")
+        result = v1_images.generate_image(request)
+        for image in result.images:
+            print(f"Saved {image.image_id} -> {image.path}")
+        print(f"Cost: {fmt_usd(result.cost_usd)}{' (estimated)' if result.estimated else ''}")
+    except Exception as exc:
+        print_error(exc)
+        write_error_log({"error": str(exc), "traceback": traceback.format_exc()})
+
+
+def handle_image_edit_command(line: str, parts: List[str]) -> None:
+    """The 'image edit' subgroup. Paths are accepted here because the console is trusted."""
+    parts_l = len(parts)
+
+    if parts_l < 3:
+        cli_show_slots()
+        return
+
+    arg2 = parts[2].lower()
+    if arg2 in {"?", "help"}:
+        print(CLI_CMD_IMAGE_EDIT_INFO)
+        return
+
+    if arg2 in {"c", "clear"}:
+        if parts_l < 4:
+            cli_clear_slots(None)
+            return
+        try: cli_clear_slots(int(parts[3]))
+        except ValueError: print(CLI_CMD_IMAGE_EDIT_INFO)
+        return
+
+    if arg2 in {"s", "set"}:
+        # 'image edit set 2 /a b/c.png' -- the path is the rest of the line, unsplit,
+        # so a filename containing spaces survives.
+        split_line = line.split(maxsplit=4)
+        if len(split_line) < 5:
+            print(CLI_CMD_IMAGE_EDIT_INFO)
+            return
+        try: number = int(split_line[3])
+        except ValueError:
+            print(CLI_CMD_IMAGE_EDIT_INFO)
+            return
+        cli_set_slot(number, split_line[4].strip().strip('"').strip("'"))
+        return
+
+    if arg2 in {"a", "add"}:
+        split_line = line.split(maxsplit=3)
+        if len(split_line) < 4:
+            print(CLI_CMD_IMAGE_EDIT_INFO)
+            return
+        cli_set_slot(v1_images.next_free_slot(), split_line[3].strip().strip('"').strip("'"))
+        return
+
+    if arg2 in {"m", "mask"}:
+        split_line = line.split(maxsplit=3)
+        if len(split_line) < 4:
+            print(CLI_CMD_IMAGE_EDIT_INFO)
+            return
+        value = split_line[3].strip().strip('"').strip("'")
+        try:
+            if value.lower() in {"clear", "none", "off"}:
+                with v1_images.SLOT_LOCK:
+                    slots = v1_images.read_slots()
+                    slots.pop("mask", None)
+                    v1_images.write_slots(slots)
+                print("Mask cleared.")
+                return
+            reference = v1_images.load_reference(value, from_prompt=False)
+            v1_images.validate_mask(reference, v1_images.filled_slots())
+            with v1_images.SLOT_LOCK:
+                slots = v1_images.read_slots()
+                slots["mask"] = reference.path
+                v1_images.write_slots(slots)
+            print(f"Mask -> {reference.path} ({reference.width}x{reference.height})")
+        except Exception as exc:
+            print_error(exc)
+        return
+
+    # Anything else is the prompt for an edit against the filled slots.
+    split_line = line.split(maxsplit=2)
+    cli_edit_image(split_line[2])
+
+
 def cli_poll_batches() -> None:
     """Runs the poller's work on demand, for when waiting out the interval is not the point."""
-    pending = v1_images_generation.pending_batches()
+    pending = v1_images.pending_batches()
     if not pending:
         print("No image batches are waiting.")
         return
 
     print(f"Checking {len(pending)} batch(es): {', '.join('#' + str(number) for number, _ in pending)}")
     try:
-        settled = v1_images_generation.poll_batches_once()
+        settled = v1_images.poll_batches_once()
     except Exception as exc:
         print_error(exc)
         write_error_log({"error": str(exc), "traceback": traceback.format_exc()})
@@ -262,7 +405,7 @@ def cli_poll_batches() -> None:
 
 
 def cli_list_batches() -> None:
-    state = v1_images_generation.read_batch_state()
+    state = v1_images.read_batch_state()
     if not state:
         print("No image batches have been submitted from this output directory.")
         return
@@ -302,19 +445,23 @@ def handle_image_command(line: str, parts: List[str]) -> None:
         cli_generate_image(split_line[2], batch=False)
         return
 
+    if arg1 in {"e", "edit"}:
+        handle_image_edit_command(line, parts)
+        return
+
     if arg1 in {"m", "model", "models"}:
         if parts_l < 3:
-            v1_images_generation.print_image_model_list()
+            v1_images.print_image_model_list()
             return
         arg2 = parts[2].lower()
         if arg2 in {"r", "refresh"}:
-            v1_images_generation.refresh_image_models(cfg.model_list_timeout_seconds)
+            v1_images.refresh_image_models(cfg.model_list_timeout_seconds)
             return
         try: index = int(arg2)
         except ValueError:
             print(CLI_CMD_IMAGE_INFO)
             return
-        v1_images_generation.select_image_model_by_number(index)
+        v1_images.select_image_model_by_number(index)
         return
 
     if arg1 in {"b", "batch"}:
@@ -1226,6 +1373,7 @@ def make_error_response(exc: Exception, payload: Optional[Dict[str, Any]] = None
 # Image generation
 IMAGE_NOTE_MAX_CHARS = 240
 HTML_TAG_RE          = re.compile(r"<[^>]+>")
+HTML_DOC_RE          = re.compile(r"<!DOCTYPE\s+html|<html[\s>]|<body[\s>]", re.IGNORECASE)
 
 def image_note_message(message: str) -> str:
     """
@@ -1235,8 +1383,14 @@ def image_note_message(message: str) -> str:
     error_from_response falls back to the first 2000 characters of the body. Relaying that
     verbatim buries the model's actual reply under a wall of markup, so it is stripped to
     one short line here. The full body still reaches the error log.
+
+    Tags are only stripped from something that is actually a markup document: the proxy's
+    own messages use angle brackets for placeholders ("img edit set 1 <path>"), and an
+    indiscriminate strip silently deletes the most useful part of the advice.
     """
-    text = HTML_TAG_RE.sub(" ", str(message or ""))
+    text = str(message or "")
+    if HTML_DOC_RE.search(text):
+        text = HTML_TAG_RE.sub(" ", text)
     text = " ".join(text.split())
     if len(text) > IMAGE_NOTE_MAX_CHARS:
         text = text[:IMAGE_NOTE_MAX_CHARS].rstrip() + "…"
@@ -1254,14 +1408,14 @@ def run_image_requests(extraction: image_orchestrator.Extraction) -> str:
     for req in extraction.requests:
         try:
             if req.batch:
-                batch = v1_images_generation.submit_image_batch([req])
+                batch = v1_images.submit_image_batch([req])
                 if cfg.image_batch_auto_poll:
                     lines.append(f"[Image batch #{batch.number} submitted — it will be saved automatically when it completes]")
                 else:
                     lines.append(f"[Image batch #{batch.number} submitted — retrieve with 'image batch get {batch.number}']")
                 continue
-            result = v1_images_generation.generate_image(req)
-            lines.append(v1_images_generation.reference_line(result))
+            result = v1_images.generate_image(req)
+            lines.append(v1_images.reference_line(result))
         except Exception as exc:
             _, client_body = build_error_body(exc)
             print_error(exc)
@@ -1503,7 +1657,7 @@ def chat_snapshot():
     )
 
 
-def make_image_response(result: v1_images_generation.ImageResult) -> Dict[str, Any]:
+def make_image_response(result: v1_images.ImageResult) -> Dict[str, Any]:
     """
     The direct endpoint's reply. Metadata rather than Base64: the images are already on
     disk, and echoing several megabytes of b64_json back to a caller that asked the proxy
@@ -1538,10 +1692,10 @@ def images_generations():
         return Response(json.dumps({"error": {"message": "Invalid JSON body."}}), status=400, content_type="application/json")
 
     try:
-        req = v1_images_generation.build_request(payload, source="direct")
+        req = v1_images.build_request(payload, source="direct")
 
         if req.batch:
-            batch = v1_images_generation.submit_image_batch([req])
+            batch = v1_images.submit_image_batch([req])
             return jsonify({
                 # 'number' is the short reference the CLI and chat replies use; the
                 # provider id is kept for callers that talk to the provider directly.
@@ -1553,7 +1707,7 @@ def images_generations():
                 "auto_retrieved"    : cfg.image_batch_auto_poll,
             })
 
-        return jsonify(make_image_response(v1_images_generation.generate_image(req)))
+        return jsonify(make_image_response(v1_images.generate_image(req)))
 
     except Exception as exc:
         return make_error_response(exc, payload)
@@ -1567,7 +1721,7 @@ def images_batch_status(token: str):
     short number the proxy assigned or the provider's own batch id.
     """
     try:
-        result = v1_images_generation.retrieve_image_batch(v1_images_generation.resolve_batch_id(token))
+        result = v1_images.retrieve_image_batch(v1_images.resolve_batch_id(token))
         return jsonify({
             "number"   : result.number,
             "batch_id" : result.batch_id,
@@ -1626,9 +1780,9 @@ if __name__ == "__main__":
         raise SystemExit(1)
     finish_model_switch(True)
 
-    v1_images_generation.resolve_image_config()
-    v1_images_generation.refresh_image_models(cfg.model_list_timeout_seconds)
-    v1_images_generation.start_batch_poller()
+    v1_images.resolve_image_config()
+    v1_images.refresh_image_models(cfg.model_list_timeout_seconds)
+    v1_images.start_batch_poller()
 
     print("Starting proxy")
     print(f"Local URL: http://{cfg.host}:{cfg.port}")

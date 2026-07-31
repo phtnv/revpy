@@ -1,16 +1,22 @@
 """
-The /images/generations backend: the low-level image API adapter.
+The /v1/images/* backend: the low-level image API adapter.
+
+Serves the whole image family -- /images/generations, /images/edits, and their Batch API
+counterparts -- rather than one endpoint each. Unlike the three v1_* wire modules, which
+are interchangeable implementations of one protocol selected per provider, generating and
+editing are two operations over a single API that share almost everything downstream:
+provider and price resolution, request validation, storage, the manifest, cost accounting
+and the batch lifecycle. Only the transport differs, and that difference is confined to
+post_generation() and post_edit().
 
 This module is a secondary service, not a fourth wire protocol. It never writes to
 cfg.backend, cfg.model or the text price fields, never appears in the conversational
 model list, and never decides *whether* an image should be made -- that is
-image_orchestrator's job. It resolves the configured image provider, validates a
-request against explicit allowlists, talks to the provider, decodes the Base64 result,
-saves it, and reports what it cost.
+image_orchestrator's job.
 
-Both entry points into image generation (the direct /v1/images/generations route and
-the chat orchestrator) build an ImageRequest and hand it here, so validation, transport,
-storage and accounting exist exactly once.
+Every entry point (the direct routes, the chat orchestrator and the CLI) builds an
+ImageRequest and hands it here, so validation, transport, storage and accounting exist
+exactly once.
 """
 
 import base64
@@ -18,6 +24,7 @@ import binascii
 import json
 import os
 import re
+import struct
 import threading
 import time
 import uuid
@@ -54,7 +61,23 @@ from providers import (
 # The fields a caller (or a model) may override. Everything else comes from configuration.
 # Provider, model, base URL, credentials, headers and output *paths* are deliberately
 # absent: those are proxy policy, not request content (see the plan, 7.3).
-ALLOWED_OVERRIDES = {"prompt", "size", "quality", "output_format", "background", "n", "batch", "filename"}
+ALLOWED_OVERRIDES = {
+    "prompt", "size", "quality", "output_format", "background", "n", "batch", "filename",
+    # Editing. 'images' names local references (slot numbers, or paths when allowed);
+    # 'file_ids' names references already on the provider, which is the only form a Batch
+    # API request can carry. 'input_fidelity' is deliberately absent: gpt-image-2 always
+    # processes inputs at high fidelity and rejects attempts to set it.
+    "images", "mask", "edit", "file_ids",
+}
+
+# What a reference image may be. Identified by magic bytes rather than by extension: a
+# '.png' that is really something else must fail here, not at the provider.
+IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "png" , "image/png" ),
+    (b"\xff\xd8\xff"     , "jpeg", "image/jpeg"),
+)
+WEBP_RIFF   = b"RIFF"
+WEBP_TAG    = b"WEBP"
 
 # Extension per output_format. 'jpeg' is the API's spelling; '.jpg' is the file's.
 FORMAT_EXTENSIONS = {"png": ".png", "jpeg": ".jpg", "webp": ".webp"}
@@ -65,9 +88,16 @@ SIZE_RE     = re.compile(r"^(\d{1,5})\s*[x×]\s*(\d{1,5})$")
 FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 FILENAME_MAX_STEM = 120
 
-BATCH_ENDPOINT   = "/v1/images/generations"
+BATCH_ENDPOINT      = "/v1/images/generations"
+BATCH_EDIT_ENDPOINT = "/v1/images/edits"
 BATCH_STATE_FILE = "img_batches.json"
 MANIFEST_FILE    = "img_generation.json"
+SLOTS_FILE       = "img_slots.json"
+# The mask shares the slots file under a key no slot number can collide with.
+MASK_KEY         = "mask"
+
+# Guards the slot file the same way BATCH_LOCK guards the batch state.
+SLOT_LOCK = threading.RLock()
 
 # Statuses a batch never moves out of. Anything else is still worth polling.
 BATCH_TERMINAL_STATUSES = {"completed", "failed", "expired", "cancelled"}
@@ -101,6 +131,22 @@ class ImageConfigError(ProviderError):
 
 
 @dataclass
+class ReferenceImage:
+    """One validated local image to edit from."""
+    path      : str
+    format    : str            # png | jpeg | webp
+    mime      : str
+    size      : int            # bytes on disk
+    width     : int = 0        # 0 when the header could not be read
+    height    : int = 0
+    has_alpha : bool = False   # PNG only; what a mask is required to have
+    slot      : int  = 0       # the slot it came from, 0 for a path
+
+    def filename(self) -> str:
+        return os.path.basename(self.path)
+
+
+@dataclass
 class ImageRequest:
     prompt        : str
     size          : str
@@ -111,6 +157,17 @@ class ImageRequest:
     batch         : bool
     filename      : str = ""       # sanitized stem, or "" for the timestamped default
     source        : str = "direct" # "direct" or "chat"; for logging only
+
+    # Editing. 'images' and 'file_ids' are mutually exclusive: the first is a multipart
+    # upload of local files, the second names references already held by the provider,
+    # which is the only form the Batch API accepts.
+    images        : List[ReferenceImage]   = field(default_factory=list)
+    mask          : Optional[ReferenceImage] = None
+    file_ids      : List[str]              = field(default_factory=list)
+
+    @property
+    def is_edit(self) -> bool:
+        return bool(self.images or self.file_ids)
 
 
 @dataclass
@@ -346,6 +403,362 @@ def sanitize_filename_stem(raw: Any) -> str:
     return stem[:FILENAME_MAX_STEM]
 
 
+# Reference image slots
+#
+# The console's way of naming files without a prompt ever carrying a path. Slots persist
+# so a restart does not lose them, and are re-validated every time they are used: the
+# file behind a slot can be moved, replaced or truncated between being set and being sent.
+def slots_path() -> str:
+    return os.path.join(os.path.abspath(cfg.image_output_dir), SLOTS_FILE)
+
+
+def read_slots() -> Dict[str, str]:
+    path = slots_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            slots = json.load(handle)
+        return {str(k): str(v) for k, v in slots.items()} if isinstance(slots, dict) else {}
+    except Exception as exc:
+        print(f"WARNING: could not read {path} ({exc}).")
+        return {}
+
+
+def write_slots(slots: Dict[str, str]) -> None:
+    path     = os.path.join(output_dir_path(), SLOTS_FILE)
+    tmp_path = f"{path}.{uuid.uuid4().hex[:8]}.part"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(slots, handle, indent=2, ensure_ascii=False, default=str)
+            handle.write("\n")
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        try: os.unlink(tmp_path)
+        except OSError: pass
+        print(f"WARNING: could not write {path} ({exc}).")
+
+
+def set_slot(number: int, path: str) -> ReferenceImage:
+    """
+    Points a slot at a file, validating it now so a mistake is reported at the console
+    rather than three turns later inside a chat reply.
+    """
+    if number < 1:
+        raise ImageRequestError("slot numbers start at 1.")
+
+    # from_prompt=False: the console is trusted with paths, which is the entire reason
+    # slots exist.
+    reference = load_reference(path, from_prompt=False, slot=number)
+
+    with SLOT_LOCK:
+        slots = read_slots()
+        slots[str(number)] = reference.path
+        write_slots(slots)
+
+    return reference
+
+
+def clear_slot(number: Optional[int]) -> int:
+    with SLOT_LOCK:
+        slots = read_slots()
+        if number is None:
+            count = len(slots)
+            write_slots({})
+            return count
+        removed = slots.pop(str(number), None)
+        write_slots(slots)
+        return 1 if removed else 0
+
+
+def numbered_slots(slots: Dict[str, str]) -> List[int]:
+    """
+    Just the reference slots, in order. The mask lives in the same file under a
+    non-numeric key, so every walk over the slots has to go through here.
+    """
+    numbers = []
+    for key in slots:
+        try: numbers.append(int(key))
+        except ValueError:
+            continue
+    return sorted(numbers)
+
+
+def next_free_slot() -> int:
+    slots = read_slots()
+    number = 1
+    while str(number) in slots:
+        number += 1
+    return number
+
+
+def stored_mask() -> Optional[ReferenceImage]:
+    """The mask set from the console, re-validated, or None when none is set."""
+    path = read_slots().get(MASK_KEY)
+    if not path:
+        return None
+    return load_reference(path, from_prompt=False)
+
+
+def resolve_slot(number: int) -> ReferenceImage:
+    slots = read_slots()
+    path  = slots.get(str(number))
+    if not path:
+        raise ImageRequestError(f"image slot {number} is empty. Fill it with 'img edit set {number} <path>'.")
+    # Re-validated rather than trusted: the file may have changed since it was set.
+    return load_reference(path, from_prompt=False, slot=number)
+
+
+def filled_slots() -> List[ReferenceImage]:
+    """Every filled slot, in number order. Unreadable ones raise rather than be skipped."""
+    return [resolve_slot(number) for number in numbered_slots(read_slots())]
+
+
+# Reference images
+def sniff_image(head: bytes) -> Optional[Tuple[str, str]]:
+    """
+    (format, mime) from a file's leading bytes, or None when it is not an image this
+    endpoint accepts. Content decides; the extension is never consulted.
+    """
+    for magic, fmt, mime in IMAGE_MAGIC:
+        if head.startswith(magic):
+            return fmt, mime
+    if head[:4] == WEBP_RIFF and head[8:12] == WEBP_TAG:
+        return "webp", "image/webp"
+    return None
+
+
+def read_png_geometry(head: bytes) -> Tuple[int, int, bool]:
+    """
+    (width, height, has_alpha) from a PNG's IHDR chunk.
+
+    Colour types 4 and 6 carry an alpha channel; 3 (palette) can fake one with a tRNS
+    chunk, which is why that is checked too. Enough to tell a usable mask from the JPEG
+    that the provider's docs call the most common cause of edit failures, without taking
+    on an imaging dependency for one header.
+    """
+    if len(head) < 26 or head[12:16] != b"IHDR":
+        return 0, 0, False
+
+    width, height = struct.unpack(">II", head[16:24])
+    colour_type   = head[25]
+    has_alpha     = colour_type in (4, 6) or (colour_type == 3 and b"tRNS" in head)
+    return width, height, has_alpha
+
+
+def path_is_allowed(resolved: str) -> bool:
+    """
+    Whether a prompt-supplied path may be read. Containment is tested after realpath, so
+    a symlink sitting inside an allowed root but pointing outside it is refused -- the
+    link, not its target, is what an attacker gets to place.
+    """
+    if not cfg.image_edit_roots:
+        return False
+    for root in cfg.image_edit_roots:
+        try:
+            if os.path.commonpath([root, resolved]) == root:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def load_reference(spec: Any, from_prompt: bool, slot: int = 0) -> ReferenceImage:
+    """
+    One validated reference image, from a slot number or a filesystem path.
+
+    Rejects rather than skips, in this order: the path must resolve, be a regular file,
+    be readable, be an image by its magic bytes, and fit the size cap. A caller that
+    named something unusable should be told so, not quietly handed a shorter list.
+    """
+    if isinstance(spec, bool):
+        raise ImageRequestError(f"an image reference must be a slot number or a path, got {spec!r}.")
+
+    # A bare integer is a slot; slots are filled from the console, never from a prompt.
+    if isinstance(spec, int) or (isinstance(spec, str) and spec.strip().isdigit()):
+        return resolve_slot(int(spec))
+
+    if not isinstance(spec, str) or not spec.strip():
+        raise ImageRequestError(f"an image reference must be a slot number or a path, got {spec!r}.")
+
+    raw = os.path.expanduser(spec.strip())
+
+    if from_prompt:
+        if not cfg.image_edit_allow_prompt_paths:
+            raise ImageRequestError(
+                "image paths in a chat request are disabled. Use a slot number "
+                "('img edit set 1 <path>'), or set IMAGE_EDIT_ALLOW_PROMPT_PATHS=true."
+            )
+        if not cfg.image_edit_roots:
+            raise ImageRequestError("IMAGE_EDIT_ALLOW_PROMPT_PATHS is on but IMAGE_EDIT_ROOTS is empty, so no path is readable.")
+
+    try: resolved = os.path.realpath(raw)
+    except OSError as exc:
+        raise ImageRequestError(f"could not resolve {spec!r}: {exc}")
+
+    if from_prompt and not path_is_allowed(resolved):
+        # Deliberately does not say whether the file exists: to an untrusted caller that
+        # difference is a directory oracle.
+        raise ImageRequestError(f"{spec!r} is outside every directory listed in IMAGE_EDIT_ROOTS.")
+
+    if not os.path.exists(resolved)    : raise ImageRequestError(f"{spec!r} does not exist.")
+    if not os.path.isfile(resolved)    : raise ImageRequestError(f"{spec!r} is not a regular file.")
+    if not os.access(resolved, os.R_OK): raise ImageRequestError(f"{spec!r} is not readable.")
+
+    size = os.path.getsize(resolved)
+    if size <= 0:
+        raise ImageRequestError(f"{spec!r} is empty.")
+    if size > cfg.image_edit_max_bytes:
+        raise ImageRequestError(f"{spec!r} is {size:,} bytes; the limit is {cfg.image_edit_max_bytes:,} (IMAGE_EDIT_MAX_BYTES).")
+
+    try:
+        with open(resolved, "rb") as handle:
+            head = handle.read(4096)
+    except OSError as exc:
+        raise ImageRequestError(f"could not read {spec!r}: {exc}")
+
+    sniffed = sniff_image(head)
+    if sniffed is None:
+        raise ImageRequestError(f"{spec!r} is not a PNG, JPEG or WebP image.")
+
+    fmt, mime = sniffed
+    width = height = 0
+    has_alpha = False
+    if fmt == "png":
+        width, height, has_alpha = read_png_geometry(head)
+
+    return ReferenceImage(path=resolved, format=fmt, mime=mime, size=size,
+                          width=width, height=height, has_alpha=has_alpha, slot=slot)
+
+
+def load_references(specs: Any, from_prompt: bool) -> List[ReferenceImage]:
+    if not isinstance(specs, list):
+        specs = [specs]
+    if not specs:
+        return []
+    if len(specs) > cfg.image_edit_max_images:
+        raise ImageRequestError(f"{len(specs)} reference images requested; the limit is {cfg.image_edit_max_images} (IMAGE_EDIT_MAX_IMAGES).")
+
+    return [load_reference(spec, from_prompt) for spec in specs]
+
+
+def validate_mask(mask: ReferenceImage, images: List[ReferenceImage]) -> None:
+    """
+    A mask has to be a PNG carrying an alpha channel; transparent pixels are the region
+    the model may repaint. With several references the provider applies it to the first,
+    so that is the one its geometry is checked against.
+    """
+    if mask.format != "png":
+        raise ImageRequestError(f"the mask must be a PNG (alpha is what marks the editable region), got {mask.format}.")
+    if not mask.has_alpha:
+        raise ImageRequestError("the mask PNG has no alpha channel, so it marks nothing as editable.")
+    if images and mask.width and images[0].width and (mask.width, mask.height) != (images[0].width, images[0].height):
+        raise ImageRequestError(
+            f"the mask is {mask.width}x{mask.height} but the first reference image is "
+            f"{images[0].width}x{images[0].height}; they must match."
+        )
+
+
+def validate_file_ids(specs: Any) -> List[str]:
+    """
+    Provider-side reference ids for a batched edit. Accepts file ids and URLs, since
+    input_reference takes either, and nothing else -- a local path here would silently
+    never be uploaded.
+    """
+    if not isinstance(specs, list):
+        specs = [specs]
+
+    ids: List[str] = []
+    for spec in specs:
+        value = str(spec).strip()
+        if not value:
+            raise ImageRequestError("a file_ids entry must not be empty.")
+        if not (value.startswith("file-") or value.startswith("http://") or value.startswith("https://")):
+            raise ImageRequestError(f"file_ids entries must be a provider file id ('file-...') or a URL, got {spec!r}.")
+        ids.append(value)
+
+    if len(ids) > cfg.image_edit_max_images:
+        raise ImageRequestError(f"{len(ids)} references requested; the limit is {cfg.image_edit_max_images} (IMAGE_EDIT_MAX_IMAGES).")
+    return ids
+
+
+def resolve_edit_inputs(fields: Dict[str, Any], source: str, batch: bool) -> Tuple[List[ReferenceImage], Optional[ReferenceImage], List[str]]:
+    """
+    Decides whether this request edits, and against what.
+
+    'images' cannot be the sole signal, because slots are filled from the console and a
+    block that means "edit what is loaded" carries no images field at all. So an explicit
+    edit:true is a second trigger, and the combinations resolve like this:
+
+        neither images nor edit     generation, exactly as before
+        images: [...]               edit against those references
+        edit: true, no images       edit against every filled slot
+        edit: true + images         edit against those references
+        edit: false + images        rejected -- a contradiction, not a preference
+        edit: true, no slots filled rejected -- nothing to edit
+        file_ids + batch: true      batched edit against provider-side references
+        file_ids without batch      rejected -- file_ids exist for the Batch API
+        images + batch: true        rejected -- local files cannot be batched
+        images + file_ids           rejected -- mutually exclusive
+    """
+    has_images   = "images"   in fields and fields["images"] not in (None, [], "")
+    has_file_ids = "file_ids" in fields and fields["file_ids"] not in (None, [], "")
+    has_mask     = "mask"     in fields and fields["mask"] not in (None, "")
+
+    edit_flag: Optional[bool] = None
+    if "edit" in fields:
+        edit_flag = validate_bool("edit", fields["edit"])
+
+    if not (has_images or has_file_ids or edit_flag):
+        if edit_flag is False and has_mask:
+            raise ImageRequestError("mask was given with edit: false; a mask only applies to an edit.")
+        return [], None, []
+
+    if not cfg.image_edit_enabled:
+        raise ImageConfigError("Image editing is disabled (IMAGE_EDIT_ENABLED=false).")
+
+    if has_images and has_file_ids:
+        raise ImageRequestError("images and file_ids are mutually exclusive: images are uploaded from this machine, file_ids already live on the provider.")
+    if edit_flag is False and (has_images or has_file_ids):
+        raise ImageRequestError("edit: false was given together with reference images. Remove one of them.")
+
+    if has_file_ids:
+        if not batch:
+            raise ImageRequestError("file_ids is for Batch API edits only. Add batch: true, or use images for an immediate edit.")
+        if has_mask:
+            raise ImageRequestError("a mask cannot be sent with a batched edit, because it would have to be uploaded as a file.")
+        return [], None, validate_file_ids(fields["file_ids"])
+
+    if batch:
+        raise ImageRequestError("local reference images cannot be batched. Upload them to the provider and pass file_ids, or drop batch: true.")
+
+    from_prompt = source == "chat"
+    if has_images:
+        images = load_references(fields["images"], from_prompt)
+    else:
+        # edit: true with nothing named means "whatever the console has loaded".
+        images = filled_slots()
+        if not images:
+            raise ImageRequestError("edit: true was requested but no image slots are filled. Use 'img edit set 1 <path>'.")
+        if len(images) > cfg.image_edit_max_images:
+            raise ImageRequestError(f"{len(images)} slots are filled; the limit is {cfg.image_edit_max_images} (IMAGE_EDIT_MAX_IMAGES).")
+
+    if not images:
+        raise ImageRequestError("no usable reference images were given.")
+
+    if has_mask:
+        mask = load_reference(fields["mask"], from_prompt)
+    else:
+        # A mask set from the console applies to slot-driven edits the same way the slots
+        # themselves do -- setting one and having it ignored would be the surprise.
+        mask = stored_mask()
+
+    if mask is not None:
+        validate_mask(mask, images)
+
+    return images, mask, []
+
+
 def build_request(overrides: Optional[Dict[str, Any]] = None, source: str = "direct") -> ImageRequest:
     """
     One validated request, from the configured defaults plus whatever the caller
@@ -367,11 +780,17 @@ def build_request(overrides: Optional[Dict[str, Any]] = None, source: str = "dir
     if len(prompt) > cfg.image_max_prompt_chars:
         raise ImageRequestError(f"prompt is {len(prompt)} characters; the limit is {cfg.image_max_prompt_chars} (IMAGE_MAX_PROMPT_CHARS).")
 
-    size          = validate_size  (fields.get("size", cfg.image_default_size))
+    batch  = validate_bool("batch", fields.get("batch", cfg.image_default_batch))
+    images, mask, file_ids = resolve_edit_inputs(fields, source, batch)
+    is_edit = bool(images or file_ids)
+
+    # An edit normally means "change this picture", so it defaults to the source geometry
+    # rather than to the generation default, which would silently reframe it.
+    default_size  = cfg.image_edit_default_size if is_edit else cfg.image_default_size
+    size          = validate_size  (fields.get("size", default_size))
     quality       = validate_choice("quality"      , fields.get("quality"      , cfg.image_default_quality)   , IMAGE_QUALITIES)
     output_format = validate_choice("output_format", fields.get("output_format", cfg.image_default_format)    , IMAGE_FORMATS)
     background    = validate_choice("background"   , fields.get("background"   , cfg.image_default_background), IMAGE_BACKGROUNDS)
-    batch         = validate_bool  ("batch"        , fields.get("batch"        , cfg.image_default_batch))
 
     raw_n = fields.get("n", cfg.image_default_n)
     try: count = int(raw_n)
@@ -392,6 +811,9 @@ def build_request(overrides: Optional[Dict[str, Any]] = None, source: str = "dir
         batch         = batch,
         filename      = filename,
         source        = source,
+        images        = images,
+        mask          = mask,
+        file_ids      = file_ids,
     )
 
 
@@ -409,7 +831,63 @@ def build_body(req: ImageRequest) -> Dict[str, Any]:
     }
     if req.size    != "auto" : body["size"]    = req.size
     if req.quality != "auto" : body["quality"] = req.quality
+
+    # A batched edit carries its references inline, since the Batch API accepts no
+    # multipart upload. Verified against the provider: the field is 'images', it is always
+    # an array even for a single reference, and each entry must be an object -- a bare id
+    # string is rejected with "expected an object", and 'input_reference' with "Missing
+    # required parameter: 'images'". Several references work and bill exactly as they do
+    # on the immediate endpoint (two 1024x1024 references measured 2048 image input
+    # tokens). An image_url entry is accepted, but the provider must then fetch it, and a
+    # host that refuses non-browser requests fails the line on the download rather than on
+    # anything the proxy sent.
+    if req.file_ids:
+        body["images"] = [
+            {"image_url": value} if value.startswith("http") else {"file_id": value}
+            for value in req.file_ids
+        ]
+
     return body
+
+
+def build_edit_form(req: ImageRequest) -> Tuple[Dict[str, str], List[Tuple[str, Any]]]:
+    """
+    The multipart form for an immediate edit.
+
+    Reference images go in as 'image[]' -- repeated, which is what the provider expects
+    for several -- and every scalar becomes a form field, because multipart carries no
+    types. Files are handed over as open handles so httpx streams them instead of the
+    proxy holding every reference image in memory at once.
+
+    'input_fidelity' is never sent: gpt-image-2 always processes inputs at high fidelity
+    and rejects the parameter outright.
+    """
+    data: Dict[str, str] = {
+        "model"         : cfg.image_model,
+        "prompt"        : req.prompt,
+        "n"             : str(req.n),
+        "output_format" : req.output_format,
+        "background"    : req.background,
+    }
+    if req.size    != "auto" : data["size"]    = req.size
+    if req.quality != "auto" : data["quality"] = req.quality
+
+    files: List[Tuple[str, Any]] = [
+        ("image[]", (reference.filename(), open(reference.path, "rb"), reference.mime))
+        for reference in req.images
+    ]
+    if req.mask is not None:
+        files.append(("mask", (req.mask.filename(), open(req.mask.path, "rb"), req.mask.mime)))
+
+    return data, files
+
+
+def close_form_files(files: List[Tuple[str, Any]]) -> None:
+    """Closes the handles build_edit_form opened, whether or not the request succeeded."""
+    for _, spec in files:
+        handle = spec[1]
+        try: handle.close()
+        except Exception: pass
 
 
 # Storage
@@ -523,12 +1001,21 @@ def append_manifest(req: ImageRequest, saved: List[SavedImage], cost_usd: float,
             },
             "source"             : req.source,
             "created_at"         : created,
+            "operation"          : "edit" if req.is_edit else "generate",
             "estimated_cost_usd" : round(cost_usd/len(saved), 6),
             "cost_is_estimate"   : estimated,
             "usage"              : usage,
         }
         if batch_id:
             record["batch_id"] = batch_id
+        # An edit driven by 'edit: true' resolves against whatever the slots held at the
+        # time, so the inputs are recorded here or the result is unreproducible.
+        if req.images:
+            record["source_images"] = [reference.path for reference in req.images]
+        if req.mask is not None:
+            record["mask"] = req.mask.path
+        if req.file_ids:
+            record["source_references"] = list(req.file_ids)
         if cfg.image_manifest_prompts:
             record["prompt"] = req.prompt
         records.append(record)
@@ -634,14 +1121,10 @@ def cost_for(req: ImageRequest, counts: Dict[str, Any], images: int, batch: bool
     return cost, estimated
 
 
-# Immediate generation
-def generate_image(request: ImageRequest) -> ImageResult:
-    """Generate one immediate image request and save all returned files."""
-    if request.batch:
-        raise ImageRequestError("this request is marked batch=true; use submit_image_batch instead.")
-
-    provider = image_provider()
-    body     = build_body(request)
+# Immediate generation and editing
+def post_generation(provider: Dict[str, Any], request: ImageRequest) -> Any:
+    """Text-to-image: a JSON body to /images/generations."""
+    body = build_body(request)
 
     if cfg.debug_log:
         print()
@@ -649,12 +1132,96 @@ def generate_image(request: ImageRequest) -> ImageResult:
         print(json.dumps(body, indent=2, ensure_ascii=False, default=str))
         print(f"=== image payload end ===")
 
-    response = httpx.post(
+    return httpx.post(
         f"{provider['base_url']}/images/generations",
         json=body,
         headers=image_headers(provider),
         timeout=request_timeout(),
     )
+
+
+def post_edit(provider: Dict[str, Any], request: ImageRequest) -> Any:
+    """
+    Image-to-image: a multipart form to /images/edits. The only structural difference
+    from generation is the transport, which is why it is isolated to this function --
+    decoding, saving, the manifest and the cost accounting are shared downstream.
+    """
+    data, files = build_edit_form(request)
+
+    if cfg.debug_log:
+        references = ", ".join(f"{ref.filename()} ({ref.format}, {ref.size:,}B)" for ref in request.images)
+        print()
+        print(f"=== image edit payload start ({cfg.image_provider}/{cfg.image_model}) ===")
+        print(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+        print(f"  references: {references}")
+        if request.mask is not None:
+            print(f"  mask      : {request.mask.filename()} ({request.mask.width}x{request.mask.height})")
+        print(f"=== image edit payload end ===")
+
+    try:
+        return httpx.post(
+            f"{provider['base_url']}/images/edits",
+            data=data,
+            files=files,
+            headers=image_headers(provider),
+            timeout=request_timeout(),
+        )
+    finally:
+        close_form_files(files)
+
+
+# Gateway-class failures: the request never reached or never completed at the origin, so
+# no image was produced and nothing was billed. Retrying those is safe. A 4xx, or a 5xx
+# the model itself produced, is not in here -- repeating a refusal just pays for it twice.
+RETRYABLE_STATUSES  = {502, 503, 504, 520, 521, 522, 523, 524}
+RETRYABLE_TRANSPORT = (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError, httpx.WriteError)
+
+
+def post_with_retry(send, provider: Dict[str, Any], request: ImageRequest) -> Any:
+    """
+    Runs one image call, retrying gateway failures.
+
+    The callable is re-invoked rather than the response replayed, because an edit's
+    multipart handles are read to EOF on the first attempt and a retry needs fresh ones.
+    """
+    attempts = max(1, cfg.image_retry_attempts)
+    delay    = max(0.0, cfg.image_retry_backoff_seconds)
+
+    for attempt in range(1, attempts + 1):
+        last_error = ""
+        try:
+            response = send(provider, request)
+            if response.status_code not in RETRYABLE_STATUSES:
+                return response
+            last_error = f"HTTP {response.status_code}"
+        except RETRYABLE_TRANSPORT as exc:
+            last_error = f"{exc.__class__.__name__}: {exc}"
+            response   = None
+
+        if attempt >= attempts:
+            if response is not None:
+                return response
+            raise ProviderError(502, {"error": {"message": f"image request failed after {attempts} attempts ({last_error})."}},
+                                f"{cfg.image_provider}: {last_error}")
+
+        print(f"WARNING: image request failed ({last_error}); retrying {attempt}/{attempts - 1} in {delay:.0f}s.")
+        time.sleep(delay)
+        delay *= 2
+
+    raise RuntimeError("unreachable")
+
+
+def generate_image(request: ImageRequest) -> ImageResult:
+    """
+    Run one immediate request -- a generation, or an edit when it carries references --
+    and save every file it returns.
+    """
+    if request.batch:
+        raise ImageRequestError("this request is marked batch=true; use submit_image_batch instead.")
+
+    provider = image_provider()
+    response = post_with_retry(post_edit if request.is_edit else post_generation, provider, request)
+
     if response.status_code != 200:
         raise error_from_response(cfg.image_provider, response)
 
@@ -802,6 +1369,7 @@ def request_to_state(req: ImageRequest) -> Dict[str, Any]:
         "batch"         : True,
         "filename"      : req.filename,
         "source"        : req.source,
+        "file_ids"      : list(req.file_ids),
     }
 
 
@@ -816,6 +1384,7 @@ def state_to_request(entry: Dict[str, Any]) -> ImageRequest:
         batch         = True,
         filename      = str(entry.get("filename", "")),
         source        = str(entry.get("source", "batch")),
+        file_ids      = [str(value) for value in (entry.get("file_ids") or [])],
     )
 
 
@@ -847,6 +1416,13 @@ def submit_image_batch(requests: List[ImageRequest]) -> ImageBatchResult:
     if not requests:
         raise ImageRequestError("a batch must contain at least one request.")
 
+    # A batch names one endpoint for all of its lines, so it cannot mix the two.
+    if len({req.is_edit for req in requests}) > 1:
+        raise ImageRequestError("a batch cannot mix edits and generations; submit them separately.")
+    if any(req.images for req in requests):
+        raise ImageRequestError("local reference images cannot be batched. Upload them to the provider and pass file_ids.")
+
+    endpoint = BATCH_EDIT_ENDPOINT if requests[0].is_edit else BATCH_ENDPOINT
     provider = image_provider()
 
     lines   : List[str]            = []
@@ -856,7 +1432,7 @@ def submit_image_batch(requests: List[ImageRequest]) -> ImageBatchResult:
         lines.append(json.dumps({
             "custom_id" : custom_id,
             "method"    : "POST",
-            "url"       : BATCH_ENDPOINT,
+            "url"       : endpoint,
             "body"      : build_body(req),
         }, ensure_ascii=False))
         entries[custom_id] = request_to_state(req)
@@ -868,7 +1444,7 @@ def submit_image_batch(requests: List[ImageRequest]) -> ImageBatchResult:
         headers=image_headers(provider),
         json   = {
             "input_file_id"     : file_id,
-            "endpoint"          : BATCH_ENDPOINT,
+            "endpoint"          : endpoint,
             "completion_window" : cfg.image_batch_window,
         },
         timeout=request_timeout(),

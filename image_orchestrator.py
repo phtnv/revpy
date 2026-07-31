@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing      import Any, Dict, List, Optional, Tuple
 
 from common import cfg
-from v1_images_generation import ImageRequest, ImageRequestError, build_request
+from v1_images import ImageRequest, ImageRequestError, build_request
 
 
 @dataclass

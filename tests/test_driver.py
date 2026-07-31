@@ -4,9 +4,11 @@ import importlib
 import io
 import json
 import os
+import struct
 import sys
 import tempfile
 import threading
+import zlib
 
 from pathlib           import Path
 from types             import SimpleNamespace
@@ -39,10 +41,9 @@ providers   : Any = importlib.import_module("providers")
 v1_messages : Any = importlib.import_module("v1_messages")
 chat_api    : Any = importlib.import_module("v1_chat_completions")
 resp_api    : Any = importlib.import_module("v1_responses")
-image_api   : Any = importlib.import_module("v1_images_generation")
+v1_images   : Any = importlib.import_module("v1_images")
 server      : Any = importlib.import_module("server")
 
-v1_images_generation = image_api
 image_orchestrator : Any = importlib.import_module("image_orchestrator")
 
 # The three request builders, keyed by the wire protocol they speak.
@@ -1037,6 +1038,13 @@ def make_image_config() -> None:
     cfg.image_max_prompt_chars   = 20000
     cfg.image_manifest_enabled   = False
     cfg.image_cost_reporting     = False
+    cfg.image_edit_enabled       = True
+    cfg.image_edit_max_images    = 4
+    cfg.image_edit_max_bytes     = 20*1024*1024
+    cfg.image_edit_default_size  = "auto"
+    # Off by default in the tests too: the cases that need it turn it on deliberately.
+    cfg.image_edit_allow_prompt_paths = False
+    cfg.image_edit_roots              = []
 
 
 def test_image_extraction(case: dict[str, Any]) -> bool:
@@ -1112,7 +1120,7 @@ def test_image_validation(case: tuple) -> bool:
 
     received_error = None
     try:
-        v1_images_generation.build_request(overrides)
+        v1_images.build_request(overrides)
     except Exception as exc:
         received_error = str(exc)
 
@@ -1144,10 +1152,10 @@ def test_image_storage_confinement() -> bool:
 
     with tempfile.TemporaryDirectory() as tmp:
         common.cfg.image_output_dir = tmp
-        request = v1_images_generation.build_request({"prompt": "x", "filename": "shot"})
+        request = v1_images.build_request({"prompt": "x", "filename": "shot"})
 
-        saved = [v1_images_generation.save_image_bytes(request, b"\x89PNG-one", "img_aaaa"),
-                 v1_images_generation.save_image_bytes(request, b"\x89PNG-two", "img_bbbb")]
+        saved = [v1_images.save_image_bytes(request, b"\x89PNG-one", "img_aaaa"),
+                 v1_images.save_image_bytes(request, b"\x89PNG-two", "img_bbbb")]
 
         names = sorted(os.path.basename(image.path) for image in saved)
         if names != ["shot.png", "shot_1.png"]:
@@ -1169,10 +1177,10 @@ def test_image_storage_confinement() -> bool:
 
         # A stem that somehow bypassed sanitisation still cannot escape.
         try:
-            v1_images_generation.allocate_path(tmp, "../escaped", ".png")
+            v1_images.allocate_path(tmp, "../escaped", ".png")
             print("exp=escape rejected, rec=allowed ", end="")
             passed = False
-        except v1_images_generation.ImageRequestError:
+        except v1_images.ImageRequestError:
             pass
 
     if passed : print(f"{GREEN}PASS{RESET}")
@@ -1223,7 +1231,7 @@ def test_image_usage(case: tuple) -> bool:
     common.cfg.image_image_input_cost = 8.00
     common.cfg.image_output_cost      = 30.00
 
-    counts = v1_images_generation.parse_usage(payload)
+    counts = v1_images.parse_usage(payload)
     passed = check_equal(expected_counts, counts)
 
     cost = common.track_image_usage(counts, images=1, batch=False, model="gpt-image-2")
@@ -1285,6 +1293,463 @@ def test_image_batch_accounting() -> bool:
     return passed
 
 
+# Image editing
+def make_png(width: int, height: int, alpha: bool = False) -> bytes:
+    """
+    A minimal valid PNG. Built by hand rather than with an imaging library, because the
+    proxy deliberately has no such dependency -- it reads headers, so the tests write them.
+    Colour type 6 is RGBA, 2 is RGB; that byte is what the mask check reads.
+    """
+    channels    = 4 if alpha else 2 + 1  # RGBA = 4 bytes, RGB = 3
+    colour_type = 6 if alpha else 2
+    pixel       = bytes([200, 100, 50, 255][:channels])
+    raw         = b"".join(b"\x00" + pixel*width for _ in range(height))
+
+    def chunk(tag: bytes, payload: bytes) -> bytes:
+        body = tag + payload
+        return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, colour_type, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 1))
+            + chunk(b"IEND", b""))
+
+
+JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"\x00"*64
+WEBP_BYTES = b"RIFF" + struct.pack("<I", 64) + b"WEBP" + b"\x00"*56
+
+
+def write_file(directory: str, name: str, payload: bytes) -> str:
+    path = os.path.join(directory, name)
+    with open(path, "wb") as handle:
+        handle.write(payload)
+    return path
+
+
+def test_image_reference_validation() -> bool:
+    """
+    A reference image is identified by its content, never its name, and anything the
+    proxy cannot use is rejected outright rather than dropped from the list.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing image references: content decides, bad input is rejected... ", end="")
+
+    make_image_config()
+    passed = True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        good_png = write_file(tmp, "good.png" , make_png(64, 32))
+        jpeg     = write_file(tmp, "photo.jpg", JPEG_BYTES)
+        webp     = write_file(tmp, "art.webp" , WEBP_BYTES)
+        # The case that matters: a text file wearing an image extension.
+        liar     = write_file(tmp, "liar.png" , b"#!/bin/sh\nrm -rf /\n")
+        empty    = write_file(tmp, "empty.png", b"")
+
+        for path, expect_format in ((good_png, "png"), (jpeg, "jpeg"), (webp, "webp")):
+            try:
+                reference = v1_images.load_reference(path, from_prompt=False)
+                if reference.format != expect_format:
+                    print(f"exp={expect_format}, rec={reference.format} ", end="")
+                    passed = False
+            except Exception as exc:
+                print(f"exp={expect_format} accepted, rec={exc} ", end="")
+                passed = False
+
+        # Geometry and alpha are read from the PNG header.
+        png_ref = v1_images.load_reference(good_png, from_prompt=False)
+        if (png_ref.width, png_ref.height, png_ref.has_alpha) != (64, 32, False):
+            print(f"exp=(64, 32, False), rec={(png_ref.width, png_ref.height, png_ref.has_alpha)} ", end="")
+            passed = False
+        rgba_ref = v1_images.load_reference(write_file(tmp, "a.png", make_png(8, 8, alpha=True)), from_prompt=False)
+        if not rgba_ref.has_alpha:
+            print("exp=alpha detected, rec=not detected ", end="")
+            passed = False
+
+        rejections = [
+            (liar                              , "not a PNG, JPEG or WebP"),
+            (empty                             , "is empty"),
+            (os.path.join(tmp, "nope.png")     , "does not exist"),
+            (tmp                               , "not a regular file"),
+        ]
+        for path, expected in rejections:
+            try:
+                v1_images.load_reference(path, from_prompt=False)
+                print(f"exp={expected!r} rejected, rec=accepted ", end="")
+                passed = False
+            except v1_images.ImageRequestError as exc:
+                if expected not in str(exc):
+                    print(f"exp contains {expected!r}, rec={exc} ", end="")
+                    passed = False
+
+        # The byte cap is enforced before anything is uploaded.
+        common.cfg.image_edit_max_bytes = 100
+        try:
+            v1_images.load_reference(good_png, from_prompt=False)
+            print("exp=size cap enforced, rec=accepted ", end="")
+            passed = False
+        except v1_images.ImageRequestError as exc:
+            if "the limit is" not in str(exc):
+                print(f"exp=size-limit message, rec={exc} ", end="")
+                passed = False
+        common.cfg.image_edit_max_bytes = 20*1024*1024
+
+        # And the count cap.
+        common.cfg.image_edit_max_images = 2
+        try:
+            v1_images.load_references([good_png, jpeg, webp], from_prompt=False)
+            print("exp=count cap enforced, rec=accepted ", end="")
+            passed = False
+        except v1_images.ImageRequestError:
+            pass
+        common.cfg.image_edit_max_images = 4
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_image_edit_path_security() -> bool:
+    """
+    The load-bearing test. A path written in a chat block is a file-read primitive aimed
+    at whatever the proxy can reach, so it must be refused unless explicitly enabled and
+    inside an allowed root -- and a symlink must not be able to walk out of one.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing image edit paths: prompts cannot read outside the allowlist... ", end="")
+
+    make_image_config()
+    passed = True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        allowed = os.path.join(tmp, "allowed"); os.makedirs(allowed)
+        secret  = os.path.join(tmp, "secret") ; os.makedirs(secret)
+        inside  = write_file(allowed, "ok.png"    , make_png(16, 16))
+        outside = write_file(secret , "secret.png", make_png(16, 16))
+
+        # A symlink planted inside the allowed root, aimed out of it.
+        escape = os.path.join(allowed, "escape.png")
+        try:
+            os.symlink(outside, escape)
+            symlinks = True
+        except (OSError, NotImplementedError):
+            symlinks = False
+
+        common.cfg.image_edit_roots = [os.path.realpath(allowed)]
+
+        # Disabled: even a path inside a root is refused.
+        common.cfg.image_edit_allow_prompt_paths = False
+        try:
+            v1_images.load_reference(inside, from_prompt=True)
+            print("exp=prompt paths refused when disabled, rec=accepted ", end="")
+            passed = False
+        except v1_images.ImageRequestError as exc:
+            if "disabled" not in str(exc):
+                print(f"exp=disabled message, rec={exc} ", end="")
+                passed = False
+
+        # Enabled: inside the root works, outside does not.
+        common.cfg.image_edit_allow_prompt_paths = True
+        try:
+            v1_images.load_reference(inside, from_prompt=True)
+        except Exception as exc:
+            print(f"exp=allowed path accepted, rec={exc} ", end="")
+            passed = False
+
+        for path, label in ((outside, "outside root"), ("/etc/hostname", "absolute system path")):
+            try:
+                v1_images.load_reference(path, from_prompt=True)
+                print(f"exp={label} refused, rec=accepted ", end="")
+                passed = False
+            except v1_images.ImageRequestError as exc:
+                if "IMAGE_EDIT_ROOTS" not in str(exc):
+                    print(f"exp=root message for {label}, rec={exc} ", end="")
+                    passed = False
+
+        if symlinks:
+            try:
+                v1_images.load_reference(escape, from_prompt=True)
+                print("exp=symlink escape refused, rec=accepted ", end="")
+                passed = False
+            except v1_images.ImageRequestError:
+                pass
+
+        # An empty root list means nothing is readable, whatever the switch says.
+        common.cfg.image_edit_roots = []
+        try:
+            v1_images.load_reference(inside, from_prompt=True)
+            print("exp=empty roots refuse everything, rec=accepted ", end="")
+            passed = False
+        except v1_images.ImageRequestError:
+            pass
+
+        # The console is trusted with paths regardless of any of the above.
+        common.cfg.image_edit_allow_prompt_paths = False
+        try:
+            v1_images.load_reference(outside, from_prompt=False)
+        except Exception as exc:
+            print(f"exp=console path accepted, rec={exc} ", end="")
+            passed = False
+
+    common.cfg.image_edit_roots = []
+    common.cfg.image_edit_allow_prompt_paths = False
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_image_edit_detection() -> bool:
+    """The truth table deciding whether a request edits, and against what."""
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing image edit detection: images, edit:true and slots... ", end="")
+
+    make_image_config()
+    passed = True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        common.cfg.image_output_dir = tmp
+        one = write_file(tmp, "one.png", make_png(32, 32))
+        two = write_file(tmp, "two.png", make_png(32, 32))
+
+        def check(name: str, fields: dict, expect_images: int, expect_error: str = "") -> None:
+            nonlocal passed
+            try:
+                request = v1_images.build_request({"prompt": "x", **fields}, source="cli")
+            except Exception as exc:
+                if not expect_error or expect_error not in str(exc):
+                    print(f"[{name}] exp={expect_error or 'accepted'}, rec={exc} ", end="")
+                    passed = False
+                return
+            if expect_error:
+                print(f"[{name}] exp={expect_error!r} rejected, rec=accepted ", end="")
+                passed = False
+            elif len(request.images) != expect_images or request.is_edit != bool(expect_images):
+                print(f"[{name}] exp={expect_images} refs, rec={len(request.images)} ", end="")
+                passed = False
+
+        # No slots filled yet.
+        check("plain generation"      , {}                               , 0)
+        check("explicit images"       , {"images": [one, two]}           , 2)
+        check("edit true, no slots"   , {"edit": True}                   , 0, "no image slots are filled")
+        check("edit false + images"   , {"edit": False, "images": [one]} , 0, "edit: false was given together")
+        check("mask with edit false"  , {"edit": False, "mask": one}     , 0, "only applies to an edit")
+
+        v1_images.set_slot(1, one)
+        v1_images.set_slot(2, two)
+
+        check("edit true uses slots"  , {"edit": True}                   , 2)
+        check("slot numbers"          , {"images": [1]}                  , 1)
+        check("edit true + images"    , {"edit": True, "images": [two]}  , 1)
+        check("still plain generation", {}                               , 0)
+
+        # An empty images list must not silently become an edit.
+        check("empty images list"     , {"images": []}                   , 0)
+
+        # Slot numbers survive a round trip through json5-style strings.
+        check("numeric string slot"   , {"images": ["2"]}                , 1)
+        check("missing slot"          , {"images": [7]}                  , 0, "slot 7 is empty")
+
+        # A slot whose file disappeared is reported, not silently skipped.
+        os.unlink(two)
+        check("slot file vanished"    , {"edit": True}                   , 0, "does not exist")
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_image_edit_batch_rules() -> bool:
+    """file_ids and local images are different worlds; mixing them is always an error."""
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing image edit batching: file_ids vs local images... ", end="")
+
+    make_image_config()
+    passed = True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        common.cfg.image_output_dir = tmp
+        one = write_file(tmp, "one.png", make_png(32, 32))
+
+        cases = [
+            ({"file_ids": ["file-abc"], "batch": True}                   , ""),
+            ({"file_ids": ["https://example.test/a.png"], "batch": True} , ""),
+            ({"file_ids": ["file-abc"]}                                  , "Batch API edits only"),
+            ({"images": [one], "batch": True}                            , "cannot be batched"),
+            ({"images": [one], "file_ids": ["file-abc"]}                 , "mutually exclusive"),
+            ({"file_ids": ["/local/path.png"], "batch": True}            , "must be a provider file id"),
+            ({"file_ids": ["file-abc"], "mask": one, "batch": True}      , "mask cannot be sent"),
+        ]
+        for fields, expected in cases:
+            try:
+                request = v1_images.build_request({"prompt": "x", **fields}, source="cli")
+            except Exception as exc:
+                if not expected or expected not in str(exc):
+                    print(f"exp={expected or 'accepted'}, rec={exc} ", end="")
+                    passed = False
+                continue
+            if expected:
+                print(f"exp={expected!r} rejected, rec=accepted ", end="")
+                passed = False
+            elif not request.is_edit:
+                print("exp=edit request, rec=generation ", end="")
+                passed = False
+
+        # A batched edit carries its references in the body, since multipart is unavailable.
+        # The shape below was verified against the provider: 'images', always an array,
+        # always objects. A bare id string inside the array is rejected with "expected an
+        # object", a bare string instead of the array with "expected an array of objects",
+        # and the 'input_reference' field the batch guide documents (which belongs to
+        # image-guided generation) with "Missing required parameter: 'images'".
+        request = v1_images.build_request({"prompt": "x", "file_ids": ["file-abc"], "batch": True}, source="cli")
+        body    = v1_images.build_body(request)
+        if body.get("images") != [{"file_id": "file-abc"}]:
+            print(f"exp=[{{'file_id': 'file-abc'}}], rec={body.get('images')} ", end="")
+            passed = False
+        if "input_reference" in body:
+            print("exp=no input_reference field, rec=sent ", end="")
+            passed = False
+
+        request = v1_images.build_request({"prompt": "x", "file_ids": ["file-a", "https://e.test/b.png"], "batch": True}, source="cli")
+        body    = v1_images.build_body(request)
+        if body.get("images") != [{"file_id": "file-a"}, {"image_url": "https://e.test/b.png"}]:
+            print(f"exp=file_id + image_url objects, rec={body.get('images')} ", end="")
+            passed = False
+
+        # A batch cannot mix the two endpoints.
+        edit_req = v1_images.build_request({"prompt": "x", "file_ids": ["file-a"], "batch": True}, source="cli")
+        gen_req  = v1_images.build_request({"prompt": "x", "batch": True}, source="cli")
+        try:
+            v1_images.submit_image_batch([edit_req, gen_req])
+            print("exp=mixed batch rejected, rec=accepted ", end="")
+            passed = False
+        except v1_images.ImageRequestError as exc:
+            if "cannot mix" not in str(exc):
+                print(f"exp=mix message, rec={exc} ", end="")
+                passed = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_image_edit_form() -> bool:
+    """The multipart form: repeated image[] fields, scalars as strings, handles closed."""
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing image edit form: multipart assembly and file handles... ", end="")
+
+    make_image_config()
+    passed = True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        common.cfg.image_output_dir = tmp
+        one  = write_file(tmp, "one.png" , make_png(32, 32))
+        two  = write_file(tmp, "two.png" , make_png(32, 32))
+        mask = write_file(tmp, "mask.png", make_png(32, 32, alpha=True))
+
+        request = v1_images.build_request(
+            {"prompt": "make it blue", "images": [one, two], "mask": mask, "quality": "high", "size": "1024x1024"},
+            source="cli",
+        )
+        data, files = v1_images.build_edit_form(request)
+
+        expected_data = {
+            "model": "gpt-image-2", "prompt": "make it blue", "n": "1",
+            "output_format": "png", "background": "opaque",
+            "size": "1024x1024", "quality": "high",
+        }
+        if not check_equal(expected_data, data):
+            passed = False
+        # Every multipart value must be a string; a raw int makes httpx reject the form.
+        if any(not isinstance(value, str) for value in data.values()):
+            print("exp=all form values are strings, rec=non-string present ", end="")
+            passed = False
+        # gpt-image-2 rejects input_fidelity outright, so it must never be sent.
+        if "input_fidelity" in data:
+            print("exp=no input_fidelity, rec=sent ", end="")
+            passed = False
+
+        field_names = [name for name, _ in files]
+        if field_names != ["image[]", "image[]", "mask"]:
+            print(f"exp=['image[]', 'image[]', 'mask'], rec={field_names} ", end="")
+            passed = False
+
+        v1_images.close_form_files(files)
+        if any(not spec[1].closed for _, spec in files):
+            print("exp=handles closed, rec=left open ", end="")
+            passed = False
+
+        # 'auto' is omitted rather than sent as a literal.
+        auto_req = v1_images.build_request({"prompt": "x", "images": [one], "size": "auto", "quality": "auto"}, source="cli")
+        auto_data, auto_files = v1_images.build_edit_form(auto_req)
+        v1_images.close_form_files(auto_files)
+        if "size" in auto_data or "quality" in auto_data:
+            print(f"exp=auto omitted, rec={auto_data} ", end="")
+            passed = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_image_mask_validation() -> bool:
+    """A mask has to be a PNG with alpha, matching the first reference's geometry."""
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing image mask: PNG, alpha, matching geometry... ", end="")
+
+    make_image_config()
+    passed = True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        common.cfg.image_output_dir = tmp
+        base      = write_file(tmp, "base.png"  , make_png(64, 64))
+        good_mask = write_file(tmp, "good.png"  , make_png(64, 64, alpha=True))
+        no_alpha  = write_file(tmp, "flat.png"  , make_png(64, 64))
+        wrong_dim = write_file(tmp, "small.png" , make_png(32, 32, alpha=True))
+        jpeg_mask = write_file(tmp, "mask.jpg"  , JPEG_BYTES)
+
+        cases = [
+            (good_mask, ""),
+            (no_alpha , "no alpha channel"),
+            (wrong_dim, "they must match"),
+            (jpeg_mask, "must be a PNG"),
+        ]
+        for path, expected in cases:
+            try:
+                v1_images.build_request({"prompt": "x", "images": [base], "mask": path}, source="cli")
+            except Exception as exc:
+                if not expected or expected not in str(exc):
+                    print(f"exp={expected or 'accepted'}, rec={exc} ", end="")
+                    passed = False
+                continue
+            if expected:
+                print(f"exp={expected!r} rejected, rec=accepted ", end="")
+                passed = False
+
+        # A mask set from the console applies to a slot-driven edit without being named.
+        v1_images.set_slot(1, base)
+        with v1_images.SLOT_LOCK:
+            slots = v1_images.read_slots()
+            slots[v1_images.MASK_KEY] = good_mask
+            v1_images.write_slots(slots)
+        request = v1_images.build_request({"prompt": "x", "edit": True}, source="cli")
+        if request.mask is None:
+            print("exp=stored mask applied, rec=ignored ", end="")
+            passed = False
+        # The mask key must not be mistaken for a reference slot.
+        if len(request.images) != 1:
+            print(f"exp=1 reference (mask is not a slot), rec={len(request.images)} ", end="")
+            passed = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
 def test_image_batch_numbering() -> bool:
     """
     Batches are referenced by a short number, not the provider's hash: numbers are
@@ -1303,7 +1768,7 @@ def test_image_batch_numbering() -> bool:
         # Reading state must not be what creates the output directory.
         nested = os.path.join(tmp, "nested")
         common.cfg.image_output_dir = nested
-        v1_images_generation.read_batch_state()
+        v1_images.read_batch_state()
         if os.path.exists(nested):
             print("exp=reading state creates nothing, rec=directory created ", end="")
             passed = False
@@ -1311,35 +1776,35 @@ def test_image_batch_numbering() -> bool:
 
         state = {}
         for index, batch_id in enumerate(["batch_aaa", "batch_bbb", "batch_ccc"], start=1):
-            number = v1_images_generation.next_batch_number(state)
+            number = v1_images.next_batch_number(state)
             if number != index:
                 print(f"exp=number {index}, rec={number} ", end="")
                 passed = False
             state[batch_id] = {"number": number, "retrieved": False, "model": "gpt-image-2"}
-        v1_images_generation.write_batch_state(state)
+        v1_images.write_batch_state(state)
 
         # A number resolves to its id, and a raw id is passed through untouched.
-        if v1_images_generation.resolve_batch_id("2") != "batch_bbb":
-            print(f"exp=batch_bbb, rec={v1_images_generation.resolve_batch_id('2')!r} ", end="")
+        if v1_images.resolve_batch_id("2") != "batch_bbb":
+            print(f"exp=batch_bbb, rec={v1_images.resolve_batch_id('2')!r} ", end="")
             passed = False
-        if v1_images_generation.resolve_batch_id("batch_ccc") != "batch_ccc":
+        if v1_images.resolve_batch_id("batch_ccc") != "batch_ccc":
             print("exp=raw id passed through, rec=rewritten ", end="")
             passed = False
         try:
-            v1_images_generation.resolve_batch_id("99")
+            v1_images.resolve_batch_id("99")
             print("exp=unknown number rejected, rec=accepted ", end="")
             passed = False
-        except v1_images_generation.ImageRequestError:
+        except v1_images.ImageRequestError:
             pass
 
         # Settling one batch removes it from the pending set but must not renumber the rest.
         state["batch_bbb"]["retrieved"] = True
-        v1_images_generation.write_batch_state(state)
-        if v1_images_generation.pending_batches() != [(1, "batch_aaa"), (3, "batch_ccc")]:
-            print(f"exp=[1, 3] pending, rec={v1_images_generation.pending_batches()} ", end="")
+        v1_images.write_batch_state(state)
+        if v1_images.pending_batches() != [(1, "batch_aaa"), (3, "batch_ccc")]:
+            print(f"exp=[1, 3] pending, rec={v1_images.pending_batches()} ", end="")
             passed = False
         # A retired number is never handed out again.
-        if v1_images_generation.next_batch_number(v1_images_generation.read_batch_state()) != 4:
+        if v1_images.next_batch_number(v1_images.read_batch_state()) != 4:
             print("exp=next number 4, rec=reused ", end="")
             passed = False
 
@@ -1348,17 +1813,17 @@ def test_image_batch_numbering() -> bool:
         common.cfg.image_batch_auto_poll = True
         threads_before = threading.active_count()
         with contextlib.redirect_stdout(io.StringIO()):
-            v1_images_generation.start_batch_poller()
-            v1_images_generation.start_batch_poller()
+            v1_images.start_batch_poller()
+            v1_images.start_batch_poller()
         if threading.active_count() - threads_before != 1:
             print(f"exp=1 poller thread, rec={threading.active_count() - threads_before} ", end="")
             passed = False
 
         # An older state file without numbers gets them rather than printing "?".
-        v1_images_generation.write_batch_state({"batch_old": {"retrieved": False}})
+        v1_images.write_batch_state({"batch_old": {"retrieved": False}})
         with contextlib.redirect_stdout(io.StringIO()):
-            v1_images_generation.number_legacy_batches()
-        if v1_images_generation.read_batch_state()["batch_old"].get("number") != 1:
+            v1_images.number_legacy_batches()
+        if v1_images.read_batch_state()["batch_old"].get("number") != 1:
             print("exp=legacy batch numbered, rec=unnumbered ", end="")
             passed = False
 
@@ -1381,7 +1846,7 @@ def test_image_batch_polling() -> bool:
 
     with tempfile.TemporaryDirectory() as tmp:
         common.cfg.image_output_dir = tmp
-        v1_images_generation.write_batch_state({
+        v1_images.write_batch_state({
             "batch_done"    : {"number": 1, "retrieved": False, "model": "gpt-image-2"},
             "batch_running" : {"number": 2, "retrieved": False, "model": "gpt-image-2"},
             "batch_broken"  : {"number": 3, "retrieved": False, "model": "gpt-image-2"},
@@ -1389,27 +1854,27 @@ def test_image_batch_polling() -> bool:
         })
 
         seen: list[str] = []
-        original = v1_images_generation.retrieve_image_batch
+        original = v1_images.retrieve_image_batch
         def fake_retrieve(batch_id: str) -> Any:
             seen.append(batch_id)
             if batch_id == "batch_broken":
                 raise providers.ProviderError(500, {"error": {"message": "boom"}}, "boom")
             status = {"batch_done": "completed", "batch_running": "in_progress", "batch_expired": "expired"}[batch_id]
-            if status in v1_images_generation.BATCH_TERMINAL_STATUSES:
-                state = v1_images_generation.read_batch_state()
+            if status in v1_images.BATCH_TERMINAL_STATUSES:
+                state = v1_images.read_batch_state()
                 state[batch_id].update({"retrieved": True, "final_status": status})
-                v1_images_generation.write_batch_state(state)
-            return v1_images_generation.ImageBatchResult(
+                v1_images.write_batch_state(state)
+            return v1_images.ImageBatchResult(
                 provider="testimg", model="gpt-image-2", batch_id=batch_id,
-                number=int(v1_images_generation.read_batch_state()[batch_id]["number"]), status=status,
+                number=int(v1_images.read_batch_state()[batch_id]["number"]), status=status,
             )
 
-        v1_images_generation.retrieve_image_batch = fake_retrieve
+        v1_images.retrieve_image_batch = fake_retrieve
         try:
             with contextlib.redirect_stdout(io.StringIO()):
-                settled = v1_images_generation.poll_batches_once()
+                settled = v1_images.poll_batches_once()
         finally:
-            v1_images_generation.retrieve_image_batch = original
+            v1_images.retrieve_image_batch = original
 
         # Every pending batch is checked, in number order, and one raising does not
         # stop the ones after it.
@@ -1423,7 +1888,7 @@ def test_image_batch_polling() -> bool:
             passed = False
 
         # A batch that expired will never produce images, so it must stop being polled.
-        still_pending = [batch_id for _, batch_id in v1_images_generation.pending_batches()]
+        still_pending = [batch_id for _, batch_id in v1_images.pending_batches()]
         if sorted(still_pending) != ["batch_broken", "batch_running"]:
             print(f"exp=broken+running still pending, rec={sorted(still_pending)} ", end="")
             passed = False
@@ -1446,14 +1911,14 @@ def test_image_chat_integration() -> bool:
     make_image_config()
     passed = True
 
-    saved = v1_images_generation.SavedImage(image_id="img_dead", path="generated_images/x.png")
-    fake_result = v1_images_generation.ImageResult(
+    saved = v1_images.SavedImage(image_id="img_dead", path="generated_images/x.png")
+    fake_result = v1_images.ImageResult(
         provider="testimg", model="gpt-image-2", created=CREATED,
         images=[saved], cost_usd=0.05, usage={"reported": True}, estimated=False,
     )
 
     calls: list[str] = []
-    original_generate = v1_images_generation.generate_image
+    original_generate = v1_images.generate_image
     def fake_generate(request: Any) -> Any:
         calls.append(request.prompt)
         return fake_result
@@ -1467,7 +1932,7 @@ def test_image_chat_integration() -> bool:
             "usage": {}, "message_extra": {},
         })
 
-    v1_images_generation.generate_image = fake_generate
+    v1_images.generate_image = fake_generate
     server.active_backend               = fake_backend
     try:
         image_only = server.generate_non_stream({"messages": [
@@ -1496,7 +1961,7 @@ def test_image_chat_integration() -> bool:
             print(f"exp=2 generations, rec={calls} ", end="")
             passed = False
     finally:
-        v1_images_generation.generate_image = original_generate
+        v1_images.generate_image = original_generate
         server.active_backend               = original_backend
 
     if passed : print(f"{GREEN}PASS{RESET}")
@@ -1520,7 +1985,7 @@ def test_image_failure_is_inline() -> bool:
 
     html = "<html><head><title>520</title></head><body><h1>" + ("Web server error. " * 200) + "</h1></body></html>"
 
-    original_generate = v1_images_generation.generate_image
+    original_generate = v1_images.generate_image
     def failing_generate(request: Any) -> Any:
         raise providers.ProviderError(520, {"error": {"message": html}}, "gateway error")
 
@@ -1531,7 +1996,7 @@ def test_image_failure_is_inline() -> bool:
             "usage": {}, "message_extra": {},
         })
 
-    v1_images_generation.generate_image = failing_generate
+    v1_images.generate_image = failing_generate
     server.active_backend               = fake_backend
     try:
         with contextlib.redirect_stdout(io.StringIO()):
@@ -1554,7 +2019,7 @@ def test_image_failure_is_inline() -> bool:
             print(f"exp=note under {server.IMAGE_NOTE_MAX_CHARS} chars, rec={len(note)} ", end="")
             passed = False
     finally:
-        v1_images_generation.generate_image = original_generate
+        v1_images.generate_image = original_generate
         server.active_backend               = original_backend
 
     if passed : print(f"{GREEN}PASS{RESET}")
@@ -1580,7 +2045,7 @@ def test_image_model_selection_is_isolated() -> bool:
 
     before = (cfg.backend, cfg.model, cfg.input_token_cost_usd, cfg.output_token_cost_usd, cfg.model_cost_family)
     try:
-        v1_images_generation.apply_image_model("gpt-image-2")
+        v1_images.apply_image_model("gpt-image-2")
     finally:
         del os.environ["TESTIMG_IMAGE_MODEL_GPTIMAGE2_REGEX"]
         del os.environ["TESTIMG_IMAGE_MODEL_GPTIMAGE2_COST"]
@@ -1637,6 +2102,13 @@ if __name__ == "__main__":
 
     for image_usage_case in IMAGE_USAGE_CASES:
         tests_passed += test_image_usage(image_usage_case)
+
+    tests_passed += test_image_reference_validation()
+    tests_passed += test_image_edit_path_security()
+    tests_passed += test_image_edit_detection()
+    tests_passed += test_image_edit_batch_rules()
+    tests_passed += test_image_edit_form()
+    tests_passed += test_image_mask_validation()
 
     tests_passed += test_image_batch_accounting()
     tests_passed += test_image_batch_numbering()
