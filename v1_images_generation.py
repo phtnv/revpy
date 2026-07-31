@@ -69,6 +69,15 @@ BATCH_ENDPOINT   = "/v1/images/generations"
 BATCH_STATE_FILE = "img_batches.json"
 MANIFEST_FILE    = "img_generation.json"
 
+# Statuses a batch never moves out of. Anything else is still worth polling.
+BATCH_TERMINAL_STATUSES = {"completed", "failed", "expired", "cancelled"}
+
+# Serializes everything that reads-then-writes the batch state file. Two actors now touch
+# it -- the background poller and whoever is at the CLI -- and a batch retrieved by both
+# at once would save its images twice and bill the session twice. Re-entrant because
+# retrieval resolves and labels batches while already holding it.
+BATCH_LOCK = threading.RLock()
+
 # Serializes filename allocation, file writes and manifest updates. Waitress serves
 # requests on a thread pool, so two concurrent generations can otherwise pick the same
 # free filename between the exists() check and the write.
@@ -127,6 +136,8 @@ class ImageBatchResult:
     model     : str
     batch_id  : str
     status    : str
+    # The short reference the user sees. 0 for a batch this proxy did not submit.
+    number    : int              = 0
     images    : List[SavedImage] = field(default_factory=list)
     cost_usd  : float            = 0.0
     counts    : Dict[str, int]   = field(default_factory=dict)
@@ -684,7 +695,68 @@ def generate_image(request: ImageRequest) -> ImageResult:
 # can be awaited inside a chat turn, so submission and retrieval are separate calls and
 # the CLI is what drives them.
 def batch_state_path() -> str:
-    return os.path.join(output_dir_path(), BATCH_STATE_FILE)
+    """Deliberately does not create the output directory: reading state must not be what
+    brings a directory into existence for a feature nobody has used yet."""
+    return os.path.join(os.path.abspath(cfg.image_output_dir), BATCH_STATE_FILE)
+
+
+def number_legacy_batches() -> None:
+    """
+    Gives a number to any batch recorded before numbering existed, so an older state file
+    does not leave unreferenceable rows in the listing.
+    """
+    with BATCH_LOCK:
+        state   = read_batch_state()
+        missing = [batch_id for batch_id, entry in state.items() if not entry.get("number")]
+        if not missing:
+            return
+
+        number = next_batch_number(state)
+        for batch_id in missing:
+            state[batch_id]["number"] = number
+            number += 1
+        write_batch_state(state)
+        print(f"Assigned reference numbers to {len(missing)} previously recorded image batch(es).")
+
+
+def next_batch_number(state: Dict[str, Any]) -> int:
+    """
+    The next short reference number. Numbers are assigned once, persisted, and never
+    reused, so the number printed when a batch was submitted still names the same batch
+    after a restart -- which is the whole point of having one instead of the provider's id.
+    """
+    highest = 0
+    for entry in state.values():
+        try: highest = max(highest, int(entry.get("number") or 0))
+        except (TypeError, ValueError):
+            continue
+    return highest + 1
+
+
+def resolve_batch_id(token: str) -> str:
+    """
+    Turns whatever the user typed into a provider batch id. A bare number is looked up
+    among the submitted batches; anything else is taken as an id already, so a batch this
+    proxy never submitted can still be retrieved.
+    """
+    token = str(token).strip()
+    if not token.isdigit():
+        return token
+
+    number = int(token)
+    with BATCH_LOCK:
+        for batch_id, entry in read_batch_state().items():
+            if int(entry.get("number") or 0) == number:
+                return batch_id
+
+    raise ImageRequestError(f"no batch numbered {number}. Use 'image batch list' to see them.")
+
+
+def batch_label(batch_id: str, state: Optional[Dict[str, Any]] = None) -> str:
+    """How a batch is named to the user: its number, not its provider hash."""
+    entry  = (state or read_batch_state()).get(batch_id) or {}
+    number = entry.get("number")
+    return f"#{number}" if number else batch_id
 
 
 def read_batch_state() -> Dict[str, Any]:
@@ -706,7 +778,7 @@ def write_batch_state(state: Dict[str, Any]) -> None:
     images and the custom_id it was given, so without this the output format, filename
     and prompt a batch was submitted with are gone by the time it completes.
     """
-    path     = batch_state_path()
+    path     = os.path.join(output_dir_path(), BATCH_STATE_FILE)
     tmp_path = f"{path}.{uuid.uuid4().hex[:8]}.part"
     try:
         with open(tmp_path, "w", encoding="utf-8") as handle:
@@ -809,24 +881,29 @@ def submit_image_batch(requests: List[ImageRequest]) -> ImageBatchResult:
     if not batch_id:
         raise ProviderError(502, {"error": {"message": "batch creation returned no id."}}, "batch creation failed")
 
-    state = read_batch_state()
-    state[batch_id] = {
-        "provider"      : cfg.image_provider,
-        "model"         : cfg.image_model,
-        "input_file_id" : file_id,
-        "submitted_at"  : time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "retrieved"     : False,
-        "requests"      : entries,
-    }
-    write_batch_state(state)
+    with BATCH_LOCK:
+        state  = read_batch_state()
+        number = next_batch_number(state)
+        state[batch_id] = {
+            "number"        : number,
+            "provider"      : cfg.image_provider,
+            "model"         : cfg.image_model,
+            "input_file_id" : file_id,
+            "submitted_at"  : time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "retrieved"     : False,
+            "requests"      : entries,
+        }
+        write_batch_state(state)
 
-    print(f"Submitted image batch {batch_id} ({len(requests)} request(s), window {cfg.image_batch_window}).")
-    print(f"Retrieve it later with: image batch get {batch_id}")
+    auto = "It will be retrieved automatically when it completes." if cfg.image_batch_auto_poll else f"Retrieve it with: image batch get {number}"
+    print(f"Submitted image batch #{number} ({len(requests)} request(s), window {cfg.image_batch_window}).")
+    print(auto)
 
     return ImageBatchResult(
         provider = cfg.image_provider,
         model    = cfg.image_model,
         batch_id = batch_id,
+        number   = number,
         status   = str(data.get("status") or "validating"),
         counts   = {"submitted": len(requests)},
     )
@@ -864,95 +941,205 @@ def retrieve_image_batch(batch_id: str) -> ImageBatchResult:
     for them again.
     """
     provider = image_provider()
-    state    = read_batch_state()
-    entry    = state.get(batch_id) or {}
 
-    data   = fetch_batch(provider, batch_id)
-    status = str(data.get("status") or "unknown")
-    model  = str(entry.get("model") or cfg.image_model)
+    # The whole read-check-save-mark sequence is one critical section: the poller and the
+    # CLI can both land on the same batch, and doing this twice would write a second copy
+    # of every image and bill the session for it.
+    with BATCH_LOCK:
+        state = read_batch_state()
+        entry = state.get(batch_id) or {}
 
-    result = ImageBatchResult(
-        provider = cfg.image_provider,
-        model    = model,
-        batch_id = batch_id,
-        status   = status,
-        counts   = dict(data.get("request_counts") or {}),
-    )
+        data   = fetch_batch(provider, batch_id)
+        status = str(data.get("status") or "unknown")
+        model  = str(entry.get("model") or cfg.image_model)
 
-    if status != "completed":
-        return result
+        result = ImageBatchResult(
+            provider = cfg.image_provider,
+            model    = model,
+            batch_id = batch_id,
+            number   = int(entry.get("number") or 0),
+            status   = status,
+            counts   = dict(data.get("request_counts") or {}),
+        )
 
-    if entry.get("retrieved"):
-        result.errors.append("already retrieved; images were saved on the first retrieval.")
-        return result
+        if entry.get("retrieved"):
+            result.errors.append("already retrieved; images were saved on the first retrieval.")
+            return result
 
-    output_file_id = str(data.get("output_file_id") or "")
-    if not output_file_id:
-        result.errors.append("batch completed without an output file.")
-        return result
+        if status != "completed":
+            # A batch that failed, expired or was cancelled will never produce images.
+            # Marking it settles it, so the poller stops asking about it every interval.
+            if status in BATCH_TERMINAL_STATUSES and entry:
+                entry["retrieved"]    = True
+                entry["final_status"] = status
+                state[batch_id]       = entry
+                write_batch_state(state)
+            return result
 
-    requests_state = entry.get("requests") or {}
-    total_counts   = {"text_input": 0, "image_input": 0, "output": 0, "reported": False}
-    images_saved   = 0
+        output_file_id = str(data.get("output_file_id") or "")
+        if not output_file_id:
+            result.errors.append("batch completed without an output file.")
+            return result
 
-    for line in fetch_file_content(provider, output_file_id).splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try: record = json.loads(line)
-        except Exception:
-            result.errors.append("could not parse an output line.")
-            continue
+        requests_state = entry.get("requests") or {}
+        total_counts   = {"text_input": 0, "image_input": 0, "output": 0, "reported": False}
+        images_saved   = 0
 
-        custom_id = str(record.get("custom_id") or "")
-        response  = record.get("response") or {}
-        body      = response.get("body") if isinstance(response, dict) else {}
-        body      = body if isinstance(body, dict) else {}
-
-        if int((response or {}).get("status_code") or 0) != 200:
-            message = ((body.get("error") or {}) if isinstance(body.get("error"), dict) else {}).get("message")
-            result.errors.append(f"{custom_id}: {message or 'request failed'}")
-            continue
-
-        req     = state_to_request(requests_state.get(custom_id) or {})
-        entries = body.get("data")
-        if not isinstance(entries, list):
-            result.errors.append(f"{custom_id}: response carried no data entries.")
-            continue
-
-        saved: List[SavedImage] = []
-        for index, item in enumerate(entries):
-            item      = item if isinstance(item, dict) else {}
-            image_id  = f"img_{uuid.uuid4().hex[:16]}"
-            try:
-                raw_bytes = decode_image(item.get("b64_json"), index)
-            except ProviderError as exc:
-                result.errors.append(f"{custom_id}: {exc}")
+        for line in fetch_file_content(provider, output_file_id).splitlines():
+            line = line.strip()
+            if not line:
                 continue
-            saved.append(save_image_bytes(req, raw_bytes, image_id))
+            try: record = json.loads(line)
+            except Exception:
+                result.errors.append("could not parse an output line.")
+                continue
 
-        counts = parse_usage(body.get("usage"))
-        for key in ("text_input", "image_input", "output"):
-            total_counts[key] += counts[key]
-        total_counts["reported"] = total_counts["reported"] or counts["reported"]
+            custom_id = str(record.get("custom_id") or "")
+            response  = record.get("response") or {}
+            body      = response.get("body") if isinstance(response, dict) else {}
+            body      = body if isinstance(body, dict) else {}
 
-        append_manifest(req, saved, 0.0, counts, not counts["reported"], batch_id=batch_id)
-        result.images.extend(saved)
-        images_saved += len(saved)
+            if int((response or {}).get("status_code") or 0) != 200:
+                message = ((body.get("error") or {}) if isinstance(body.get("error"), dict) else {}).get("message")
+                result.errors.append(f"{custom_id}: {message or 'request failed'}")
+                continue
 
-    if images_saved:
-        # Billed once for the whole batch, at the batch rate, rather than per output line:
-        # the session report distinguishes batch spending from immediate spending.
-        billing_req = state_to_request(next(iter(requests_state.values()), {}))
-        result.cost_usd, _ = cost_for(billing_req, total_counts, images_saved, batch=True)
+            req     = state_to_request(requests_state.get(custom_id) or {})
+            entries = body.get("data")
+            if not isinstance(entries, list):
+                result.errors.append(f"{custom_id}: response carried no data entries.")
+                continue
 
-    entry["retrieved"]     = True
-    entry["retrieved_at"]  = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    entry["images"]        = [image.path for image in result.images]
-    state[batch_id]        = entry
-    write_batch_state(state)
+            saved: List[SavedImage] = []
+            for index, item in enumerate(entries):
+                item      = item if isinstance(item, dict) else {}
+                image_id  = f"img_{uuid.uuid4().hex[:16]}"
+                try:
+                    raw_bytes = decode_image(item.get("b64_json"), index)
+                except ProviderError as exc:
+                    result.errors.append(f"{custom_id}: {exc}")
+                    continue
+                saved.append(save_image_bytes(req, raw_bytes, image_id))
+
+            counts = parse_usage(body.get("usage"))
+            for key in ("text_input", "image_input", "output"):
+                total_counts[key] += counts[key]
+            total_counts["reported"] = total_counts["reported"] or counts["reported"]
+
+            append_manifest(req, saved, 0.0, counts, not counts["reported"], batch_id=batch_id)
+            result.images.extend(saved)
+            images_saved += len(saved)
+
+        if images_saved:
+            # Billed once for the whole batch, at the batch rate, rather than per output
+            # line: the session report distinguishes batch from immediate spending.
+            billing_req = state_to_request(next(iter(requests_state.values()), {}))
+            result.cost_usd, _ = cost_for(billing_req, total_counts, images_saved, batch=True)
+
+        entry["retrieved"]    = True
+        entry["retrieved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        entry["final_status"] = status
+        entry["images"]       = [image.path for image in result.images]
+        state[batch_id]       = entry
+        write_batch_state(state)
 
     return result
+
+
+# Background retrieval
+def pending_batches() -> List[Tuple[int, str]]:
+    """Every submitted batch that has not settled yet, in submission order."""
+    with BATCH_LOCK:
+        state = read_batch_state()
+
+    pending = [
+        (int(entry.get("number") or 0), batch_id)
+        for batch_id, entry in state.items()
+        if not entry.get("retrieved")
+    ]
+    return sorted(pending)
+
+
+def poll_batches_once() -> List[ImageBatchResult]:
+    """
+    Checks every unsettled batch once and retrieves the finished ones. Returns only the
+    batches that actually settled, so a caller has nothing to report on a quiet pass.
+
+    One batch failing must not stop the others from being checked, so each is caught
+    separately -- a provider hiccup on one id is not a reason to strand the rest.
+    """
+    settled: List[ImageBatchResult] = []
+
+    for number, batch_id in pending_batches():
+        try:
+            result = retrieve_image_batch(batch_id)
+        except Exception as exc:
+            print(f"WARNING: could not check image batch #{number}: {exc}")
+            continue
+        if result.status in BATCH_TERMINAL_STATUSES:
+            settled.append(result)
+
+    return settled
+
+
+def report_settled_batch(result: ImageBatchResult) -> None:
+    """Announces a batch that finished while nobody was watching."""
+    label = f"#{result.number}" if result.number else result.batch_id
+    print()
+    print(f"=== image batch {label} {result.status} ===")
+    for image in result.images:
+        print(f"  saved {image.image_id} -> {image.path}")
+    if result.images:
+        print(f"  cost {fmt_usd(result.cost_usd)}")
+    for error in result.errors:
+        print(f"  {error}")
+    print(f"=== image batch {label} end ===")
+    print("> ", end="", flush=True)
+
+
+def batch_poll_loop() -> None:
+    """
+    Retrieves completed batches in the background.
+
+    A batch finishes on the provider's schedule, which is rarely the moment anyone is
+    looking at the CLI. Without this its images stay on the provider until somebody
+    remembers to ask, and the completion window can expire first.
+    """
+    while True:
+        time.sleep(cfg.image_batch_poll_seconds)
+
+        if not cfg.image_enabled or not cfg.image_batch_auto_poll:
+            continue
+
+        try:
+            for result in poll_batches_once():
+                report_settled_batch(result)
+        except Exception as exc:
+            # The poller outliving a bad pass matters more than the pass succeeding.
+            print(f"WARNING: image batch poll failed: {exc}")
+
+
+# One poller per process. 'reload' can turn auto-polling on after startup, so this is
+# called again from there; without the flag that would leave two threads racing for the
+# same batches. The thread itself re-reads the settings every pass, so a poller already
+# running picks up a new interval (or a disabled switch) without being restarted.
+POLLER_STARTED = False
+
+def start_batch_poller() -> None:
+    global POLLER_STARTED
+
+    if not cfg.image_enabled:
+        return
+
+    number_legacy_batches()
+
+    if not cfg.image_batch_auto_poll or POLLER_STARTED:
+        return
+
+    POLLER_STARTED = True
+    threading.Thread(target=batch_poll_loop, daemon=True).start()
+    waiting = len(pending_batches())
+    print(f"Image batches are retrieved automatically every {cfg.image_batch_poll_seconds:.0f}s ({waiting} waiting).")
 
 
 # Image model list. Fetched separately from the conversational one: <NAME>_MODELS_REGEX

@@ -407,14 +407,31 @@ Each image also appends a record to `img_generation.json` in the output director
 
 ### Batch API
 
-Setting `batch: true` submits through the provider's Batch API instead of generating immediately. A batch is **not** the same thing as `n: 4` — `n` asks for several images now, a batch trades latency (up to `IMAGE_BATCH_COMPLETION_WINDOW`, default 24h) for a lower rate. It therefore cannot return a file inside a chat turn; you get a batch id and retrieve it later:
+Setting `batch: true` submits through the provider's Batch API instead of generating immediately. A batch is **not** the same thing as `n: 4` — `n` asks for several images now, a batch trades latency (up to `IMAGE_BATCH_COMPLETION_WINDOW`, default 24h) for a lower rate. It therefore cannot return a file inside a chat turn.
+
+You don't have to chase it. The proxy polls unsettled batches in the background every `IMAGE_BATCH_POLL_SECONDS` (default 300, floored at 30) and saves their images the moment they finish, announcing it in the terminal:
 
 ```text
-image batch get batch_6a6c70...
-GET /v1/images/batches/batch_6a6c70...
+=== image batch #3 completed ===
+  saved img_9deea2c9a2304746 -> generated_images/20260731_125500_9deea2c9.png
+  cost $0.002968
+=== image batch #3 end ===
 ```
 
-The parameters each batch was submitted with are kept in `img_batches.json` in the output directory, because the provider returns only the images and the id it was given. Retrieving a completed batch saves its images once and records that it did, so re-running it will not write a second copy or bill you twice.
+Set `IMAGE_BATCH_AUTO_POLL=false` to turn that off and retrieve them by hand instead.
+
+**Batches are referred to by a small number, not the provider's hash.** The number is assigned at submission, persisted, and never reused, so the one printed when you submitted still names the same batch after a restart:
+
+```text
+image batch list       →   1  completed   gpt-image-2  submitted 2026-07-31T12:52:32+0300  1 image(s)
+                           2  pending     gpt-image-2  submitted 2026-07-31T13:15:15+0300
+image batch get 2          Retrieve #2 now.
+image batch poll           Check everything unsettled now, instead of waiting out the interval.
+```
+
+`GET /v1/images/batches/2` works the same way, and both forms still accept a raw provider id so a batch this proxy never submitted can be fetched.
+
+The parameters each batch was submitted with are kept in `img_batches.json` in the output directory, because the provider returns only the images and the id it was given. Retrieving a completed batch saves its images once and records that it did, so neither a second retrieval nor the poller racing you can write a duplicate or bill you twice. A batch that failed, expired or was cancelled is settled too, so the poller stops asking about it.
 
 A batch reports the same token counts as an immediate request, so nothing in the response reveals the discount — set `IMAGE_BATCH_COST_MULTIPLIER` to state it. It defaults to `1.0` (no discount assumed, so a budget is never quietly understated); OpenAI bills the Batch API at 50%, so `0.5` is right for that provider.
 
@@ -426,8 +443,9 @@ image gen <prompt>     Generate now, using the configured defaults.
 image model            List the image provider's image models.
 image model <number>   Select one. Your chat model is untouched.
 image batch <prompt>   Submit a one-request batch.
-image batch get <id>   Retrieve a batch and save its images.
+image batch get <n>    Retrieve batch number <n> and save its images.
 image batch list       List batches submitted from this output directory.
+image batch poll       Check every unsettled batch now.
 image cost             Show image spending.
 ```
 

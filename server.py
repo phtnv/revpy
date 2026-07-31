@@ -85,6 +85,9 @@ def reload_runtime_env() -> None:
     # again here rather than riding along with the model switch below.
     v1_images_generation.resolve_image_config()
     v1_images_generation.refresh_image_models(cfg.model_list_timeout_seconds)
+    # Idempotent: arms the poller if this reload switched it on, and does nothing if one
+    # is already running (it re-reads the interval by itself).
+    v1_images_generation.start_batch_poller()
 
     print("Reloaded runtime configuration from .env.")
     print("HOST and PORT were not changed; restart the process to change bind address.")
@@ -178,10 +181,12 @@ CLI_CMD_IMAGE_INFO = """\
     image model refresh       Request the image model list again.
       Alias: r
     image batch <prompt>      Submit a one-request image batch.
-    image batch get <id>      Retrieve a batch and save its images when complete.
+    image batch get <uint>    Retrieve a batch by its number and save its images.
       Alias: g
     image batch list          List the batches submitted from this output directory.
       Alias: l
+    image batch poll          Check every unsettled batch now, instead of waiting.
+      Alias: p
     image cost                Show image session spending.
     image help                Display this message.
       Alias: ?
@@ -205,7 +210,7 @@ def cli_generate_image(prompt: str, batch: bool) -> None:
         req = v1_images_generation.build_request({"prompt": prompt, "batch": batch}, source="cli")
         if batch:
             result = v1_images_generation.submit_image_batch([req])
-            print(f"Batch {result.batch_id} is {result.status}.")
+            print(f"Batch #{result.number} is {result.status}.")
             return
         result = v1_images_generation.generate_image(req)
         for image in result.images:
@@ -216,10 +221,13 @@ def cli_generate_image(prompt: str, batch: bool) -> None:
         write_error_log({"error": str(exc), "traceback": traceback.format_exc()})
 
 
-def cli_retrieve_batch(batch_id: str) -> None:
+def cli_retrieve_batch(token: str) -> None:
+    """Retrieves a batch by its short number (or by a raw provider id)."""
     try:
-        result = v1_images_generation.retrieve_image_batch(batch_id)
-        print(f"Batch {result.batch_id} is {result.status}. {result.counts}")
+        batch_id = v1_images_generation.resolve_batch_id(token)
+        result   = v1_images_generation.retrieve_image_batch(batch_id)
+        label    = f"#{result.number}" if result.number else result.batch_id
+        print(f"Batch {label} is {result.status}. {result.counts}")
         for image in result.images:
             print(f"Saved {image.image_id} -> {image.path}")
         if result.images:
@@ -231,14 +239,43 @@ def cli_retrieve_batch(batch_id: str) -> None:
         write_error_log({"error": str(exc), "traceback": traceback.format_exc()})
 
 
+def cli_poll_batches() -> None:
+    """Runs the poller's work on demand, for when waiting out the interval is not the point."""
+    pending = v1_images_generation.pending_batches()
+    if not pending:
+        print("No image batches are waiting.")
+        return
+
+    print(f"Checking {len(pending)} batch(es): {', '.join('#' + str(number) for number, _ in pending)}")
+    try:
+        settled = v1_images_generation.poll_batches_once()
+    except Exception as exc:
+        print_error(exc)
+        write_error_log({"error": str(exc), "traceback": traceback.format_exc()})
+        return
+
+    if not settled:
+        print("None of them have finished yet.")
+        return
+    for result in settled:
+        print(f"  #{result.number} {result.status}, {len(result.images)} image(s) saved.")
+
+
 def cli_list_batches() -> None:
     state = v1_images_generation.read_batch_state()
     if not state:
         print("No image batches have been submitted from this output directory.")
         return
-    for batch_id, entry in state.items():
-        status = "retrieved" if entry.get("retrieved") else "pending"
-        print(f"  {batch_id}  {status:<10}  {entry.get('model', '')}  submitted {entry.get('submitted_at', '')}")
+
+    rows = sorted(state.items(), key=lambda item: int(item[1].get("number") or 0))
+    for batch_id, entry in rows:
+        number = entry.get("number") or "?"
+        status = entry.get("final_status", "") if entry.get("retrieved") else "pending"
+        images = len(entry.get("images") or [])
+        images_cell = f"{images} image(s)" if entry.get("retrieved") else ""
+        print(f"  {str(number):>3}  {status or 'settled':<10}  {entry.get('model', ''):<16}  submitted {entry.get('submitted_at', '')}  {images_cell}")
+
+    print("Retrieve one with 'image batch get <number>'.")
 
 
 def handle_image_command(line: str, parts: List[str]) -> None:
@@ -287,6 +324,9 @@ def handle_image_command(line: str, parts: List[str]) -> None:
         arg2 = parts[2].lower()
         if arg2 in {"l", "list"}:
             cli_list_batches()
+            return
+        if arg2 in {"p", "poll"}:
+            cli_poll_batches()
             return
         if arg2 in {"g", "get"}:
             if parts_l < 4:
@@ -1215,7 +1255,10 @@ def run_image_requests(extraction: image_orchestrator.Extraction) -> str:
         try:
             if req.batch:
                 batch = v1_images_generation.submit_image_batch([req])
-                lines.append(f"[Image batch submitted: {batch.batch_id} — retrieve with 'image batch get {batch.batch_id}']")
+                if cfg.image_batch_auto_poll:
+                    lines.append(f"[Image batch #{batch.number} submitted — it will be saved automatically when it completes]")
+                else:
+                    lines.append(f"[Image batch #{batch.number} submitted — retrieve with 'image batch get {batch.number}']")
                 continue
             result = v1_images_generation.generate_image(req)
             lines.append(v1_images_generation.reference_line(result))
@@ -1415,6 +1458,8 @@ def running():
                 "model"                : cfg.image_model,
                 "output_dir"           : cfg.image_output_dir,
                 "cost_family"          : cfg.image_cost_family,
+                "batch_auto_poll"      : cfg.image_batch_auto_poll,
+                "batch_poll_seconds"   : cfg.image_batch_poll_seconds,
                 "defaults"             : {
                     "size"       : cfg.image_default_size,
                     "quality"    : cfg.image_default_quality,
@@ -1498,10 +1543,14 @@ def images_generations():
         if req.batch:
             batch = v1_images_generation.submit_image_batch([req])
             return jsonify({
+                # 'number' is the short reference the CLI and chat replies use; the
+                # provider id is kept for callers that talk to the provider directly.
+                "number"            : batch.number,
                 "batch_id"          : batch.batch_id,
                 "status"            : batch.status,
                 "model"             : batch.model,
                 "completion_window" : cfg.image_batch_window,
+                "auto_retrieved"    : cfg.image_batch_auto_poll,
             })
 
         return jsonify(make_image_response(v1_images_generation.generate_image(req)))
@@ -1510,13 +1559,17 @@ def images_generations():
         return make_error_response(exc, payload)
 
 
-@app.route("/images/batches/<batch_id>"   , methods=["GET"])
-@app.route("/v1/images/batches/<batch_id>", methods=["GET"])
-def images_batch_status(batch_id: str):
-    """Batch status, saving the images once the batch has completed."""
+@app.route("/images/batches/<token>"   , methods=["GET"])
+@app.route("/v1/images/batches/<token>", methods=["GET"])
+def images_batch_status(token: str):
+    """
+    Batch status, saving the images once the batch has completed. Accepts either the
+    short number the proxy assigned or the provider's own batch id.
+    """
     try:
-        result = v1_images_generation.retrieve_image_batch(batch_id)
+        result = v1_images_generation.retrieve_image_batch(v1_images_generation.resolve_batch_id(token))
         return jsonify({
+            "number"   : result.number,
             "batch_id" : result.batch_id,
             "status"   : result.status,
             "model"    : result.model,
@@ -1575,6 +1628,7 @@ if __name__ == "__main__":
 
     v1_images_generation.resolve_image_config()
     v1_images_generation.refresh_image_models(cfg.model_list_timeout_seconds)
+    v1_images_generation.start_batch_poller()
 
     print("Starting proxy")
     print(f"Local URL: http://{cfg.host}:{cfg.port}")

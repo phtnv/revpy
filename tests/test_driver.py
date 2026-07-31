@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 
 from pathlib           import Path
 from types             import SimpleNamespace
@@ -1284,6 +1285,154 @@ def test_image_batch_accounting() -> bool:
     return passed
 
 
+def test_image_batch_numbering() -> bool:
+    """
+    Batches are referenced by a short number, not the provider's hash: numbers are
+    assigned once, survive a restart, are never reused, and resolve back to the id.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing image batch numbering: stable, unique, resolvable... ", end="")
+
+    make_image_config()
+    passed = True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        common.cfg.image_output_dir = tmp
+
+        # Reading state must not be what creates the output directory.
+        nested = os.path.join(tmp, "nested")
+        common.cfg.image_output_dir = nested
+        v1_images_generation.read_batch_state()
+        if os.path.exists(nested):
+            print("exp=reading state creates nothing, rec=directory created ", end="")
+            passed = False
+        common.cfg.image_output_dir = tmp
+
+        state = {}
+        for index, batch_id in enumerate(["batch_aaa", "batch_bbb", "batch_ccc"], start=1):
+            number = v1_images_generation.next_batch_number(state)
+            if number != index:
+                print(f"exp=number {index}, rec={number} ", end="")
+                passed = False
+            state[batch_id] = {"number": number, "retrieved": False, "model": "gpt-image-2"}
+        v1_images_generation.write_batch_state(state)
+
+        # A number resolves to its id, and a raw id is passed through untouched.
+        if v1_images_generation.resolve_batch_id("2") != "batch_bbb":
+            print(f"exp=batch_bbb, rec={v1_images_generation.resolve_batch_id('2')!r} ", end="")
+            passed = False
+        if v1_images_generation.resolve_batch_id("batch_ccc") != "batch_ccc":
+            print("exp=raw id passed through, rec=rewritten ", end="")
+            passed = False
+        try:
+            v1_images_generation.resolve_batch_id("99")
+            print("exp=unknown number rejected, rec=accepted ", end="")
+            passed = False
+        except v1_images_generation.ImageRequestError:
+            pass
+
+        # Settling one batch removes it from the pending set but must not renumber the rest.
+        state["batch_bbb"]["retrieved"] = True
+        v1_images_generation.write_batch_state(state)
+        if v1_images_generation.pending_batches() != [(1, "batch_aaa"), (3, "batch_ccc")]:
+            print(f"exp=[1, 3] pending, rec={v1_images_generation.pending_batches()} ", end="")
+            passed = False
+        # A retired number is never handed out again.
+        if v1_images_generation.next_batch_number(v1_images_generation.read_batch_state()) != 4:
+            print("exp=next number 4, rec=reused ", end="")
+            passed = False
+
+        # Starting the poller twice (boot, then a 'reload' that re-enables it) must not
+        # leave two threads racing for the same batches.
+        common.cfg.image_batch_auto_poll = True
+        threads_before = threading.active_count()
+        with contextlib.redirect_stdout(io.StringIO()):
+            v1_images_generation.start_batch_poller()
+            v1_images_generation.start_batch_poller()
+        if threading.active_count() - threads_before != 1:
+            print(f"exp=1 poller thread, rec={threading.active_count() - threads_before} ", end="")
+            passed = False
+
+        # An older state file without numbers gets them rather than printing "?".
+        v1_images_generation.write_batch_state({"batch_old": {"retrieved": False}})
+        with contextlib.redirect_stdout(io.StringIO()):
+            v1_images_generation.number_legacy_batches()
+        if v1_images_generation.read_batch_state()["batch_old"].get("number") != 1:
+            print("exp=legacy batch numbered, rec=unnumbered ", end="")
+            passed = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_image_batch_polling() -> bool:
+    """
+    The poller settles finished batches, leaves running ones alone, keeps going past a
+    batch that errors, and stops chasing one that failed or expired.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing image batch polling: settles the finished, survives the broken... ", end="")
+
+    make_image_config()
+    passed = True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        common.cfg.image_output_dir = tmp
+        v1_images_generation.write_batch_state({
+            "batch_done"    : {"number": 1, "retrieved": False, "model": "gpt-image-2"},
+            "batch_running" : {"number": 2, "retrieved": False, "model": "gpt-image-2"},
+            "batch_broken"  : {"number": 3, "retrieved": False, "model": "gpt-image-2"},
+            "batch_expired" : {"number": 4, "retrieved": False, "model": "gpt-image-2"},
+        })
+
+        seen: list[str] = []
+        original = v1_images_generation.retrieve_image_batch
+        def fake_retrieve(batch_id: str) -> Any:
+            seen.append(batch_id)
+            if batch_id == "batch_broken":
+                raise providers.ProviderError(500, {"error": {"message": "boom"}}, "boom")
+            status = {"batch_done": "completed", "batch_running": "in_progress", "batch_expired": "expired"}[batch_id]
+            if status in v1_images_generation.BATCH_TERMINAL_STATUSES:
+                state = v1_images_generation.read_batch_state()
+                state[batch_id].update({"retrieved": True, "final_status": status})
+                v1_images_generation.write_batch_state(state)
+            return v1_images_generation.ImageBatchResult(
+                provider="testimg", model="gpt-image-2", batch_id=batch_id,
+                number=int(v1_images_generation.read_batch_state()[batch_id]["number"]), status=status,
+            )
+
+        v1_images_generation.retrieve_image_batch = fake_retrieve
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                settled = v1_images_generation.poll_batches_once()
+        finally:
+            v1_images_generation.retrieve_image_batch = original
+
+        # Every pending batch is checked, in number order, and one raising does not
+        # stop the ones after it.
+        if seen != ["batch_done", "batch_running", "batch_broken", "batch_expired"]:
+            print(f"exp=all four checked in order, rec={seen} ", end="")
+            passed = False
+
+        settled_ids = sorted(result.batch_id for result in settled)
+        if settled_ids != ["batch_done", "batch_expired"]:
+            print(f"exp=['batch_done', 'batch_expired'] settled, rec={settled_ids} ", end="")
+            passed = False
+
+        # A batch that expired will never produce images, so it must stop being polled.
+        still_pending = [batch_id for _, batch_id in v1_images_generation.pending_batches()]
+        if sorted(still_pending) != ["batch_broken", "batch_running"]:
+            print(f"exp=broken+running still pending, rec={sorted(still_pending)} ", end="")
+            passed = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
 def test_image_chat_integration() -> bool:
     """
     The two chat outcomes: an image-only turn never reaches a text backend, and a mixed
@@ -1490,6 +1639,8 @@ if __name__ == "__main__":
         tests_passed += test_image_usage(image_usage_case)
 
     tests_passed += test_image_batch_accounting()
+    tests_passed += test_image_batch_numbering()
+    tests_passed += test_image_batch_polling()
     tests_passed += test_image_storage_confinement()
     tests_passed += test_image_chat_integration()
     tests_passed += test_image_failure_is_inline()

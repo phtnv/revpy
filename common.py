@@ -528,6 +528,13 @@ class RuntimeConfig:
         # published rate -- over-reporting a budget is the safe direction to be wrong in.
         self.image_batch_multiplier = max(0.0, getenv_float("IMAGE_BATCH_COST_MULTIPLIER", 1.0))
 
+        # Background batch retrieval. A batch completes on the provider's schedule rather
+        # than the proxy's, so without this its images sit finished but never collected
+        # until somebody runs the CLI. The floor keeps a misconfigured interval from
+        # turning the poller into a request loop.
+        self.image_batch_auto_poll    = getenv_bool("IMAGE_BATCH_AUTO_POLL", True)
+        self.image_batch_poll_seconds = max(10.0, getenv_float("IMAGE_BATCH_POLL_SECONDS", 300.0))
+
         # Fallback per-image price estimates, for providers that return no usage object.
         # {"model-regex": {quality: {size: usd}}}, with "*" accepted for either key.
         self.image_price_table: Dict[str, Any] = {}
@@ -613,6 +620,8 @@ class RuntimeConfig:
         print(f"  Output dir          {self.image_output_dir}")
         print(f"  Defaults            size={self.image_default_size} quality={self.image_default_quality} format={self.image_default_format} background={self.image_default_background} n={self.image_default_n} batch={self.image_default_batch}")
         print(f"  Limits              max_n={self.image_max_n} max_prompt_chars={self.image_max_prompt_chars}")
+        if self.image_batch_auto_poll : print(f"  Batch auto-poll  ✅  every {self.image_batch_poll_seconds:.0f}s, window {self.image_batch_window}, billed x{self.image_batch_multiplier:g}")
+        else                          : print(f"  Batch auto-poll  ❌  retrieve with 'image batch get <number>'")
 
     def check_cache_block_num(self) -> None:
         cache_blocks_active : int = 0
