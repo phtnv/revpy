@@ -20,6 +20,22 @@ THINK_EFFORT_ORDER  = ("low", "medium", "high", "xhigh", "max")
 MAX_TOKENS_PARAMS   = {"auto", "max_tokens", "max_completion_tokens"}
 REASONING_SUMMARIES = {"none", "auto", "concise", "detailed"}
 
+# Image generation enums, as accepted by /images/generations on the gpt-image family.
+# 'transparent' is deliberately absent from the backgrounds: gpt-image-2 does not support
+# it, and offering a value the model will reject is worse than not offering it at all.
+IMAGE_QUALITIES   = {"auto", "low", "medium", "high"}
+IMAGE_FORMATS     = {"png", "jpeg", "webp"}
+IMAGE_BACKGROUNDS = {"opaque", "automatic"}
+
+# Size constraints rather than a size allowlist. gpt-image-2 accepts any resolution
+# meeting all of these, so an enum of the four popular sizes would reject valid requests
+# and would go stale the moment the model's range changes.
+IMAGE_SIZE_MAX_EDGE     = 3840
+IMAGE_SIZE_EDGE_MULTIPLE = 16
+IMAGE_SIZE_MAX_ASPECT   = 3.0
+IMAGE_SIZE_MIN_PIXELS   = 655_360
+IMAGE_SIZE_MAX_PIXELS   = 8_294_400
+
 # Which wire protocol a provider speaks, and the variable declaring the providers that
 # speak it. A provider is served by the module for the list it was declared in; nothing
 # is derived from its endpoint, so pointing a provider at any host that implements the
@@ -65,6 +81,15 @@ def getenv_preserve_thinking_blocks(name: str, default: str = "0") -> int:
         try: return max(0, int(default))
         except Exception:
             return 0
+def getenv_choice(name: str, default: str, allowed: set) -> str:
+    """One value out of a fixed set, lowercased. An unknown value warns and takes the default."""
+    value = os.getenv(name, default).strip().lower()
+    if value in allowed:
+        return value
+    print(f"WARNING: {name} must be one of {sorted(allowed)}. Defaulting to {default}.")
+    return default
+
+
 def getenv_cache_ttl(name: str, default: str) -> str:
     if default not in {"5m", "1h"}:
         default = "1h"
@@ -136,6 +161,25 @@ def resolve_costs(costs: Dict[str, Any]) -> Dict[str, float]:
     }
 
 
+def resolve_image_costs(costs: Dict[str, Any]) -> Dict[str, float]:
+    """
+    The four prices an image model is billed at, in USD per 1 million tokens. These are
+    separate from resolve_costs() because image billing splits its input by modality
+    (prompt text vs. reference images) rather than by cache state, and because forcing
+    image output into the text output_cost field would corrupt the text session totals.
+    Cached input defaults to the uncached image input rate, which is what a provider
+    charging no cache discount looks like.
+    """
+    image_input = cost_value(costs, "image_input", 0.0)
+
+    return {
+        "text_input_cost"   : cost_value(costs, "text_input"   , 0.0),
+        "image_input_cost"  : image_input,
+        "cached_input_cost" : cost_value(costs, "cached_input" , image_input),
+        "image_output_cost" : cost_value(costs, "image_output" , 0.0),
+    }
+
+
 def extract_claude_version(value: Any) -> Version:
     """
     Extracts a Claude major.minor model version from either display names like
@@ -192,6 +236,45 @@ class RuntimeConfig:
                 families.append({"name": family.lower(), "regex": pattern, **resolve_costs(costs)})
             except Exception as exc:
                 print(f"WARNING: {cost_var}: {exc}. Skipping cost family.")
+
+        return families
+
+
+    def parse_image_cost_families(self, prefix: str) -> List[Dict[str, Any]]:
+        """
+        Per-model image prices: <PREFIX>_IMAGE_MODEL_<FAMILY>_REGEX is matched (re.search)
+        against the selected image model id; the first declared match wins. The costs live
+        in <PREFIX>_IMAGE_MODEL_<FAMILY>_COST as a json5 object, USD per 1 million tokens:
+            {text_input: 5.00, image_input: 8.00, image_output: 30.00}
+        See resolve_image_costs() for what a missing key falls back to.
+
+        This is deliberately a separate namespace from parse_cost_families(): the same
+        provider serves text and image models, and <PREFIX>_MODEL_* must keep pricing only
+        the text ones.
+        """
+        families: List[Dict[str, Any]] = []
+        family_var_re = re.compile(rf"^{re.escape(prefix)}_IMAGE_MODEL_([A-Za-z0-9]+)_REGEX$")
+
+        for env_name in os.environ:
+            match = family_var_re.match(env_name)
+            if match is None:
+                continue
+            family   = match.group(1)
+            cost_var = f"{prefix}_IMAGE_MODEL_{family}_COST"
+
+            try:
+                pattern = re.compile(os.environ[env_name].strip())
+            except re.error as exc:
+                print(f"WARNING: {env_name} is not a valid regex ({exc}). Skipping image cost family.")
+                continue
+
+            try:
+                costs = json5.loads(os.getenv(cost_var, "").strip() or "null")
+                if not isinstance(costs, dict):
+                    raise ValueError("must be a json5 object like {text_input: 5.0, image_input: 8.0, image_output: 30.0}")
+                families.append({"name": family.lower(), "regex": pattern, **resolve_image_costs(costs)})
+            except Exception as exc:
+                print(f"WARNING: {cost_var}: {exc}. Skipping image cost family.")
 
         return families
 
@@ -398,6 +481,73 @@ class RuntimeConfig:
         self.cache_anthropic_auto = getenv_bool("CACHE_ANTHROPIC_AUTO", False)
         self.cache_anthropic_ttl  = getenv_cache_ttl("CACHE_ANTHROPIC_TTL", "1h")
 
+        # Image generation. A secondary service: none of this touches the active text
+        # provider or model, and the image model is never bound through providers.apply_model.
+        self.image_enabled      = getenv_bool("IMAGE_GENERATION_ENABLED", False)
+        # Whether <IMAGE_REQUEST_TAG> blocks in user messages are honored. Turning this off
+        # leaves the direct /v1/images/generations endpoint working.
+        self.image_chat_enabled = getenv_bool("IMAGE_CHAT_ENABLED", True)
+        self.image_provider     = os.getenv("IMAGE_PROVIDER", "").strip().lower()
+        self.image_model        = os.getenv("IMAGE_MODEL", "").strip()
+        self.image_output_dir   = os.getenv("IMAGE_OUTPUT_DIR", "generated_images").strip() or "generated_images"
+
+        # Defaults applied to every request, direct or chat-triggered, that does not
+        # override them. 'auto' lets the provider decide.
+        self.image_default_size       = os.getenv("IMAGE_DEFAULT_SIZE", "1024x1024").strip().lower()
+        self.image_default_quality    = getenv_choice("IMAGE_DEFAULT_QUALITY"   , "medium", IMAGE_QUALITIES)
+        self.image_default_format     = getenv_choice("IMAGE_DEFAULT_FORMAT"    , "png"   , IMAGE_FORMATS)
+        self.image_default_background = getenv_choice("IMAGE_DEFAULT_BACKGROUND", "opaque", IMAGE_BACKGROUNDS)
+        self.image_default_n          = max(1, getenv_int("IMAGE_DEFAULT_N", 1))
+        self.image_default_batch      = getenv_bool("IMAGE_DEFAULT_BATCH", False)
+
+        # Validation limits, checked before the provider is contacted.
+        self.image_max_n            = max(1, getenv_int("IMAGE_MAX_N", 4))
+        self.image_max_prompt_chars = max(1, getenv_int("IMAGE_MAX_PROMPT_CHARS", 20000))
+        if self.image_default_n > self.image_max_n:
+            print(f"WARNING: IMAGE_DEFAULT_N ({self.image_default_n}) exceeds IMAGE_MAX_N ({self.image_max_n}). Clamping.")
+            self.image_default_n = self.image_max_n
+
+        # The tag a user message carries an image request in. Assistant output is never
+        # scanned, so this is the only trigger there is.
+        self.image_request_tag = os.getenv("IMAGE_REQUEST_TAG", "image_generation").strip() or "image_generation"
+
+        # The image model list is fetched separately from the conversational one, because
+        # <NAME>_MODELS_REGEX exists precisely to keep image models out of that list.
+        self.image_models_regex = os.getenv("IMAGE_MODELS_REGEX", "image").strip()
+
+        self.image_cost_reporting   = getenv_bool("IMAGE_COST_REPORTING"  , True)
+        self.image_manifest_enabled = getenv_bool("IMAGE_MANIFEST_ENABLED", True)
+        # Prompts are chat content. Writing them into a sidecar that outlives the session is
+        # a separate decision from printing them to a debug console, so it gets its own switch.
+        self.image_manifest_prompts = getenv_bool("IMAGE_MANIFEST_PROMPTS", True)
+
+        self.image_batch_window     = os.getenv("IMAGE_BATCH_COMPLETION_WINDOW", "24h").strip() or "24h"
+        # What a batch is billed at relative to immediate generation. The provider reports
+        # the same token counts either way, so nothing in the usage payload reveals the
+        # discount; it has to be configured. Defaults to 1.0 rather than to any provider's
+        # published rate -- over-reporting a budget is the safe direction to be wrong in.
+        self.image_batch_multiplier = max(0.0, getenv_float("IMAGE_BATCH_COST_MULTIPLIER", 1.0))
+
+        # Fallback per-image price estimates, for providers that return no usage object.
+        # {"model-regex": {quality: {size: usd}}}, with "*" accepted for either key.
+        self.image_price_table: Dict[str, Any] = {}
+        price_table_raw = os.getenv("IMAGE_PRICE_TABLE", "").strip()
+        if price_table_raw:
+            try:
+                parsed = json5.loads(price_table_raw)
+                if isinstance(parsed, dict) : self.image_price_table = parsed
+                else                        : print("WARNING: IMAGE_PRICE_TABLE must be a json5 object. Ignoring.")
+            except Exception as exc:
+                print(f"WARNING: IMAGE_PRICE_TABLE is not valid json5 ({exc}). Ignoring.")
+
+        # Resolved prices for the selected image model. Populated by
+        # v1_images_generation.apply_image_model(); inert until then.
+        self.image_cost_family     = ""
+        self.image_text_input_cost   = 0.0
+        self.image_image_input_cost  = 0.0
+        self.image_cached_input_cost = 0.0
+        self.image_output_cost       = 0.0
+
         self.error_log_path = os.getenv("ERROR_LOG_PATH", "revpy_error.log")
         self.model_list_timeout_seconds = getenv_float("MODEL_LIST_TIMEOUT_SECONDS", 10.0)
 
@@ -452,6 +602,17 @@ class RuntimeConfig:
         else                          : print(f"  Auto   cache   {self.cache_auto_msg:3d}  {self.cache_auto_ttl} | 1 is the last user message")
         if self.cache_anthropic_auto  : print(f"  Anthropic auto  ✅  {self.cache_anthropic_ttl}")
         else                          : print(f"  Anthropic auto  ❌  {self.cache_anthropic_ttl}")
+
+    def print_image_status(self) -> None:
+        if self.image_enabled      : print("  Image generation ✅")
+        else                       : print("  Image generation ❌  (IMAGE_GENERATION_ENABLED)")
+        if self.image_chat_enabled : print(f"  Chat trigger     ✅  <{self.image_request_tag}> in a user message")
+        else                       : print(f"  Chat trigger     ❌  direct endpoint only")
+        print(f"  Provider/model      {self.image_provider or '(unset)'}/{self.image_model or '(unset)'}")
+        print(f"  Cost family         {self.image_cost_family or '(unresolved)'}")
+        print(f"  Output dir          {self.image_output_dir}")
+        print(f"  Defaults            size={self.image_default_size} quality={self.image_default_quality} format={self.image_default_format} background={self.image_default_background} n={self.image_default_n} batch={self.image_default_batch}")
+        print(f"  Limits              max_n={self.image_max_n} max_prompt_chars={self.image_max_prompt_chars}")
 
     def check_cache_block_num(self) -> None:
         cache_blocks_active : int = 0
@@ -565,6 +726,14 @@ class RuntimeConfig:
         print(f"preserve_thinking      = {preserve_str}")
         print(f"error_log_path         = {self.error_log_path}")
         print(f"model_list_timeout_sec = {self.model_list_timeout_seconds}")
+        print(f"image_enabled          = {self.image_enabled}")
+        print(f"image_provider         = {self.image_provider}")
+        print(f"image_model            = {self.image_model}")
+        print(f"image_cost_family      = {self.image_cost_family}")
+        print(f"  text_input_cost      = {self.image_text_input_cost}")
+        print(f"  image_input_cost     = {self.image_image_input_cost}")
+        print(f"  image_output_cost    = {self.image_output_cost}")
+        print(f"image_output_dir       = {self.image_output_dir}")
         print("=== Runtime config end ===")
         print()
 
@@ -619,6 +788,60 @@ def add_session_cost(request_total_cost: float, total_input_cost: float, output_
 def session_cost_snapshot() -> Dict[str, Any]:
     with SESSION_COST_LOCK:
         return session_cost_totals_locked()
+
+
+# Image session cost tracking. Deliberately separate from the text totals above: an
+# image is not an output token, and folding its cost into SESSION_TTL_OUTPUT_COST_USD
+# would make the average-cost-per-token report meaningless. Immediate and Batch API
+# spending are tracked apart because they are billed at different rates.
+SESSION_IMAGE_IMMEDIATE_COST_USD = 0.0
+SESSION_IMAGE_BATCH_COST_USD     = 0.0
+SESSION_IMAGE_COUNT              = 0
+SESSION_IMAGE_BATCH_COUNT        = 0
+SESSION_IMAGE_TEXT_INPUT_TOK     = 0
+SESSION_IMAGE_IMAGE_INPUT_TOK    = 0
+SESSION_IMAGE_OUTPUT_TOK         = 0
+SESSION_IMAGE_ESTIMATED          = False
+IMAGE_COST_LOCK                  = threading.Lock()
+
+
+def image_cost_totals_locked() -> Dict[str, Any]:
+    return {
+        "immediate_cost_usd" : SESSION_IMAGE_IMMEDIATE_COST_USD,
+        "batch_cost_usd"     : SESSION_IMAGE_BATCH_COST_USD,
+        "total_cost_usd"     : SESSION_IMAGE_IMMEDIATE_COST_USD + SESSION_IMAGE_BATCH_COST_USD,
+        "images"             : SESSION_IMAGE_COUNT,
+        "batch_images"       : SESSION_IMAGE_BATCH_COUNT,
+        "text_input_tokens"  : SESSION_IMAGE_TEXT_INPUT_TOK,
+        "image_input_tokens" : SESSION_IMAGE_IMAGE_INPUT_TOK,
+        "image_output_tokens": SESSION_IMAGE_OUTPUT_TOK,
+        # True once any total includes a price the provider did not actually report.
+        "contains_estimates" : SESSION_IMAGE_ESTIMATED,
+    }
+
+
+def add_image_cost(cost_usd: float, text_input_tok: int, image_input_tok: int, output_tok: int, images: int, batch: bool, estimated: bool) -> Dict[str, Any]:
+    global SESSION_IMAGE_IMMEDIATE_COST_USD, SESSION_IMAGE_BATCH_COST_USD, SESSION_IMAGE_COUNT
+    global SESSION_IMAGE_BATCH_COUNT, SESSION_IMAGE_TEXT_INPUT_TOK, SESSION_IMAGE_IMAGE_INPUT_TOK
+    global SESSION_IMAGE_OUTPUT_TOK, SESSION_IMAGE_ESTIMATED
+
+    with IMAGE_COST_LOCK:
+        if batch:
+            SESSION_IMAGE_BATCH_COST_USD += cost_usd
+            SESSION_IMAGE_BATCH_COUNT    += images
+        else:
+            SESSION_IMAGE_IMMEDIATE_COST_USD += cost_usd
+            SESSION_IMAGE_COUNT              += images
+        SESSION_IMAGE_TEXT_INPUT_TOK  += text_input_tok
+        SESSION_IMAGE_IMAGE_INPUT_TOK += image_input_tok
+        SESSION_IMAGE_OUTPUT_TOK      += output_tok
+        SESSION_IMAGE_ESTIMATED        = SESSION_IMAGE_ESTIMATED or estimated
+        return image_cost_totals_locked()
+
+
+def image_cost_snapshot() -> Dict[str, Any]:
+    with IMAGE_COST_LOCK:
+        return image_cost_totals_locked()
 
 
 def get_bearer_token() -> str:
@@ -869,6 +1092,82 @@ def usage_to_openai_dict(counts: Dict[str, Any]) -> Dict[str, int]:
     }
 
 
+def tok_usd(tokens: int, usd_per_million_tokens: float) -> float:
+    return (tokens*usd_per_million_tokens)/1_000_000.0
+
+
+def fmt_usd(amount: float) -> str:
+    sign = "-" if amount < 0 else ""
+    return f"{sign}${abs(amount):,.6f}"
+
+
+def track_image_usage(counts: Dict[str, Any], images: int, batch: bool, model: str) -> float:
+    """
+    Costs one image request and folds it into the image session totals. Returns the
+    request cost so the caller can report it back to the client.
+
+    'counts' carries text_input, image_input, output and an 'estimated' flag. The
+    providers seen so far return an exact usage object, so estimation is the fallback
+    path for those that do not (see v1_images_generation.estimate_image_cost).
+    """
+    text_input_tok  = max(0, int(counts.get("text_input" , 0) or 0))
+    image_input_tok = max(0, int(counts.get("image_input", 0) or 0))
+    output_tok      = max(0, int(counts.get("output"     , 0) or 0))
+    estimated       = bool(counts.get("estimated", False))
+
+    # A batch reports the same token counts as an immediate request but is invoiced at a
+    # different rate, so the discount is applied here rather than hidden in the prices.
+    multiplier = cfg.image_batch_multiplier if batch else 1.0
+
+    if estimated:
+        request_cost = float(counts.get("estimated_cost_usd", 0.0) or 0.0)*multiplier
+        text_cost = image_cost = output_cost = 0.0
+    else:
+        text_cost    = tok_usd(text_input_tok , cfg.image_text_input_cost) *multiplier
+        image_cost   = tok_usd(image_input_tok, cfg.image_image_input_cost)*multiplier
+        output_cost  = tok_usd(output_tok     , cfg.image_output_cost)     *multiplier
+        request_cost = text_cost + image_cost + output_cost
+
+    session = add_image_cost(
+        cost_usd        = request_cost,
+        text_input_tok  = text_input_tok,
+        image_input_tok = image_input_tok,
+        output_tok      = output_tok,
+        images          = images,
+        batch           = batch,
+        estimated       = estimated,
+    )
+
+    if not cfg.debug_log or not cfg.image_cost_reporting:
+        return request_cost
+
+    mode = f"batch x{multiplier:g}" if batch else "immediate"
+    print()
+    print(f"=== image usage start ({cfg.image_provider}/{model}, {mode}) ===")
+    print("Request:")
+    print(f"    Images             = {images}")
+    if estimated:
+        print(f"    Tokens             = not reported by the provider; cost estimated from IMAGE_PRICE_TABLE")
+        print(f"    Estimated cost     = {fmt_usd(request_cost)}")
+    else:
+        print( "    Input tokens       =       text +      image")
+        print( "    {:18d} = {:10d} + {:10d}".format(text_input_tok + image_input_tok, text_input_tok, image_input_tok))
+        print( "    {:>18s} = {:>10s} + {:>10s}".format(fmt_usd(text_cost + image_cost), fmt_usd(text_cost), fmt_usd(image_cost)))
+        print(f"    Output tokens      = {output_tok:d} ({fmt_usd(output_cost)})")
+        print(f"    Total cost         = {fmt_usd(request_cost)}")
+    print("Session:")
+    print("    Images             = {:d} immediate + {:d} batch".format(session["images"], session["batch_images"]))
+    print("    Immediate cost     = {}".format(fmt_usd(session["immediate_cost_usd"])))
+    print("    Batch cost         = {}".format(fmt_usd(session["batch_cost_usd"])))
+    print("    Image total        = {}{}".format(fmt_usd(session["total_cost_usd"]), " (contains estimates)" if session["contains_estimates"] else ""))
+    print("    Text total         = {}".format(fmt_usd(session_cost_snapshot()["total_spent_usd"])))
+    print("    Combined session   = {}".format(fmt_usd(session["total_cost_usd"] + session_cost_snapshot()["total_spent_usd"])))
+    print(f"=== image usage end ===")
+    print("> ", end="", flush=True)
+
+    return request_cost
+
+
 def track_usage(tokens: Dict[str, Any]) -> None:
     """
     Model-agnostic cost accounting over a normalized token-count dict:
@@ -881,11 +1180,6 @@ def track_usage(tokens: Dict[str, Any]) -> None:
     does not report the count -- Anthropic and Aion reason without ever saying how
     much, and printing a zero there would be a lie rather than a measurement.
     """
-    def tok_usd(tokens: int, usd_per_million_tokens: float) -> float:
-        return (tokens*usd_per_million_tokens)/1_000_000.0
-    def fmt_usd(amount: float) -> str:
-        sign = "-" if amount < 0 else ""
-        return f"{sign}${abs(amount):,.6f}"
     def cache_lbl(net_cost_usd: float) -> str:
         if net_cost_usd < 0: return f"{fmt_usd(abs(net_cost_usd))} saved"
         if net_cost_usd > 0: return f"{fmt_usd(net_cost_usd)} lost"

@@ -11,9 +11,11 @@ from flask_cors import CORS
 from typing     import Any, Dict, List, Optional, Tuple
 from waitress   import serve
 
+import image_orchestrator
 import v1_messages
 import providers
 import v1_chat_completions
+import v1_images_generation
 import v1_responses
 
 from common import (
@@ -25,6 +27,8 @@ from common import (
     cfg,
     content_to_plain_text,
     error_body,
+    fmt_usd,
+    image_cost_snapshot,
     print_error,
     session_cost_snapshot,
 )
@@ -76,6 +80,11 @@ def reload_runtime_env() -> None:
     cfg.port = bound_port
 
     providers.refresh_models(cfg.model_list_timeout_seconds)
+
+    # Image generation is configured independently of the text model, so it is resolved
+    # again here rather than riding along with the model switch below.
+    v1_images_generation.resolve_image_config()
+    v1_images_generation.refresh_image_models(cfg.model_list_timeout_seconds)
 
     print("Reloaded runtime configuration from .env.")
     print("HOST and PORT were not changed; restart the process to change bind address.")
@@ -158,6 +167,139 @@ CLI_CMD_LOREBOOK_INFO = """\
     lorebook help          Display this message
       Alias: ?
 """
+
+CLI_CMD_IMAGE_INFO = """\
+  image command. Alias: img, i.
+    image                     Show image generation status.
+    image gen <prompt>        Generate an image now, using the configured defaults.
+      Alias: g, generate
+    image model               List the image models of the image provider.
+    image model <uint>        Select an image model. Does not change the chat model.
+    image model refresh       Request the image model list again.
+      Alias: r
+    image batch <prompt>      Submit a one-request image batch.
+    image batch get <id>      Retrieve a batch and save its images when complete.
+      Alias: g
+    image batch list          List the batches submitted from this output directory.
+      Alias: l
+    image cost                Show image session spending.
+    image help                Display this message.
+      Alias: ?
+"""
+
+
+def cli_print_image_cost() -> None:
+    images = image_cost_snapshot()
+    text   = session_cost_snapshot()
+    print(f"  Text model cost:      {fmt_usd(text['total_spent_usd'])}")
+    print(f"  Image immediate cost: {fmt_usd(images['immediate_cost_usd'])} ({images['images']} image(s))")
+    print(f"  Image batch cost:     {fmt_usd(images['batch_cost_usd'])} ({images['batch_images']} image(s))")
+    print(f"  Combined session:     {fmt_usd(text['total_spent_usd'] + images['total_cost_usd'])}")
+    if images["contains_estimates"]:
+        print("  Note: some image costs are estimates (the provider reported no usage).")
+
+
+def cli_generate_image(prompt: str, batch: bool) -> None:
+    """Runs one CLI image request. Errors are reported, never raised into the CLI loop."""
+    try:
+        req = v1_images_generation.build_request({"prompt": prompt, "batch": batch}, source="cli")
+        if batch:
+            result = v1_images_generation.submit_image_batch([req])
+            print(f"Batch {result.batch_id} is {result.status}.")
+            return
+        result = v1_images_generation.generate_image(req)
+        for image in result.images:
+            print(f"Saved {image.image_id} -> {image.path}")
+        print(f"Cost: {fmt_usd(result.cost_usd)}{' (estimated)' if result.estimated else ''}")
+    except Exception as exc:
+        print_error(exc)
+        write_error_log({"error": str(exc), "traceback": traceback.format_exc()})
+
+
+def cli_retrieve_batch(batch_id: str) -> None:
+    try:
+        result = v1_images_generation.retrieve_image_batch(batch_id)
+        print(f"Batch {result.batch_id} is {result.status}. {result.counts}")
+        for image in result.images:
+            print(f"Saved {image.image_id} -> {image.path}")
+        if result.images:
+            print(f"Cost: {fmt_usd(result.cost_usd)}")
+        for error in result.errors:
+            print(f"  {error}")
+    except Exception as exc:
+        print_error(exc)
+        write_error_log({"error": str(exc), "traceback": traceback.format_exc()})
+
+
+def cli_list_batches() -> None:
+    state = v1_images_generation.read_batch_state()
+    if not state:
+        print("No image batches have been submitted from this output directory.")
+        return
+    for batch_id, entry in state.items():
+        status = "retrieved" if entry.get("retrieved") else "pending"
+        print(f"  {batch_id}  {status:<10}  {entry.get('model', '')}  submitted {entry.get('submitted_at', '')}")
+
+
+def handle_image_command(line: str, parts: List[str]) -> None:
+    """The 'image' CLI command group. Nothing here touches the active chat model."""
+    parts_l = len(parts)
+
+    if parts_l < 2:
+        cfg.print_image_status()
+        return
+
+    arg1 = parts[1].lower()
+    if arg1 in {"?", "help"}:
+        print(CLI_CMD_IMAGE_INFO)
+        return
+    if arg1 == "cost":
+        cli_print_image_cost()
+        return
+
+    if arg1 in {"g", "gen", "generate"}:
+        split_line = line.split(maxsplit=2)
+        if len(split_line) < 3:
+            print(CLI_CMD_IMAGE_INFO)
+            return
+        cli_generate_image(split_line[2], batch=False)
+        return
+
+    if arg1 in {"m", "model", "models"}:
+        if parts_l < 3:
+            v1_images_generation.print_image_model_list()
+            return
+        arg2 = parts[2].lower()
+        if arg2 in {"r", "refresh"}:
+            v1_images_generation.refresh_image_models(cfg.model_list_timeout_seconds)
+            return
+        try: index = int(arg2)
+        except ValueError:
+            print(CLI_CMD_IMAGE_INFO)
+            return
+        v1_images_generation.select_image_model_by_number(index)
+        return
+
+    if arg1 in {"b", "batch"}:
+        if parts_l < 3:
+            print(CLI_CMD_IMAGE_INFO)
+            return
+        arg2 = parts[2].lower()
+        if arg2 in {"l", "list"}:
+            cli_list_batches()
+            return
+        if arg2 in {"g", "get"}:
+            if parts_l < 4:
+                print(CLI_CMD_IMAGE_INFO)
+                return
+            cli_retrieve_batch(parts[3])
+            return
+        split_line = line.split(maxsplit=2)
+        cli_generate_image(split_line[2], batch=True)
+        return
+
+    print(CLI_CMD_IMAGE_INFO)
+
 
 def admin_cli_loop() -> None:
     print("Runtime CLI ready. Type 'help' for commands.\n")
@@ -344,6 +486,10 @@ def admin_cli_loop() -> None:
                 print(CLI_CMD_MODEL_INFO)
                 continue
 
+            if cmd in {"i", "img", "image", "images"}:
+                handle_image_command(line, parts)
+                continue
+
             if cmd == "status":
                 cfg.print_status()
                 continue
@@ -387,6 +533,7 @@ def admin_cli_loop() -> None:
                 print()
                 print("Commands:")
                 print(CLI_CMD_CACHE_INFO)
+                print(CLI_CMD_IMAGE_INFO)
                 print(CLI_CMD_MODEL_INFO)
                 print(CLI_CMD_PREFILL_INFO)
                 print(CLI_CMD_THINK_INFO)
@@ -1036,18 +1183,117 @@ def make_error_response(exc: Exception, payload: Optional[Dict[str, Any]] = None
     return Response(json.dumps(client_body, ensure_ascii=False), status=status_code, content_type="application/json")
 
 
+# Image generation
+IMAGE_NOTE_MAX_CHARS = 240
+HTML_TAG_RE          = re.compile(r"<[^>]+>")
+
+def image_note_message(message: str) -> str:
+    """
+    An upstream error message fit to appear inside a chat reply.
+
+    A gateway failure (Cloudflare's 520 page, say) arrives as HTML rather than JSON, and
+    error_from_response falls back to the first 2000 characters of the body. Relaying that
+    verbatim buries the model's actual reply under a wall of markup, so it is stripped to
+    one short line here. The full body still reaches the error log.
+    """
+    text = HTML_TAG_RE.sub(" ", str(message or ""))
+    text = " ".join(text.split())
+    if len(text) > IMAGE_NOTE_MAX_CHARS:
+        text = text[:IMAGE_NOTE_MAX_CHARS].rstrip() + "…"
+    return text or "unknown error"
+
+
+def run_image_requests(extraction: image_orchestrator.Extraction) -> str:
+    """
+    Runs the image requests a user turn asked for and returns the text to append to the
+    reply. A failure here never costs the conversation its turn: the error is logged in
+    full and reported inline, so the model's prose still reaches the client.
+    """
+    lines: List[str] = []
+
+    for req in extraction.requests:
+        try:
+            if req.batch:
+                batch = v1_images_generation.submit_image_batch([req])
+                lines.append(f"[Image batch submitted: {batch.batch_id} — retrieve with 'image batch get {batch.batch_id}']")
+                continue
+            result = v1_images_generation.generate_image(req)
+            lines.append(v1_images_generation.reference_line(result))
+        except Exception as exc:
+            _, client_body = build_error_body(exc)
+            print_error(exc)
+            write_error_log({"error": client_body, "image_request": req.prompt[:200], "traceback": traceback.format_exc()})
+            lines.append(f"[Image generation failed: {image_note_message(client_body['error']['message'])}]")
+
+    for error in extraction.errors:
+        lines.append(f"[Image request rejected: {image_note_message(error)}]")
+
+    return "\n".join(lines)
+
+
+def make_image_only_response(note: str) -> Dict[str, Any]:
+    """
+    The chat completion for a turn that was nothing but image requests. No text backend
+    was called, so the model label reports the image model that actually did the work.
+    """
+    return {
+        "id"      : f"imggen-{int(time.time())}",
+        "object"  : "chat.completion",
+        "created" : int(time.time()),
+        "model"   : f"{cfg.image_provider}/{cfg.image_model}",
+        "choices" : [{
+            "index"         : 0,
+            "finish_reason" : "stop",
+            "message"       : {"role": "assistant", "content": note},
+        }],
+        "usage"   : {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
 # Generation
 def generate_non_stream(payload: Dict[str, Any]) -> Dict[str, Any]:
+    extraction = image_orchestrator.extract(payload)
+    if extraction.found:
+        payload = {**payload, "messages": extraction.messages}
+
+    # An image-only turn never reaches a text backend.
+    if extraction.found and not extraction.needs_text:
+        note     = run_image_requests(extraction)
+        response = make_image_only_response(note)
+        capture_chat_snapshot(payload, note)
+        return response
+
     prepared = prepare_chat_request(payload)
     result   = active_backend().generate_non_stream(prepared)
 
     response = make_openai_non_stream_response(result)
+
+    # Images run after the reply, so a slow generation does not delay the prose.
+    if extraction.found:
+        note = run_image_requests(extraction)
+        if note:
+            message = response["choices"][0]["message"]
+            message["content"] = f"{message.get('content', '')}\n\n{note}".strip()
+
     capture_chat_snapshot(payload, response["choices"][0]["message"].get("content", ""))
     return response
 
 
 def generate_stream(payload: Dict[str, Any]):
     try:
+        extraction = image_orchestrator.extract(payload)
+        if extraction.found:
+            payload = {**payload, "messages": extraction.messages}
+
+        if extraction.found and not extraction.needs_text:
+            label = f"{cfg.image_provider}/{cfg.image_model}"
+            note  = run_image_requests(extraction)
+            capture_chat_snapshot(payload, note)
+            yield openai_stream_chunk(label, {"role": "assistant", "content": note})
+            yield openai_stream_chunk(label, {}, finish_reason="stop", message_id=f"imggen-{int(time.time())}")
+            yield "data: [DONE]\n\n"
+            return
+
         prepared = prepare_chat_request(payload)
         label    = model_label()
 
@@ -1064,7 +1310,17 @@ def generate_stream(payload: Dict[str, Any]):
                     "content" : data,
                 })
             elif kind == "final":
-                capture_chat_snapshot(payload, data["snapshot_text"], data["snapshot_reasoning"])
+                # Generated after the prose has streamed, so the reply is not held back
+                # for the seconds an image takes, then appended as one last text delta.
+                note = run_image_requests(extraction) if extraction.found else ""
+                if note:
+                    yield openai_stream_chunk(label, {"role": "assistant", "content": f"\n\n{note}"})
+
+                snapshot_text = data["snapshot_text"]
+                if note:
+                    snapshot_text = f"{snapshot_text}\n\n{note}".strip()
+                capture_chat_snapshot(payload, snapshot_text, data["snapshot_reasoning"])
+
                 yield openai_stream_chunk(
                     label,
                     {},
@@ -1113,6 +1369,7 @@ def handle_chat_completion():
 @app.route("/", methods=["GET"])
 def running():
     session = session_cost_snapshot()
+    images  = image_cost_snapshot()
 
     return jsonify(
         {
@@ -1146,6 +1403,27 @@ def running():
                 "session_total_output_tokens"                      : session["output_tokens"],
                 "session_average_input_token_cost_usd_per_million" : session["average_input_cost_usd"]*1_000_000,
                 "session_cache_net_cost_usd"                       : session["cache_net_cost_usd"],
+                # Text and image spending are tracked apart, then added up here.
+                "session_image_spent_usd"                         : images["total_cost_usd"],
+                "session_combined_spent_usd"                      : session["total_spent_usd"] + images["total_cost_usd"],
+            },
+            "images" : {
+                "enabled"              : cfg.image_enabled,
+                "chat_trigger_enabled" : cfg.image_chat_enabled,
+                "request_tag"          : cfg.image_request_tag,
+                "provider"             : cfg.image_provider,
+                "model"                : cfg.image_model,
+                "output_dir"           : cfg.image_output_dir,
+                "cost_family"          : cfg.image_cost_family,
+                "defaults"             : {
+                    "size"       : cfg.image_default_size,
+                    "quality"    : cfg.image_default_quality,
+                    "format"     : cfg.image_default_format,
+                    "background" : cfg.image_default_background,
+                    "n"          : cfg.image_default_n,
+                    "batch"      : cfg.image_default_batch,
+                },
+                "session"              : images,
             },
             "thinking" : {
                 "thinking_enabled"          : cfg.thinking_enabled,
@@ -1178,6 +1456,77 @@ def chat_snapshot():
         content_type="application/json; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+def make_image_response(result: v1_images_generation.ImageResult) -> Dict[str, Any]:
+    """
+    The direct endpoint's reply. Metadata rather than Base64: the images are already on
+    disk, and echoing several megabytes of b64_json back to a caller that asked the proxy
+    to save them serves no one.
+    """
+    usage: Dict[str, Any] = {"estimated_cost_usd": round(result.cost_usd, 6), "cost_is_estimate": result.estimated}
+    if result.usage.get("reported"):
+        usage.update({
+            "text_input_tokens"   : result.usage["text_input"],
+            "image_input_tokens"  : result.usage["image_input"],
+            "image_output_tokens" : result.usage["output"],
+        })
+
+    return {
+        "created" : result.created,
+        "model"   : result.model,
+        "data"    : [{"id": image.image_id, "path": image.path} for image in result.images],
+        "usage"   : usage,
+    }
+
+
+@app.route("/images/generations"   , methods=["POST"])
+@app.route("/v1/images/generations", methods=["POST"])
+def images_generations():
+    """
+    Direct image generation, sharing every default, validator, storage rule and cost
+    path with the chat-triggered route. Only 'prompt' is required.
+    """
+    payload = request.get_json(silent=True)
+
+    if not isinstance(payload, dict):
+        return Response(json.dumps({"error": {"message": "Invalid JSON body."}}), status=400, content_type="application/json")
+
+    try:
+        req = v1_images_generation.build_request(payload, source="direct")
+
+        if req.batch:
+            batch = v1_images_generation.submit_image_batch([req])
+            return jsonify({
+                "batch_id"          : batch.batch_id,
+                "status"            : batch.status,
+                "model"             : batch.model,
+                "completion_window" : cfg.image_batch_window,
+            })
+
+        return jsonify(make_image_response(v1_images_generation.generate_image(req)))
+
+    except Exception as exc:
+        return make_error_response(exc, payload)
+
+
+@app.route("/images/batches/<batch_id>"   , methods=["GET"])
+@app.route("/v1/images/batches/<batch_id>", methods=["GET"])
+def images_batch_status(batch_id: str):
+    """Batch status, saving the images once the batch has completed."""
+    try:
+        result = v1_images_generation.retrieve_image_batch(batch_id)
+        return jsonify({
+            "batch_id" : result.batch_id,
+            "status"   : result.status,
+            "model"    : result.model,
+            "data"     : [{"id": image.image_id, "path": image.path} for image in result.images],
+            "counts"   : result.counts,
+            "errors"   : result.errors,
+            "usage"    : {"estimated_cost_usd": round(result.cost_usd, 6)},
+        })
+    except Exception as exc:
+        return make_error_response(exc, None)
 
 
 @app.route("/"                   , methods=["POST"])
@@ -1224,9 +1573,14 @@ if __name__ == "__main__":
         raise SystemExit(1)
     finish_model_switch(True)
 
+    v1_images_generation.resolve_image_config()
+    v1_images_generation.refresh_image_models(cfg.model_list_timeout_seconds)
+
     print("Starting proxy")
     print(f"Local URL: http://{cfg.host}:{cfg.port}")
     print(f"Chat completions: http://{cfg.host}:{cfg.port}/chat/completions")
+    if cfg.image_enabled:
+        print(f"Image generations: http://{cfg.host}:{cfg.port}/v1/images/generations")
     print("Cloudflare Tunnel service URL should point to this local address:")
     print(f"  http://{cfg.host}:{cfg.port}")
     print()

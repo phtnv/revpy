@@ -11,6 +11,8 @@ Three upstream protocols are supported, and you say which one a provider speaks 
 
 Nothing is guessed from the URL, so a provider goes wherever you put it. Every configured provider's models appear in one CLI `model` list; selecting one switches the active backend.
 
+A separately configured image model can also generate images, either from a block written in a chat message or through the proxy's own `/v1/images/generations` endpoint, without disturbing the conversation — see [Image generation](#image-generation).
+
 Model-agnostic features (summary blocks, lorebook handling, cost tracking, instruction prefill, auto-trim, dumps) work for every backend. Anthropic-protocol features (explicit cache markers, signed thinking-block preservation, assistant prefill) apply only to providers on `/v1/messages`. The shared thinking settings are translated into the provider's own dialect for GPT, Aion, GLM and Kimi models (see [Thinking on OpenAI-style backends](#thinking-on-openai-style-backends)). Any other provider-specific request option is passed through verbatim via `<NAME>_EXTRA_BODY`.
 
 ## Requirements
@@ -327,6 +329,128 @@ I was born at a very young age...
 
 The proxy should print a warning if you made mistakes with your tags somewhere (forgot to close one, mistyped the tag, etc...).
 
+## Image generation
+
+The proxy can generate images through a separately configured image model, while your chat model carries on as normal. Selecting or invoking an image model never changes `MODEL`, the active backend, or the prices your conversation is billed at — it is a secondary service, not a fourth protocol.
+
+Turn it on in `.env`:
+
+```ini
+IMAGE_GENERATION_ENABLED=true
+IMAGE_PROVIDER=gpt
+IMAGE_MODEL=gpt-image-2
+IMAGE_OUTPUT_DIR=generated_images
+```
+
+`IMAGE_PROVIDER` normally names one of the providers you already declared, whose base URL and key are reused. It can also name one that appears in **no** list — its `<NAME>_BASE_URL` and `<NAME>_API_KEY` are then read directly. That is how you generate images through OpenAI while chatting with Claude, without OpenAI's text models cluttering the `model` list.
+
+### Asking for an image in chat
+
+Write a block in any **user** message. The proxy removes it before the conversation reaches the text model, so the model never sees the control syntax:
+
+```xml
+<image_generation>
+prompt  : "Cassia seated at a small dinner table in a candlelit stone chamber",
+quality : "high"
+</image_generation>
+```
+
+Only `prompt` is required; everything else falls back to your configured defaults. The syntax is json5 without the surrounding braces, and a block with no `field:` syntax at all is taken as a bare prompt — `<image_generation>a gray tabby cat</image_generation>` works.
+
+The reply comes back with a reference appended:
+
+```text
+[Generated image: img_8f281a — generated_images/20260730_105900_8f281a.png]
+```
+
+If the message contained *nothing but* the block, no request is made to the text model at all — you get the reference on its own.
+
+Two things worth knowing:
+
+- **Only the latest user message triggers.** Chat clients resend the whole history every turn, so a block written three turns ago arrives again with every request. Old blocks are still stripped (the model never sees them) but never re-run — otherwise every turn would regenerate every image the chat has ever asked for.
+- **The assistant cannot request images.** Only user messages are scanned, so the model cannot spend your money by writing about the tag.
+
+A failed generation never costs you the turn. The model's prose still arrives, with the reason inlined:
+
+```text
+[Image generation failed: content policy violation]
+```
+
+### Overridable fields
+
+`prompt`, `size`, `quality`, `output_format`, `background`, `n`, `batch`, `filename`.
+
+Anything else — model, provider, base URL, API key, headers, output path — is proxy policy and is rejected rather than ignored, so a typo is reported instead of silently taking a default. `filename` is a *name*, never a path: separators, traversal and unusual characters are refused, the extension comes from `output_format`, and an existing file is never overwritten (a linear index is appended instead).
+
+`size` is validated against the model's constraints rather than a list: edges must be multiples of 16 and at most 3840px, the aspect ratio at most 3:1, and the total between 655,360 and 8,294,400 pixels. `auto` is accepted. Note that `background: transparent` is **not** supported by `gpt-image-2` — only `opaque` and `automatic`.
+
+### The direct endpoint
+
+```text
+POST /v1/images/generations
+{"prompt": "A gray tabby cat hugging an otter"}
+```
+
+Every omitted field is filled from configuration. The reply is metadata, not Base64 — the images are already on disk:
+
+```json
+{
+  "created": 1785400000,
+  "model": "gpt-image-2",
+  "data": [{"id": "img_8f281a", "path": "generated_images/20260730_105900_8f281a.png"}],
+  "usage": {"estimated_cost_usd": 0.005945, "cost_is_estimate": false,
+            "text_input_tokens": 13, "image_output_tokens": 196}
+}
+```
+
+Each image also appends a record to `img_generation.json` in the output directory (`IMAGE_MANIFEST_ENABLED`; `IMAGE_MANIFEST_PROMPTS` decides whether the prompt itself is kept, since the manifest outlives the session).
+
+### Batch API
+
+Setting `batch: true` submits through the provider's Batch API instead of generating immediately. A batch is **not** the same thing as `n: 4` — `n` asks for several images now, a batch trades latency (up to `IMAGE_BATCH_COMPLETION_WINDOW`, default 24h) for a lower rate. It therefore cannot return a file inside a chat turn; you get a batch id and retrieve it later:
+
+```text
+image batch get batch_6a6c70...
+GET /v1/images/batches/batch_6a6c70...
+```
+
+The parameters each batch was submitted with are kept in `img_batches.json` in the output directory, because the provider returns only the images and the id it was given. Retrieving a completed batch saves its images once and records that it did, so re-running it will not write a second copy or bill you twice.
+
+A batch reports the same token counts as an immediate request, so nothing in the response reveals the discount — set `IMAGE_BATCH_COST_MULTIPLIER` to state it. It defaults to `1.0` (no discount assumed, so a budget is never quietly understated); OpenAI bills the Batch API at 50%, so `0.5` is right for that provider.
+
+### CLI
+
+```text
+image                  Show image status.
+image gen <prompt>     Generate now, using the configured defaults.
+image model            List the image provider's image models.
+image model <number>   Select one. Your chat model is untouched.
+image batch <prompt>   Submit a one-request batch.
+image batch get <id>   Retrieve a batch and save its images.
+image batch list       List batches submitted from this output directory.
+image cost             Show image spending.
+```
+
+### Cost
+
+Image spending is tracked separately from text spending and reported apart, because an image is not an output token and folding it into the text totals would make the per-token averages meaningless:
+
+```text
+Text model cost:      $0.412300
+Image immediate cost: $0.005945
+Image batch cost:     $0.000000
+Combined session:     $0.418245
+```
+
+Prices are configuration-driven, in USD per million tokens, under their own `<PREFIX>_IMAGE_MODEL_*` namespace so they never collide with the text families:
+
+```ini
+GPT_IMAGE_MODEL_GPTIMAGE2_REGEX=^gpt-image-2
+GPT_IMAGE_MODEL_GPTIMAGE2_COST={text_input: 5.00, image_input: 8.00, image_output: 30.00}
+```
+
+The gpt-image family returns exact token counts, so this is real accounting rather than a guess — a low-quality 1024×1024 image reports 196 output tokens and bills at $0.0059, a high-quality one lands around $0.16–$0.21. `IMAGE_PRICE_TABLE` supplies fallback per-image estimates and is consulted only when a provider returns no usage object at all; anything costed that way is flagged as an estimate.
+
 ## Code layout
 
 The backend boundary is the upstream wire protocol — one module per protocol, each exposing the same five entry points:
@@ -345,7 +469,14 @@ Around them:
 - **`providers.py`** — the registry every backend shares: provider config, the aggregated model list, model selection and pricing, HTTP transport, and the request message list the two OpenAI-style modules build from. It imports none of the backends, so a provider can never depend on the endpoint that happens to be selected.
 - **`common.py`** — configuration from `.env`, cost accounting, text helpers, error rendering.
 
-Tests live in `tests/` and run with `python tests/test_driver.py`. They need no network and no API key: the Anthropic client is faked, and the provider tests assert the exact request body each backend builds.
+Image generation sits beside them rather than among them, since it is a secondary service the chat backends never call:
+
+- **`v1_images_generation.py`** — the `/images/generations` adapter: provider and price resolution, validation, transport, Base64 decoding, atomic file saving, the manifest, and the Batch API. It never writes to `cfg.backend`, `cfg.model` or the text price fields.
+- **`image_orchestrator.py`** — finds, parses and strips `<image_generation>` blocks in user messages, and decides whether the turn still needs the text model. It decides *whether*; `v1_images_generation.py` decides *how*.
+
+Both the direct endpoint and the chat trigger build the same `ImageRequest` and hand it to the same module, so validation, storage and accounting exist exactly once.
+
+Tests live in `tests/` and run with `python tests/test_driver.py`. They need no network and no API key: the Anthropic client is faked, the provider tests assert the exact request body each backend builds, and the image tests cover extraction, validation, filename confinement and cost without contacting anything.
 
 ## If you've read this far...
 

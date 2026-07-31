@@ -38,7 +38,11 @@ providers   : Any = importlib.import_module("providers")
 v1_messages : Any = importlib.import_module("v1_messages")
 chat_api    : Any = importlib.import_module("v1_chat_completions")
 resp_api    : Any = importlib.import_module("v1_responses")
+image_api   : Any = importlib.import_module("v1_images_generation")
 server      : Any = importlib.import_module("server")
+
+v1_images_generation = image_api
+image_orchestrator : Any = importlib.import_module("image_orchestrator")
 
 # The three request builders, keyed by the wire protocol they speak.
 BUILDERS = {
@@ -948,6 +952,508 @@ def test_provider_request_body(inputs: dict[str, Any], case: dict[str, Any]) -> 
     return passed
 
 
+# Image generation
+#
+# None of these contact a provider: extraction, validation and filename confinement all
+# happen before transport, and the two chat cases stub generate_image out. The point is
+# that a request is rejected (or an image is placed) without anything being spent.
+IMAGE_EXTRACTION_CASES = [
+    {
+        "name"       : "a block in the last user message triggers and is stripped",
+        "messages"   : [{"role": "user", "content": "<image_generation>prompt: \"a fox\"</image_generation>"}],
+        "prompts"    : ["a fox"],
+        "needs_text" : False,
+        "cleaned"    : [""],
+    },
+    {
+        "name"       : "history is stripped but never re-triggered",
+        "messages"   : [
+            {"role": "user"     , "content": "before <image_generation>prompt: \"an old fox\"</image_generation> after"},
+            {"role": "assistant", "content": "done"},
+            {"role": "user"     , "content": "just talking"},
+        ],
+        "prompts"    : [],
+        "needs_text" : True,
+        "cleaned"    : ["before  after", "done", "just talking"],
+    },
+    {
+        "name"       : "a mixed turn keeps its text and still generates",
+        "messages"   : [{"role": "user", "content": "describe the room\n<image_generation>prompt: \"a lit chamber\"</image_generation>"}],
+        "prompts"    : ["a lit chamber"],
+        "needs_text" : True,
+        "cleaned"    : ["describe the room"],
+    },
+    {
+        "name"       : "a body with no field syntax is taken as a bare prompt",
+        "messages"   : [{"role": "user", "content": "<image_generation>a gray tabby cat hugging an otter</image_generation>"}],
+        "prompts"    : ["a gray tabby cat hugging an otter"],
+        "needs_text" : False,
+        "cleaned"    : [""],
+    },
+    {
+        "name"       : "a body that already carries braces parses as-is",
+        "messages"   : [{"role": "user", "content": "<image_generation>{prompt: \"a braced fox\"}</image_generation>"}],
+        "prompts"    : ["a braced fox"],
+        "needs_text" : False,
+        "cleaned"    : [""],
+    },
+    {
+        "name"       : "an unsupported field is reported, not silently defaulted",
+        "messages"   : [{"role": "user", "content": "<image_generation>prompt: \"x\", model: \"gpt-4o\"</image_generation>"}],
+        "prompts"    : [],
+        "needs_text" : False,
+        "errors"     : 1,
+        "cleaned"    : [""],
+    },
+    {
+        "name"       : "assistant output is never scanned",
+        "messages"   : [
+            {"role": "user"     , "content": "hello"},
+            {"role": "assistant", "content": "<image_generation>prompt: \"sneaky\"</image_generation>"},
+        ],
+        "prompts"    : [],
+        "needs_text" : True,
+        "cleaned"    : ["hello", "<image_generation>prompt: \"sneaky\"</image_generation>"],
+    },
+]
+
+
+def make_image_config() -> None:
+    """Turns image generation on with known defaults, without touching the chat model."""
+    cfg = common.cfg
+    cfg.image_enabled            = True
+    cfg.image_chat_enabled       = True
+    cfg.image_provider           = "testimg"
+    cfg.image_model              = "gpt-image-2"
+    cfg.image_request_tag        = "image_generation"
+    cfg.image_default_size       = "1024x1024"
+    cfg.image_default_quality    = "medium"
+    cfg.image_default_format     = "png"
+    cfg.image_default_background = "opaque"
+    cfg.image_default_n          = 1
+    cfg.image_default_batch      = False
+    cfg.image_max_n              = 4
+    cfg.image_max_prompt_chars   = 20000
+    cfg.image_manifest_enabled   = False
+    cfg.image_cost_reporting     = False
+
+
+def test_image_extraction(case: dict[str, Any]) -> bool:
+    global tests_ttl
+    tests_ttl += 1
+    print(f"Testing image extraction: {case['name']}... ", end="")
+
+    make_image_config()
+    extraction = image_orchestrator.extract({"messages": case["messages"]})
+
+    received = {
+        "prompts"    : [req.prompt for req in extraction.requests],
+        "needs_text" : extraction.needs_text,
+        "errors"     : len(extraction.errors),
+        "cleaned"    : [msg["content"] for msg in extraction.messages],
+    }
+    expected = {
+        "prompts"    : case["prompts"],
+        "needs_text" : case["needs_text"],
+        "errors"     : case.get("errors", 0),
+        "cleaned"    : case["cleaned"],
+    }
+
+    passed = check_equal(expected, received)
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+IMAGE_VALIDATION_CASES = [
+    ({"prompt": "ok"}                                   , None),
+    ({}                                                 , "prompt is required"),
+    ({"prompt": "   "}                                  , "prompt is required"),
+    ({"prompt": "x", "size": "1024x1536"}               , None),
+    ({"prompt": "x", "size": "auto"}                    , None),
+    ({"prompt": "x", "size": "1000x1000"}               , "multiples of 16"),
+    ({"prompt": "x", "size": "4096x1024"}               , "at most 3840px"),
+    ({"prompt": "x", "size": "2048x512"}                , "aspect ratio"),
+    ({"prompt": "x", "size": "512x512"}                 , "pixels"),
+    ({"prompt": "x", "size": "wide"}                    , "WIDTHxHEIGHT"),
+    ({"prompt": "x", "quality": "ultra"}                , "quality must be one of"),
+    # gpt-image-2 has no transparent background; offering the value would only produce
+    # a provider-side rejection later.
+    ({"prompt": "x", "background": "transparent"}       , "background must be one of"),
+    ({"prompt": "x", "output_format": "gif"}            , "output_format must be one of"),
+    ({"prompt": "x", "n": 0}                            , "n must be between"),
+    ({"prompt": "x", "n": 5}                            , "n must be between"),
+    ({"prompt": "x", "n": "two"}                        , "n must be an integer"),
+    # Everything the caller must never choose.
+    ({"prompt": "x", "model": "gpt-4o"}                 , "unsupported field"),
+    ({"prompt": "x", "provider": "gpt"}                 , "unsupported field"),
+    ({"prompt": "x", "base_url": "http://evil.test"}    , "unsupported field"),
+    ({"prompt": "x", "api_key": "sk-test"}              , "unsupported field"),
+    ({"prompt": "x", "output_dir": "/etc"}              , "unsupported field"),
+    # A filename is a name, never a path.
+    ({"prompt": "x", "filename": "portrait"}            , None),
+    ({"prompt": "x", "filename": "../../etc/passwd"}    , "no path separators"),
+    ({"prompt": "x", "filename": "/tmp/evil"}           , "no path separators"),
+    ({"prompt": "x", "filename": "a/b"}                 , "no path separators"),
+    ({"prompt": "x", "filename": "..\\..\\win"}         , "no path separators"),
+    ({"prompt": "x", "filename": ".hidden"}             , "no path separators"),
+    ({"prompt": "x", "filename": ".."}                  , "no path separators"),
+]
+
+
+def test_image_validation(case: tuple) -> bool:
+    global tests_ttl
+    tests_ttl += 1
+    overrides, expected_error = case
+    print(f"Testing image validation: {str(overrides)[:58]}... ", end="")
+
+    make_image_config()
+
+    received_error = None
+    try:
+        v1_images_generation.build_request(overrides)
+    except Exception as exc:
+        received_error = str(exc)
+
+    if expected_error is None:
+        passed = received_error is None
+        if not passed:
+            print(f"exp=accepted, rec={received_error!r} ", end="")
+    else:
+        passed = received_error is not None and expected_error in received_error
+        if not passed:
+            print(f"exp contains {expected_error!r}, rec={received_error!r} ", end="")
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_image_storage_confinement() -> bool:
+    """
+    Storage is the last line able to catch a path escaping the output directory, and it
+    is what guarantees an existing image is never overwritten.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing image storage: collisions index, paths stay confined... ", end="")
+
+    make_image_config()
+    passed = True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        common.cfg.image_output_dir = tmp
+        request = v1_images_generation.build_request({"prompt": "x", "filename": "shot"})
+
+        saved = [v1_images_generation.save_image_bytes(request, b"\x89PNG-one", "img_aaaa"),
+                 v1_images_generation.save_image_bytes(request, b"\x89PNG-two", "img_bbbb")]
+
+        names = sorted(os.path.basename(image.path) for image in saved)
+        if names != ["shot.png", "shot_1.png"]:
+            print(f"exp=['shot.png', 'shot_1.png'], rec={names} ", end="")
+            passed = False
+
+        # The first file must still hold its own bytes; an index that overwrote it
+        # would leave both names pointing at the second image.
+        with open(os.path.join(tmp, "shot.png"), "rb") as handle:
+            if handle.read() != b"\x89PNG-one":
+                print("exp=first image intact, rec=overwritten ", end="")
+                passed = False
+
+        # No .part file may survive a completed write.
+        leftovers = [name for name in os.listdir(tmp) if name.endswith(".part")]
+        if leftovers:
+            print(f"exp=no temp files, rec={leftovers} ", end="")
+            passed = False
+
+        # A stem that somehow bypassed sanitisation still cannot escape.
+        try:
+            v1_images_generation.allocate_path(tmp, "../escaped", ".png")
+            print("exp=escape rejected, rec=allowed ", end="")
+            passed = False
+        except v1_images_generation.ImageRequestError:
+            pass
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+IMAGE_USAGE_CASES = [
+    (
+        "exact counts, split by modality",
+        {"input_tokens": 15, "input_tokens_details": {"text_tokens": 15, "image_tokens": 0},
+         "output_tokens": 196, "total_tokens": 211},
+        {"text_input": 15, "image_input": 0, "output": 196, "reported": True},
+        # 15 text @ $5/MTok + 196 image output @ $30/MTok
+        0.005955,
+    ),
+    (
+        "an undivided input counts as text, which is what text-to-image sends",
+        {"input_tokens": 20, "output_tokens": 4160},
+        {"text_input": 20, "image_input": 0, "output": 4160, "reported": True},
+        0.1249,
+    ),
+    (
+        "reference images are billed at the image input rate",
+        {"input_tokens": 530, "input_tokens_details": {"text_tokens": 30, "image_tokens": 500},
+         "output_tokens": 1056},
+        {"text_input": 30, "image_input": 500, "output": 1056, "reported": True},
+        # 30 @ $5 + 500 @ $8 + 1056 @ $30, per MTok
+        0.035830,
+    ),
+    (
+        "no usage object at all",
+        None,
+        {"text_input": 0, "image_input": 0, "output": 0, "reported": False},
+        0.0,
+    ),
+]
+
+
+def test_image_usage(case: tuple) -> bool:
+    global tests_ttl
+    tests_ttl += 1
+    name, payload, expected_counts, expected_cost = case
+    print(f"Testing image usage: {name}... ", end="")
+
+    make_image_config()
+    common.cfg.image_text_input_cost  = 5.00
+    common.cfg.image_image_input_cost = 8.00
+    common.cfg.image_output_cost      = 30.00
+
+    counts = v1_images_generation.parse_usage(payload)
+    passed = check_equal(expected_counts, counts)
+
+    cost = common.track_image_usage(counts, images=1, batch=False, model="gpt-image-2")
+    if round(cost, 6) != round(expected_cost, 6):
+        print(f"key=cost exp={expected_cost!r}, rec={round(cost, 6)!r}")
+        passed = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_image_batch_accounting() -> bool:
+    """
+    Batch spending is billed at its own rate and kept in its own bucket, so the session
+    report can tell immediate from batch spending rather than blending them.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing image batch accounting: own rate, own bucket... ", end="")
+
+    make_image_config()
+    cfg = common.cfg
+    cfg.image_text_input_cost  = 5.00
+    cfg.image_image_input_cost = 8.00
+    cfg.image_output_cost      = 30.00
+    cfg.image_batch_multiplier = 0.5
+
+    counts = {"text_input": 15, "image_input": 0, "output": 196, "reported": True}
+
+    before    = common.image_cost_snapshot()
+    immediate = common.track_image_usage(dict(counts), images=1, batch=False, model="gpt-image-2")
+    batched   = common.track_image_usage(dict(counts), images=1, batch=True , model="gpt-image-2")
+    after     = common.image_cost_snapshot()
+
+    passed = True
+    if round(batched, 6) != round(immediate*0.5, 6):
+        print(f"exp=half of {immediate!r}, rec={batched!r} ", end="")
+        passed = False
+
+    expected = {
+        "immediate" : round(before["immediate_cost_usd"] + immediate, 6),
+        "batch"     : round(before["batch_cost_usd"] + batched, 6),
+        "images"    : before["images"] + 1,
+        "batch_imgs": before["batch_images"] + 1,
+    }
+    received = {
+        "immediate" : round(after["immediate_cost_usd"], 6),
+        "batch"     : round(after["batch_cost_usd"], 6),
+        "images"    : after["images"],
+        "batch_imgs": after["batch_images"],
+    }
+    if not check_equal(expected, received):
+        passed = False
+
+    cfg.image_batch_multiplier = 1.0
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_image_chat_integration() -> bool:
+    """
+    The two chat outcomes: an image-only turn never reaches a text backend, and a mixed
+    turn keeps the model's prose with the reference appended.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing image chat integration: image-only skips the backend, mixed appends... ", end="")
+
+    make_config()
+    make_image_config()
+    passed = True
+
+    saved = v1_images_generation.SavedImage(image_id="img_dead", path="generated_images/x.png")
+    fake_result = v1_images_generation.ImageResult(
+        provider="testimg", model="gpt-image-2", created=CREATED,
+        images=[saved], cost_usd=0.05, usage={"reported": True}, estimated=False,
+    )
+
+    calls: list[str] = []
+    original_generate = v1_images_generation.generate_image
+    def fake_generate(request: Any) -> Any:
+        calls.append(request.prompt)
+        return fake_result
+
+    backend_calls: list[Any] = []
+    original_backend = server.active_backend
+    def fake_backend() -> Any:
+        backend_calls.append(True)
+        return SimpleNamespace(generate_non_stream=lambda prepared: {
+            "id": "msg_test", "stop_reason": "stop", "text": "The room is lit.",
+            "usage": {}, "message_extra": {},
+        })
+
+    v1_images_generation.generate_image = fake_generate
+    server.active_backend               = fake_backend
+    try:
+        image_only = server.generate_non_stream({"messages": [
+            {"role": "user", "content": "<image_generation>prompt: \"a lit chamber\"</image_generation>"},
+        ]})
+        if backend_calls:
+            print("exp=no backend call for an image-only turn, rec=called ", end="")
+            passed = False
+        content = image_only["choices"][0]["message"]["content"]
+        if content != "[Generated image: img_dead — generated_images/x.png]":
+            print(f"exp=reference only, rec={content!r} ", end="")
+            passed = False
+
+        mixed = server.generate_non_stream({"messages": [
+            {"role": "user", "content": "describe it\n<image_generation>prompt: \"a lit chamber\"</image_generation>"},
+        ]})
+        if len(backend_calls) != 1:
+            print(f"exp=1 backend call for a mixed turn, rec={len(backend_calls)} ", end="")
+            passed = False
+        content = mixed["choices"][0]["message"]["content"]
+        if content != "The room is lit.\n\n[Generated image: img_dead — generated_images/x.png]":
+            print(f"exp=prose + reference, rec={content!r} ", end="")
+            passed = False
+
+        if calls != ["a lit chamber", "a lit chamber"]:
+            print(f"exp=2 generations, rec={calls} ", end="")
+            passed = False
+    finally:
+        v1_images_generation.generate_image = original_generate
+        server.active_backend               = original_backend
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_image_failure_is_inline() -> bool:
+    """
+    A provider failure must cost the turn its image, never its text -- and an HTML
+    gateway error page must not be relayed into the reply verbatim.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing image failure: the turn survives and the note stays short... ", end="")
+
+    make_config()
+    make_image_config()
+    common.cfg.error_log_path = str(ROOT / "test_error_log.txt")
+    passed = True
+
+    html = "<html><head><title>520</title></head><body><h1>" + ("Web server error. " * 200) + "</h1></body></html>"
+
+    original_generate = v1_images_generation.generate_image
+    def failing_generate(request: Any) -> Any:
+        raise providers.ProviderError(520, {"error": {"message": html}}, "gateway error")
+
+    original_backend = server.active_backend
+    def fake_backend() -> Any:
+        return SimpleNamespace(generate_non_stream=lambda prepared: {
+            "id": "msg_test", "stop_reason": "stop", "text": "The room is lit.",
+            "usage": {}, "message_extra": {},
+        })
+
+    v1_images_generation.generate_image = failing_generate
+    server.active_backend               = fake_backend
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = server.generate_non_stream({"messages": [
+                {"role": "user", "content": "describe it\n<image_generation>prompt: \"a lit chamber\"</image_generation>"},
+            ]})
+        content = response["choices"][0]["message"]["content"]
+
+        if not content.startswith("The room is lit."):
+            print(f"exp=prose kept, rec={content[:60]!r} ", end="")
+            passed = False
+        if "[Image generation failed:" not in content:
+            print(f"exp=inline failure note, rec={content[:80]!r} ", end="")
+            passed = False
+        if "<" in content or ">" in content:
+            print("exp=markup stripped, rec=markup relayed ", end="")
+            passed = False
+        note = content.split("[Image generation failed:", 1)[1]
+        if len(note) > server.IMAGE_NOTE_MAX_CHARS + 8:
+            print(f"exp=note under {server.IMAGE_NOTE_MAX_CHARS} chars, rec={len(note)} ", end="")
+            passed = False
+    finally:
+        v1_images_generation.generate_image = original_generate
+        server.active_backend               = original_backend
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_image_model_selection_is_isolated() -> bool:
+    """
+    The rule the whole feature rests on: choosing an image model must leave the
+    conversation, its backend and its text prices exactly as they were.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing image model selection: the chat model is untouched... ", end="")
+
+    make_config()
+    make_image_config()
+    cfg = common.cfg
+
+    os.environ["TESTIMG_IMAGE_MODEL_GPTIMAGE2_REGEX"] = "^gpt-image-2"
+    os.environ["TESTIMG_IMAGE_MODEL_GPTIMAGE2_COST"]  = "{text_input: 5.0, image_input: 8.0, image_output: 30.0}"
+
+    before = (cfg.backend, cfg.model, cfg.input_token_cost_usd, cfg.output_token_cost_usd, cfg.model_cost_family)
+    try:
+        v1_images_generation.apply_image_model("gpt-image-2")
+    finally:
+        del os.environ["TESTIMG_IMAGE_MODEL_GPTIMAGE2_REGEX"]
+        del os.environ["TESTIMG_IMAGE_MODEL_GPTIMAGE2_COST"]
+
+    after  = (cfg.backend, cfg.model, cfg.input_token_cost_usd, cfg.output_token_cost_usd, cfg.model_cost_family)
+    passed = True
+
+    if before != after:
+        print(f"exp=chat state unchanged, rec={before} -> {after} ", end="")
+        passed = False
+
+    expected_image = {"family": "testimg:gptimage2", "text": 5.0, "image_in": 8.0, "out": 30.0}
+    received_image = {"family": cfg.image_cost_family, "text": cfg.image_text_input_cost,
+                      "image_in": cfg.image_image_input_cost, "out": cfg.image_output_cost}
+    if not check_equal(expected_image, received_image):
+        passed = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
 if __name__ == "__main__":
     make_config()
 
@@ -973,6 +1479,21 @@ if __name__ == "__main__":
     body_inputs, body_cases = load_body_cases("provider_bodies.json5")
     for body_case in body_cases:
         tests_passed += test_provider_request_body(body_inputs, body_case)
+
+    for extraction_case in IMAGE_EXTRACTION_CASES:
+        tests_passed += test_image_extraction(extraction_case)
+
+    for validation_case in IMAGE_VALIDATION_CASES:
+        tests_passed += test_image_validation(validation_case)
+
+    for image_usage_case in IMAGE_USAGE_CASES:
+        tests_passed += test_image_usage(image_usage_case)
+
+    tests_passed += test_image_batch_accounting()
+    tests_passed += test_image_storage_confinement()
+    tests_passed += test_image_chat_integration()
+    tests_passed += test_image_failure_is_inline()
+    tests_passed += test_image_model_selection_is_isolated()
 
     tests_failed : int = tests_ttl - tests_passed
 
