@@ -331,7 +331,7 @@ The proxy should print a warning if you made mistakes with your tags somewhere (
 
 ## Image generation
 
-The proxy can generate images through a separately configured image model, while your chat model carries on as normal. Selecting or invoking an image model never changes `MODEL`, the active backend, or the prices your conversation is billed at — it is a secondary service, not a fourth protocol.
+Image generation is optional and separate from chat. Selecting or invoking an image model never changes `MODEL`, the active backend, or the text prices your conversation uses.
 
 Turn it on in `.env`:
 
@@ -342,11 +342,11 @@ IMAGE_MODEL=gpt-image-2
 IMAGE_OUTPUT_DIR=generated_images
 ```
 
-`IMAGE_PROVIDER` normally names one of the providers you already declared, whose base URL and key are reused. It can also name one that appears in **no** list — its `<NAME>_BASE_URL` and `<NAME>_API_KEY` are then read directly. That is how you generate images through OpenAI while chatting with Claude, without OpenAI's text models cluttering the `model` list.
+`IMAGE_PROVIDER` may reuse a provider declared in one of the text-provider lists, or name a standalone `<NAME>_BASE_URL` / `<NAME>_API_KEY` block. That lets you chat through one provider and generate images through another without adding image-only models to the chat `model` list.
 
-### Asking for an image in chat
+### Chat trigger
 
-Write a block in any **user** message. The proxy removes it before the conversation reaches the text model, so the model never sees the control syntax:
+Put an `<image_generation>` block in a user message. The proxy strips the block before sending the conversation to the text model, and only blocks in the latest user message can trigger generation:
 
 ```xml
 <image_generation>
@@ -355,27 +355,21 @@ quality : "high"
 </image_generation>
 ```
 
-Only `prompt` is required; everything else falls back to your configured defaults. The syntax is json5 without the surrounding braces, and a block with no `field:` syntax at all is taken as a bare prompt — `<image_generation>a gray tabby cat</image_generation>` works.
+Only `prompt` is required. The body is json5 fields without outer braces, or a bare prompt like `<image_generation>a gray tabby cat</image_generation>`.
 
 The reply comes back with a reference appended:
 
 ```text
-[Generated image: img_8f281a — generated_images/20260730_105900_8f281a.png]
+[Generated image: img_8f281a - generated_images/20260730_105900_8f281a.png]
 ```
 
-If the message contained *nothing but* the block, no request is made to the text model at all — you get the reference on its own.
+If the user message contains only image blocks, the text backend is skipped.
 
-### Overridable fields
+Allowed overrides are `prompt`, `size`, `quality`, `output_format`, `background`, `n`, `batch`, `filename`, and for editing `images`, `edit`, `mask`, `file_ids`, `source_files`. Everything else is proxy policy. `model` is accepted for OpenAI-client compatibility but ignored.
 
-`prompt`, `size`, `quality`, `output_format`, `background`, `n`, `batch`, `filename`, and for editing `images`, `edit`, `mask`, `file_ids`, `source_files`.
+`filename` is a bare name, never a path. Existing files are not overwritten; an index is appended. `size` may be `auto` or a valid model size; for `gpt-image-2`, `background: transparent` is rejected.
 
-Anything else — model, provider, base URL, API key, headers, output path — is proxy policy and is rejected rather than ignored, so a typo is reported instead of silently taking a default. `filename` is a *name*, never a path: separators, traversal and unusual characters are refused, the extension comes from `output_format`, and an existing file is never overwritten (a linear index is appended instead).
-
-`size` is validated against the model's constraints rather than a list: edges must be multiples of 16 and at most 3840px, the aspect ratio at most 3:1, and the total between 655,360 and 8,294,400 pixels. `auto` is accepted. Note that `background: transparent` is **not** supported by `gpt-image-2` — only `opaque` and `automatic`.
-
-### The direct endpoints
-
-Two routes, split the way the upstream API splits them, so a client that knows one knows the other:
+### Direct endpoints
 
 ```text
 POST /v1/images/generations    text to image
@@ -384,22 +378,7 @@ GET  /v1/images/batches        every batch submitted from this output directory
 GET  /v1/images/batches/<n>    one batch, retrieving it if it has completed
 ```
 
-Every omitted field is filled from configuration; only `prompt` is required.
-
-```json
-{
-  "created": 1785400000,
-  "model": "gpt-image-2",
-  "data": [{"id": "img_8f281a", "b64_json": "iVBORw0…",
-            "path": "generated_images/20260730_105900_8f281a.png"}],
-  "usage": {"estimated_cost_usd": 0.005945, "cost_is_estimate": false,
-            "text_input_tokens": 13, "image_output_tokens": 196}
-}
-```
-
-The reply carries `b64_json` by default, because chat requests never come through these routes — every caller here is an external app, and an OpenAI client expects the bytes. The saved `path` rides along regardless, and `"response_format": "path"` trims the reply to metadata alone when the file on disk is all you wanted. `IMAGE_RESPONSE_FORMAT` changes the default.
-
-**The OpenAI SDK works against these unmodified:**
+Direct routes fill omitted fields from config. They return `b64_json` by default for OpenAI SDK compatibility, always include the saved `path`, and accept `"response_format": "path"` for metadata-only responses.
 
 ```python
 client = OpenAI(base_url="http://127.0.0.1:5001/v1", api_key=PROXY_KEY)
@@ -409,44 +388,11 @@ client.images.edit(model="gpt-image-2", image=[open("a.png","rb"), open("b.png",
                    prompt="put the leaf from the first image on the stone from the second")
 ```
 
-A multipart edit carries the caller's own bytes, so it needs no filesystem access on the proxy host and the path allowlist never comes into it — the content checks (magic bytes, size, count) are the same ones a path gets. `REQUEST_MAX_BYTES` caps what the server will buffer, defaulting to `IMAGE_EDIT_MAX_IMAGES × IMAGE_EDIT_MAX_BYTES` plus slack; over that is a 413.
+`GET /` reports image defaults, limits and the resolved output directory for clients that want to prefill controls.
 
-Note that `model` is accepted and **ignored**, exactly as it is for chat — the proxy decides which image model runs, via `IMAGE_MODEL` or `image model <n>`. `user`, `style` and friends are likewise accepted and discarded. A field that is neither honored nor known is still a 400, so a typo is reported rather than silently defaulted, and `stream: true` is refused outright instead of returning something an SSE client cannot read.
+### Editing
 
-`GET /` reports the image defaults, the limits and the resolved output directory, so a client can fill its own controls and reject a bad request before sending it rather than learning the rules one 400 at a time.
-
-### The manifest
-
-Each image appends a record to `img_generation.json` in the output directory (`IMAGE_MANIFEST_ENABLED`; `IMAGE_MANIFEST_PROMPTS` decides whether the prompt itself is kept, since the manifest outlives the session).
-
-```json
-{
-  "image_id": "img_8f281a…", "file": "20260730_105900_8f281a.png",
-  "path": "generated_images/20260730_105900_8f281a.png", "bytes": 1857293,
-  "provider": "openai", "model": "gpt-image-2",
-  "request_parameters": {"size": "1024x1024", "quality": "high",
-                         "output_format": "png", "background": "opaque", "n": 1},
-  "operation": "edit", "source": "direct", "created_at": "2026-07-30T10:59:00+0300",
-  "source_files": [{"file": "base.png", "path": "D:\\img\\base.png", "file_id": "file-HT2dMq…"}],
-  "estimated_cost_usd": 0.005945, "cost_is_estimate": false, "usage": {}
-}
-```
-
-**Every path in a record is relative to the manifest's own directory, with forward slashes on both platforms.** The manifest sits beside the images it describes, so its folder is a root any reader already has — and one that survives the folder being moved, renamed, or copied to another machine. There is nothing to configure and nothing to pass between programs. A path stays absolute only where no relative form exists: a different Windows drive shares no prefix to climb through.
-
-That makes `path` equal `file` for a generated image. `file` is the key that joins a record to a directory listing, and `allocate_path` has already made it unique there.
-
-`request_parameters.size` is the size that was *asked* for, recorded as given, including the literal `"auto"`.
-
-Names are judged by what Windows and POSIX will *both* accept, not by what the machine running the proxy happens to allow — an output directory gets copied and read elsewhere, and a name only one of them can open is a problem postponed. So `nul`, `con`, `com3` and friends are refused whatever extension follows, a trailing dot is refused (Windows drops it silently), and `allocate_path` treats names case-insensitively, so `Cat.png` beside `cat.png` becomes `Cat_1.png` on Linux exactly as it would on Windows.
-
-`source_files` is the lineage: which file on this machine each reference came from. For an edit against paths or uploads the proxy derives it (a path knows where it came from; an upload only its name). For a batched edit it has to be declared, because the request names its inputs by provider file id and nothing else connects those to a local file — see below.
-
-### Editing images
-
-The proxy can edit existing images as well as make new ones — including the common case of taking a feature from one picture and applying it to another, which is what several reference images are for.
-
-**Reference images are named from the console, not from the chat.** Fill numbered slots:
+For chat-triggered edits, put reference images in console slots:
 
 ```text
 image edit set 1 /home/you/pictures/cassia.png
@@ -455,7 +401,7 @@ image edit                                     # list them
 image edit clear                               # empty every slot
 ```
 
-Then edit, either from the CLI or from a chat block:
+Then use `edit: true` in a chat block or CLI command:
 
 ```xml
 <image_generation>
@@ -464,7 +410,7 @@ edit   : true
 </image_generation>
 ```
 
-`edit: true` means "use whatever the slots hold". You can also name references inline as slot numbers:
+You can also name slots inline:
 
 ```xml
 <image_generation>
@@ -473,73 +419,36 @@ images : [1, 2]
 </image_generation>
 ```
 
-A block with neither `images` nor `edit` is an ordinary generation, exactly as before — nothing about the existing behaviour changes.
-
-Because `edit: true` resolves against mutable console state, the manifest records the absolute source paths for every generated image, so a result can always be traced back to its inputs.
-
-#### Paths in chat blocks are off by default
-
-A path written inside a chat message is a request for this proxy to read a file off your machine and upload it to the provider. Since the proxy is built to sit behind a public tunnel, that is disabled unless you turn it on *and* nominate the directories it may read:
+Prompt-written paths are disabled by default because the proxy is often behind a public tunnel. To allow them:
 
 ```ini
 IMAGE_EDIT_ALLOW_PROMPT_PATHS=true
 IMAGE_EDIT_ROOTS=/home/you/pictures,/home/you/refs
 ```
 
-Paths are resolved with `realpath` before the check, so a symlink sitting inside an allowed root but pointing outside it is refused. Slot numbers work regardless of this setting, and the CLI is always allowed to name paths — that is the point of slots.
+References are validated by content bytes, size and count before anything is sent. Multipart direct edits upload the caller's bytes and do not use the proxy host filesystem or prompt-path allowlist. `REQUEST_MAX_BYTES` caps multipart uploads.
 
-Every reference is validated before anything is sent: it must exist, be a regular readable file, be a PNG, JPEG or WebP **by its leading bytes rather than its extension**, and fit `IMAGE_EDIT_MAX_BYTES`. Anything that fails is rejected outright rather than quietly dropped from the list.
-
-#### Masks
-
-A mask marks the region the model may repaint — transparent pixels are editable, opaque ones are preserved. It must be a PNG with an alpha channel, matching the first reference's dimensions:
+Optional masks must be PNGs with alpha, matching the first reference dimensions:
 
 ```text
 image edit mask /home/you/pictures/coat_area.png
 image edit mask clear
 ```
 
-A mask set this way applies to slot-driven edits automatically. Note that masking with GPT Image is prompt-guided: the model treats the mask as guidance rather than a precise stencil. A JPEG mask is rejected up front, since JPEG has no alpha channel — the provider's own docs call that the most common cause of edit failures.
+Image calls retry gateway-class failures (502/503/504/520/522/524 and dropped connections). Tune with `IMAGE_RETRY_ATTEMPTS` and `IMAGE_RETRY_BACKOFF_SECONDS`.
 
-#### Reliability
+### Batches, Manifest, Cost
 
-Image calls retry gateway-class failures (502/503/504/520/522/524 and dropped connections), which the provider's front end produces often enough to matter. Only failures that produced no image are retried, so a retry never pays for the same picture twice; a refusal or a bad request is never repeated. Tune with `IMAGE_RETRY_ATTEMPTS` (1 disables) and `IMAGE_RETRY_BACKOFF_SECONDS`.
-
-### Batch API
-
-Setting `batch: true` submits through the provider's Batch API instead of generating immediately. A batch is **not** the same thing as `n: 4` — `n` asks for several images now, a batch trades latency (up to `IMAGE_BATCH_COMPLETION_WINDOW`, default 24h) for a lower rate. It therefore cannot return a file inside a chat turn.
-
-You don't have to chase it. The proxy polls unsettled batches in the background every `IMAGE_BATCH_POLL_SECONDS` (default 300, floored at 30) and saves their images the moment they finish, announcing it in the terminal:
+`batch: true` submits through the provider Batch API instead of generating immediately. It cannot return an image inside a chat turn. The proxy assigns each submitted batch a small number, persists it, and can poll unfinished batches in the background:
 
 ```text
-=== image batch #3 completed ===
-  saved img_9deea2c9a2304746 -> generated_images/20260731_125500_9deea2c9.png
-  cost $0.002968
-=== image batch #3 end ===
+image batch list          1  completed   gpt-image-2  submitted 2026-07-31T12:52:32+0300  1 image(s)
+                          2  pending     gpt-image-2  submitted 2026-07-31T13:15:15+0300
+image batch get 2         Retrieve #2 now.
+image batch poll          Check everything unsettled now, instead of waiting out the interval.
 ```
 
-Set `IMAGE_BATCH_AUTO_POLL=false` to turn that off and retrieve them by hand instead.
-
-**Batches are referred to by a small number, not the provider's hash.** The number is assigned at submission, persisted, and never reused, so the one printed when you submitted still names the same batch after a restart:
-
-```text
-image batch list       →   1  completed   gpt-image-2  submitted 2026-07-31T12:52:32+0300  1 image(s)
-                           2  pending     gpt-image-2  submitted 2026-07-31T13:15:15+0300
-image batch get 2          Retrieve #2 now.
-image batch poll           Check everything unsettled now, instead of waiting out the interval.
-```
-
-`GET /v1/images/batches/2` works the same way, and both forms still accept a raw provider id so a batch this proxy never submitted can be fetched.
-
-`GET /v1/images/batches` lists them all instead, newest first, from the recorded state alone — it asks the provider nothing, so it neither costs anything nor retrieves anything, and a client can poll it to rebuild a job list after a restart. An unsettled batch reports `pending`, which is this proxy's word rather than one of the provider's; its live status comes from retrieving it.
-
-The parameters each batch was submitted with are kept in `img_batches.json` in the output directory, because the provider returns only the images and the id it was given. Retrieving a completed batch saves its images once and records that it did, so neither a second retrieval nor the poller racing you can write a duplicate or bill you twice. A batch that failed, expired or was cancelled is settled too, so the poller stops asking about it.
-
-A batch reports the same token counts as an immediate request, so nothing in the response reveals the discount — set `IMAGE_BATCH_COST_MULTIPLIER` to state it. It defaults to `1.0` (no discount assumed, so a budget is never quietly understated); OpenAI bills the Batch API at 50%, so `0.5` is right for that provider.
-
-#### Batching an edit
-
-The Batch API accepts no multipart upload, so a batched edit cannot send local files. Reference images have to already live on the provider, named by `file_ids` instead of `images`:
+Batched edits cannot upload local files; use provider file ids or URLs:
 
 ```json
 {
@@ -550,19 +459,7 @@ The Batch API accepts no multipart upload, so a batched edit cannot send local f
 }
 ```
 
-`source_files` is optional and never reaches the provider — it is recorded in the manifest so the result can still be traced back to its inputs once the ids are gone. That matters here more than anywhere else: **a provider file id expires and is deleted, while the copy on your disk does not**, so the local file is the durable name for a reference and the id is only the handle this particular job used. An entry may be a bare string — read as a path when it looks like one, as a name otherwise — or an object with any of `file_id`, `path` and `file`. Given the same number of entries as `file_ids` and no ids of its own, the two are paired positionally, so the ids do not have to be repeated. A path that no longer resolves is recorded as given rather than rejected: the file may have moved, and a stale link is worth more than none.
-
-Entries may be provider file ids or URLs, and several references work — two were confirmed to consume 2048 image input tokens, the same as an immediate two-reference edit. A URL entry is accepted by the schema, but the provider then has to fetch it, and a host that refuses non-browser requests fails the line with `Error while downloading file. Upstream status code: 400` rather than anything about the URL being wrong (Wikimedia does exactly this). A `file-` id avoids the whole question. Upload the files yourself (the proxy does not manage the Files API); anything else is rejected before submission:
-
-- `file_ids` without `batch: true` — it exists only for batching
-- `images` with `batch: true` — local files cannot be batched; upload them and use `file_ids`
-- `images` and `file_ids` together — mutually exclusive
-- a `mask` with `batch: true` — a mask would have to be uploaded too
-- a batch mixing edits and generations — a batch names one endpoint for all its lines
-
-One provider note worth recording, since the published batch guide is misleading here: batched edits take `images` as **an array of objects** (`[{"file_id": "..."}]`) — always an array, even for one reference, and never bare id strings. The `input_reference` field the guide describes belongs to image-guided *generation*, and sending it to `/v1/images/edits` fails with `Missing required parameter: 'images'`.
-
-### CLI
+`source_files` is optional local lineage for the manifest and never reaches the provider. It matters for batched edits because provider file ids expire.
 
 ```text
 image                  Show image status.
@@ -577,25 +474,14 @@ image batch poll       Check every unsettled batch now.
 image cost             Show image spending.
 ```
 
-### Cost
-
-Image spending is tracked separately from text spending and reported apart, because an image is not an output token and folding it into the text totals would make the per-token averages meaningless:
-
-```text
-Text model cost:      $0.412300
-Image immediate cost: $0.005945
-Image batch cost:     $0.000000
-Combined session:     $0.418245
-```
-
-Prices are configuration-driven, in USD per million tokens, under their own `<PREFIX>_IMAGE_MODEL_*` namespace so they never collide with the text families:
+Each image can append a record to `img_generation.json` (`IMAGE_MANIFEST_ENABLED`). Paths are recorded relative to the manifest directory, and `IMAGE_MANIFEST_PROMPTS` controls whether prompts are kept. Image spending is tracked separately from text spending; configure token prices under `<PREFIX>_IMAGE_MODEL_*`:
 
 ```ini
 GPT_IMAGE_MODEL_GPTIMAGE2_REGEX=^gpt-image-2
 GPT_IMAGE_MODEL_GPTIMAGE2_COST={text_input: 5.00, image_input: 8.00, image_output: 30.00}
 ```
 
-The gpt-image family returns exact token counts, so this is real accounting rather than a guess — a low-quality 1024×1024 image reports 196 output tokens and bills at $0.0059, a high-quality one lands around $0.16–$0.21. `IMAGE_PRICE_TABLE` supplies fallback per-image estimates and is consulted only when a provider returns no usage object at all; anything costed that way is flagged as an estimate.
+`IMAGE_PRICE_TABLE` is used only when the provider returns no image usage object; those costs are flagged as estimates.
 
 ## Code layout
 
@@ -615,12 +501,10 @@ Around them:
 - **`providers.py`** — the registry every backend shares: provider config, the aggregated model list, model selection and pricing, HTTP transport, and the request message list the two OpenAI-style modules build from. It imports none of the backends, so a provider can never depend on the endpoint that happens to be selected.
 - **`common.py`** — configuration from `.env`, cost accounting, text helpers, error rendering.
 
-Image generation sits beside them rather than among them, since it is a secondary service the chat backends never call:
+Image generation is secondary and separate from chat backend selection:
 
-- **`v1_images.py`** — the `/v1/images/*` adapter: provider and price resolution, validation, both transports (JSON for generation, multipart for editing), Base64 decoding, atomic file saving, reference-image slots, the manifest, and the Batch API. One module rather than one per endpoint, because generating and editing share everything except the transport — the `v1_*` files above are split by *protocol*, which is a dispatch boundary, not by URL. It never writes to `cfg.backend`, `cfg.model` or the text price fields.
-- **`image_orchestrator.py`** — finds, parses and strips `<image_generation>` blocks in user messages, and decides whether the turn still needs the text model. It decides *whether*; `v1_images.py` decides *how*.
-
-Both the direct endpoint and the chat trigger build the same `ImageRequest` and hand it to the same module, so validation, storage and accounting exist exactly once.
+- **`v1_images.py`** — `/v1/images/*` validation, transport, storage, manifests, batches and image cost accounting.
+- **`image_orchestrator.py`** — parses `<image_generation>` blocks and decides whether a chat turn still needs the text model.
 
 Tests live in `tests/` and run with `python tests/test_driver.py`. They need no network and no API key: the Anthropic client is faked, the provider tests assert the exact request body each backend builds, and the image tests cover extraction, validation, filename confinement and cost without contacting anything.
 

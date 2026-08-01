@@ -101,17 +101,11 @@ def getenv_cache_ttl(name: str, default: str) -> str:
     print(f"WARNING: {name} must be '5m' or '1h'. Defaulting to {default}.")
     return default
 
-# Unique sentinel for deep_get. A fresh object() per lookup would never compare
-# `is`-equal, making every missing path return truthy garbage instead of default.
+# Shared sentinel for missing nested paths.
 _MISSING = object()
 
 def deep_get(obj: Any, path: str, default: Any = None) -> Any:
-    """
-    Safe lookup for nested dict/list JSON.
-    Example:
-        deep_get(model_info, "thinking.supported", False)
-        deep_get(model_info, "thinking.types.adaptive.supported", False)
-    """
+    """Safe dotted lookup through nested dict/list JSON."""
     cur = obj
 
     for part in path.split("."):
@@ -129,10 +123,7 @@ def deep_get(obj: Any, path: str, default: Any = None) -> Any:
     return cur
 
 def cost_value(costs: Dict[str, Any], key: str, default: float) -> float:
-    """
-    One price out of a <NAME>_MODEL_<FAMILY>_COST object, in USD per 1 million tokens.
-    A missing key takes the default; an explicit 0 means free and is kept as such.
-    """
+    """One USD-per-million-token price; missing uses default, explicit 0 stays free."""
     raw = costs.get(key)
     if raw is None:
         return default
@@ -143,13 +134,7 @@ def cost_value(costs: Dict[str, Any], key: str, default: float) -> float:
 
 
 def resolve_costs(costs: Dict[str, Any]) -> Dict[str, float]:
-    """
-    The five prices every provider and cost family resolves to, from whichever subset
-    was configured. Both cache write buckets default to cache_write, which defaults to
-    the input price -- that is what a provider charging no write fee looks like, and it
-    nets those tokens to zero in the cache report. Anthropic-style providers, the only
-    ones that let you pick a TTL, set the two buckets apart.
-    """
+    """Resolve provider/cost-family text prices and cache-write fallbacks."""
     input_cost = cost_value(costs, "input", 0.0)
     write_cost = cost_value(costs, "cache_write", input_cost)
 
@@ -163,14 +148,7 @@ def resolve_costs(costs: Dict[str, Any]) -> Dict[str, float]:
 
 
 def resolve_image_costs(costs: Dict[str, Any]) -> Dict[str, float]:
-    """
-    The four prices an image model is billed at, in USD per 1 million tokens. These are
-    separate from resolve_costs() because image billing splits its input by modality
-    (prompt text vs. reference images) rather than by cache state, and because forcing
-    image output into the text output_cost field would corrupt the text session totals.
-    Cached input defaults to the uncached image input rate, which is what a provider
-    charging no cache discount looks like.
-    """
+    """Resolve image prices, split by text input, image input, cached input and output."""
     image_input = cost_value(costs, "image_input", 0.0)
 
     return {
@@ -182,10 +160,7 @@ def resolve_image_costs(costs: Dict[str, Any]) -> Dict[str, float]:
 
 
 def extract_claude_version(value: Any) -> Version:
-    """
-    Extracts a Claude major.minor model version from either display names like
-    "Claude Opus 4.8" or ids like "claude-opus-4-8-YYYYMMDD".
-    """
+    """Extract a Claude major.minor version from a display name or model id."""
     text = str(value or "")
 
     dot_match = re.search(r"(?<!\d)(\d+(?:\.\d+)+)(?!\d)", text)

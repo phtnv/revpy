@@ -1,22 +1,9 @@
 """
-The /v1/images/* backend: the low-level image API adapter.
+Low-level adapter for /v1/images/*.
 
-Serves the whole image family -- /images/generations, /images/edits, and their Batch API
-counterparts -- rather than one endpoint each. Unlike the three v1_* wire modules, which
-are interchangeable implementations of one protocol selected per provider, generating and
-editing are two operations over a single API that share almost everything downstream:
-provider and price resolution, request validation, storage, the manifest, cost accounting
-and the batch lifecycle. Only the transport differs, and that difference is confined to
-post_generation() and post_edit().
-
-This module is a secondary service, not a fourth wire protocol. It never writes to
-cfg.backend, cfg.model or the text price fields, never appears in the conversational
-model list, and never decides *whether* an image should be made -- that is
-image_orchestrator's job.
-
-Every entry point (the direct routes, the chat orchestrator and the CLI) builds an
-ImageRequest and hands it here, so validation, transport, storage and accounting exist
-exactly once.
+Generation, editing and batches share provider resolution, validation, storage,
+manifests and accounting; only the upstream transport differs. This module never mutates
+the active chat backend/model. Chat-side triggering lives in image_orchestrator.py.
 """
 
 import base64
@@ -58,32 +45,19 @@ from providers import (
 )
 
 
-# The fields a caller (or a model) may override. Everything else comes from configuration.
-# Provider, model, base URL, credentials, headers and output *paths* are deliberately
-# absent: those are proxy policy, not request content (see the plan, 7.3).
+# Request fields the caller may control; provider, model, auth and paths are proxy policy.
 ALLOWED_OVERRIDES = {
     "prompt", "size", "quality", "output_format", "background", "n", "batch", "filename",
-    # Editing. 'images' names local references (slot numbers, or paths when allowed);
-    # 'file_ids' names references already on the provider, which is the only form a Batch
-    # API request can carry. 'input_fidelity' is deliberately absent: gpt-image-2 always
-    # processes inputs at high fidelity and rejects attempts to set it.
+    # 'images' are local references; 'file_ids' are provider-side references for batches.
     "images", "mask", "edit", "file_ids",
-    # Lineage the caller declares rather than the proxy derives: which file on this
-    # machine each reference came from. Recorded in the manifest, never sent upstream.
-    # See validate_source_files() for why it exists at all.
+    # Local lineage for provider-side references; recorded, never sent upstream.
     "source_files",
 }
 
-# Fields an OpenAI client sends that this proxy accepts and then discards. They are not in
-# ALLOWED_OVERRIDES because they are not honoured -- 'model' in particular is proxy policy,
-# exactly as it is for chat, where the model chosen in the frontend has no effect either.
-# Keeping them out of the unknown-field check is what lets client.images.generate() work
-# unmodified; keeping them out of the override list is what stops a caller picking the
-# model. A genuinely unknown field is still an error, so a typo is still reported.
+# Known OpenAI-client fields accepted for compatibility but ignored.
 IGNORED_FIELDS = {"model", "user", "moderation", "style", "output_compression", "partial_images"}
 
-# What a reference image may be. Identified by magic bytes rather than by extension: a
-# '.png' that is really something else must fail here, not at the provider.
+# Reference images are identified by magic bytes, not filename extension.
 IMAGE_MAGIC = (
     (b"\x89PNG\r\n\x1a\n", "png" , "image/png" ),
     (b"\xff\xd8\xff"     , "jpeg", "image/jpeg"),
@@ -94,9 +68,7 @@ WEBP_TAG    = b"WEBP"
 # Extension per output_format. 'jpeg' is the API's spelling; '.jpg' is the file's.
 FORMAT_EXTENSIONS = {"png": ".png", "jpeg": ".jpg", "webp": ".webp"}
 
-# What one 'source_files' entry may carry. 'file' is the basename, which is what joins a
-# manifest record to a directory listing; 'path' is where it was at request time; and
-# 'file_id' is the provider handle the job used, which outlives nothing.
+# Allowed keys in manifest lineage entries.
 SOURCE_FILE_KEYS = {"file_id", "path", "file"}
 
 SIZE_RE     = re.compile(r"^(\d{1,5})\s*[x×]\s*(\d{1,5})$")
@@ -105,10 +77,7 @@ SIZE_RE     = re.compile(r"^(\d{1,5})\s*[x×]\s*(\d{1,5})$")
 FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 FILENAME_MAX_STEM = 120
 
-# Names Windows refuses to give a file, whatever extension follows. They are legal on every
-# other platform, so a manifest written on Linux can carry a name that cannot be checked out
-# on Windows -- which is exactly the sort of thing worth refusing at the point it is chosen
-# rather than discovering on the machine that cannot open it.
+# Windows device names are rejected so output directories stay portable.
 RESERVED_STEMS = {"con", "prn", "aux", "nul"} | {f"com{n}" for n in range(1, 10)} | {f"lpt{n}" for n in range(1, 10)}
 
 BATCH_ENDPOINT      = "/v1/images/generations"
@@ -125,24 +94,15 @@ SLOT_LOCK = threading.RLock()
 # Statuses a batch never moves out of. Anything else is still worth polling.
 BATCH_TERMINAL_STATUSES = {"completed", "failed", "expired", "cancelled"}
 
-# Serializes everything that reads-then-writes the batch state file. Two actors now touch
-# it -- the background poller and whoever is at the CLI -- and a batch retrieved by both
-# at once would save its images twice and bill the session twice. Re-entrant because
-# retrieval resolves and labels batches while already holding it.
+# Batch state is read-modify-written by the CLI and the poller; keep retrieval idempotent.
 BATCH_LOCK = threading.RLock()
 
-# Serializes filename allocation, file writes and manifest updates. Waitress serves
-# requests on a thread pool, so two concurrent generations can otherwise pick the same
-# free filename between the exists() check and the write.
+# Filename allocation and manifest writes must stay atomic across request threads.
 STORAGE_LOCK = threading.Lock()
 
 
 class ImageRequestError(ProviderError):
-    """
-    A request rejected before the provider was contacted. Subclasses ProviderError so
-    server.build_error_body and common.error_body render it like any other backend
-    failure, with no special cases at the call sites.
-    """
+    """A preflight rejection rendered like any other provider error."""
     def __init__(self, message: str, status_code: int = 400):
         super().__init__(status_code, {"error": {"message": message, "type": "invalid_request_error"}}, message)
 
@@ -154,13 +114,7 @@ class ImageConfigError(ProviderError):
 
 
 class ReferenceImage:
-    """
-    One validated image to edit from, held either as a path on this machine or as bytes
-    uploaded with the request. The two arrive by very different routes -- a path is named
-    from the console or an allowlisted prompt, an upload is posted by a client -- but from
-    the point of validation onwards they are the same thing, so the rest of the module
-    never has to care which it got.
-    """
+    """One validated edit reference, either a local path or uploaded bytes."""
     def __init__(self, format: str, mime: str, size: int, path: str = "", data: Optional[bytes] = None,
                  name: str = "", width: int = 0, height: int = 0, has_alpha: bool = False, slot: int = 0):
         self.format    = format
@@ -187,10 +141,7 @@ class ReferenceImage:
 
 
 class ImageRequest:
-    """
-    One fully validated request. Every field has already been checked against the
-    allowlists by build_request(), so anything downstream can use it without re-testing.
-    """
+    """One fully validated image request."""
     def __init__(self, prompt: str, size: str, quality: str, output_format: str, background: str,
                  n: int, batch: bool, filename: str = "", source: str = "direct",
                  images: Optional[List[ReferenceImage]] = None,
@@ -207,16 +158,12 @@ class ImageRequest:
         self.filename      = filename   # sanitized stem, or "" for the timestamped default
         self.source        = source     # "direct", "chat" or "cli"; for logging only
 
-        # Editing. 'images' and 'file_ids' are mutually exclusive: the first is a multipart
-        # upload of local files, the second names references already held by the provider,
-        # which is the only form the Batch API accepts.
+        # Local references and provider-side references are mutually exclusive.
         self.images   = images or []
         self.mask     = mask
         self.file_ids = file_ids or []
 
-        # Declared lineage. Empty means "derive it from the references", which
-        # manifest_source_files() does; it is only supplied explicitly when the
-        # references are provider ids and the proxy has no other way to know.
+        # Empty means manifest_source_files() can derive lineage from local references.
         self.source_files = source_files or []
 
     @property
@@ -229,8 +176,7 @@ class SavedImage:
     def __init__(self, image_id: str, path: str, data: Optional[bytes] = None):
         self.image_id = image_id
         self.path     = path
-        # The decoded bytes, kept so a caller asking for b64_json is served without reading
-        # the file back off disk. Saving happens either way; this is only about the reply.
+        # Kept only so b64_json replies need not reread the saved file.
         self.data     = data
 
     def b64(self) -> str:
@@ -254,22 +200,17 @@ class ImageResult:
 
 
 class ImageBatchResult:
-    """
-    What is known about one batch. Unlike ImageResult this is filled in as retrieval
-    proceeds rather than all at once -- the fields below the line accumulate while the
-    output file is walked -- so the two halves are kept visibly apart.
-    """
+    """What is known about one batch; images/cost/errors fill during retrieval."""
     def __init__(self, provider: str, model: str, batch_id: str, status: str,
                  number: int = 0, counts: Optional[Dict[str, int]] = None):
         self.provider = provider
         self.model    = model
         self.batch_id = batch_id
         self.status   = status
-        # The short reference the user sees. 0 for a batch this proxy did not submit.
+        # Short user-facing reference; 0 for foreign batches.
         self.number   = number
         self.counts   = counts or {}
 
-        # Accumulated during retrieve_image_batch().
         self.images   : List[SavedImage] = []
         self.cost_usd : float            = 0.0
         self.errors   : List[str]        = []
@@ -278,16 +219,10 @@ class ImageBatchResult:
 # Provider and model resolution
 def image_provider() -> Dict[str, Any]:
     """
-    The provider entry image requests are served by.
+    Provider entry for image requests.
 
-    IMAGE_PROVIDER normally names a provider already declared in one of the three text
-    lists, in which case its base URL and credentials are reused as-is. When it names one
-    that is not declared anywhere, its <NAME>_* variables are parsed standalone -- which
-    is what lets you generate images through OpenAI while chatting with Claude, without
-    OpenAI's text models appearing in the conversational model list.
-
-    The standalone entry is built with api='chat' because that only selects the auth
-    header shape, and /images/generations is an OpenAI-style Bearer endpoint.
+    IMAGE_PROVIDER may reuse a declared text provider or name a standalone <NAME>_*
+    block. Standalone entries use api='chat' only for Bearer-auth header shape.
     """
     name = cfg.image_provider
     if not name:
@@ -315,13 +250,8 @@ def image_provider() -> Dict[str, Any]:
 
 def image_headers(provider: Dict[str, Any]) -> Dict[str, str]:
     """
-    Auth for an image request.
-
-    Inside a Flask request this goes through common.resolve_api_key, so the PROXY_KEY
-    check and ALLOW_KEY_PASSTHROUGH behave exactly as they do for chat. The CLI has no
-    request to read a bearer token from, so it uses the configured key directly -- calling
-    resolve_api_key there would fail on the missing request context rather than on
-    anything to do with the key.
+    Auth for an image request. HTTP requests follow the chat proxy-key rules; CLI calls
+    use the configured provider key because there is no Flask request context.
     """
     if has_request_context():
         key = resolve_api_key(provider["api_key"], provider["api_key_name"])
@@ -335,9 +265,7 @@ def image_headers(provider: Dict[str, Any]) -> Dict[str, str]:
 
 def apply_image_model(model_id: str) -> None:
     """
-    Points the image price fields at a model. The counterpart of providers.apply_model,
-    except that it binds nothing else: no backend, no wire protocol, and none of cfg's
-    text state. Selecting an image model must leave the conversation exactly as it was.
+    Bind only image-model pricing. Chat backend, model and text prices are untouched.
     """
     prefix   = re.sub(r"[^A-Z0-9]", "_", (cfg.image_provider or "").upper())
     families = cfg.parse_image_cost_families(prefix)
@@ -362,10 +290,7 @@ def apply_image_model(model_id: str) -> None:
 
 
 def resolve_image_config() -> None:
-    """
-    Startup and post-reload check. Reports what image generation resolved to, and
-    disables it rather than letting the first request fail with a configuration error.
-    """
+    """Validate image config at startup/reload and disable it if it cannot run."""
     if not cfg.image_enabled:
         print("Image generation is disabled (IMAGE_GENERATION_ENABLED).")
         return
@@ -382,9 +307,7 @@ def resolve_image_config() -> None:
         cfg.image_enabled = False
         return
 
-    # The configured default is checked once here rather than on every request, so a bad
-    # IMAGE_DEFAULT_SIZE is a startup warning instead of an error blaming each request
-    # for a field it never sent.
+    # A bad default is a startup warning, not a per-request validation error.
     try:
         cfg.image_default_size = validate_size(cfg.image_default_size)
     except ImageRequestError as exc:
@@ -403,13 +326,7 @@ def resolve_image_config() -> None:
 
 # Validation
 def validate_size(raw: Any) -> str:
-    """
-    A size the image model will actually accept.
-
-    Checked against the model family's constraints rather than an allowlist of the four
-    popular sizes: gpt-image-2 takes any resolution inside these bounds, so an enum would
-    reject valid requests and rot as soon as the range changes.
-    """
+    """A size accepted by the model family, not just a small enum of common sizes."""
     size = str(raw).strip().lower()
     if size == "auto":
         return size
@@ -457,18 +374,8 @@ def validate_bool(field_name: str, raw: Any) -> bool:
 
 def sanitize_filename_stem(raw: Any) -> str:
     """
-    A caller-supplied filename reduced to a bare, safe stem.
-
-    The caller names the file; the proxy decides where it goes and what it ends in. Any
-    directory component, traversal segment, separator or unusual character is a rejection
-    rather than something to quietly strip -- a request that meant to escape the output
-    directory should fail loudly, and one that did not is unaffected.
-
-    The rules are the intersection of what Windows and POSIX will both accept, not what the
-    machine running the proxy happens to allow: an output directory gets copied, synced and
-    read elsewhere, and a name only one of them can open is a problem deferred rather than
-    avoided. Hence the reserved-device check and the trailing-dot check, neither of which
-    Linux would ever complain about.
+    A caller-supplied filename reduced to a portable stem. Directories, traversal,
+    unusual characters, device names and trailing dots are rejected rather than rewritten.
     """
     name = str(raw).strip()
     if not name:
@@ -482,10 +389,7 @@ def sanitize_filename_stem(raw: Any) -> str:
 
     stem = stem[:FILENAME_MAX_STEM]
 
-    # Windows silently strips a trailing dot, so the file that appears is not the one that was
-    # asked for -- and the manifest would then name something that is not there. Reached by
-    # 'name..', since splitext has already taken a single trailing dot as the extension.
-    # A trailing space cannot get this far: it is stripped above and the pattern has no space.
+    # Reached by 'name..'; splitext already treated one trailing dot as the extension.
     if stem.endswith("."):
         raise ImageRequestError(f"filename must not end in a dot, got {raw!r}.")
 
@@ -497,9 +401,7 @@ def sanitize_filename_stem(raw: Any) -> str:
 
 # Reference image slots
 #
-# The console's way of naming files without a prompt ever carrying a path. Slots persist
-# so a restart does not lose them, and are re-validated every time they are used: the
-# file behind a slot can be moved, replaced or truncated between being set and being sent.
+# Persistent console-managed references; each use re-validates the current file.
 def slots_path() -> str:
     return os.path.join(os.path.abspath(cfg.image_output_dir), SLOTS_FILE)
 
@@ -539,8 +441,6 @@ def set_slot(number: int, path: str) -> ReferenceImage:
     if number < 1:
         raise ImageRequestError("slot numbers start at 1.")
 
-    # from_prompt=False: the console is trusted with paths, which is the entire reason
-    # slots exist.
     reference = load_reference(path, from_prompt=False, slot=number)
 
     with SLOT_LOCK:
@@ -867,11 +767,7 @@ def validate_source_files(specs: Any) -> List[Dict[str, str]]:
 
 def resolve_edit_inputs(fields: Dict[str, Any], source: str, batch: bool) -> Tuple[List[ReferenceImage], Optional[ReferenceImage], List[str]]:
     """
-    Decides whether this request edits, and against what.
-
-    'images' cannot be the sole signal, because slots are filled from the console and a
-    block that means "edit what is loaded" carries no images field at all. So an explicit
-    edit:true is a second trigger, and the combinations resolve like this:
+    Decide whether this request edits, and against what:
 
         neither images nor edit     generation, exactly as before
         images: [...]               edit against those references
@@ -888,12 +784,11 @@ def resolve_edit_inputs(fields: Dict[str, Any], source: str, batch: bool) -> Tup
     has_file_ids = "file_ids" in fields and fields["file_ids"] not in (None, [], "")
     has_mask     = "mask"     in fields and fields["mask"] not in (None, "")
 
-    edit_flag: Optional[bool] = None
-    if "edit" in fields:
-        edit_flag = validate_bool("edit", fields["edit"])
+    edit_given = "edit" in fields
+    edit_flag  = validate_bool("edit", fields["edit"]) if edit_given else False
 
     if not (has_images or has_file_ids or edit_flag):
-        if edit_flag is False and has_mask:
+        if edit_given and has_mask:
             raise ImageRequestError("mask was given with edit: false; a mask only applies to an edit.")
         return [], None, []
 
@@ -902,7 +797,7 @@ def resolve_edit_inputs(fields: Dict[str, Any], source: str, batch: bool) -> Tup
 
     if has_images and has_file_ids:
         raise ImageRequestError("images and file_ids are mutually exclusive: images are uploaded from this machine, file_ids already live on the provider.")
-    if edit_flag is False and (has_images or has_file_ids):
+    if edit_given and not edit_flag and (has_images or has_file_ids):
         raise ImageRequestError("edit: false was given together with reference images. Remove one of them.")
 
     if has_file_ids:
@@ -919,7 +814,6 @@ def resolve_edit_inputs(fields: Dict[str, Any], source: str, batch: bool) -> Tup
     if has_images:
         images = load_references(fields["images"], from_prompt)
     else:
-        # edit: true with nothing named means "whatever the console has loaded".
         images = filled_slots()
         if not images:
             raise ImageRequestError("edit: true was requested but no image slots are filled. Use 'img edit set 1 <path>'.")
@@ -932,8 +826,6 @@ def resolve_edit_inputs(fields: Dict[str, Any], source: str, batch: bool) -> Tup
     if has_mask:
         mask = load_reference(fields["mask"], from_prompt)
     else:
-        # A mask set from the console applies to slot-driven edits the same way the slots
-        # themselves do -- setting one and having it ignored would be the surprise.
         mask = stored_mask()
 
     if mask is not None:
@@ -944,17 +836,14 @@ def resolve_edit_inputs(fields: Dict[str, Any], source: str, batch: bool) -> Tup
 
 def build_request(overrides: Optional[Dict[str, Any]] = None, source: str = "direct") -> ImageRequest:
     """
-    One validated request, from the configured defaults plus whatever the caller
-    explicitly overrode. Unknown fields are rejected rather than ignored, so a typo in a
-    model-written block is reported instead of silently taking a default.
+    One validated request, from configured defaults plus explicit caller overrides.
     """
     if not cfg.image_enabled:
         raise ImageConfigError("Image generation is disabled (IMAGE_GENERATION_ENABLED=false).")
 
     fields = dict(overrides or {})
 
-    # Streaming image generation cannot be relayed, and silently returning a whole
-    # response to a client waiting for events fails later and less clearly than saying so.
+    # Image responses are not streamed by this proxy.
     if str(fields.get("stream", "")).strip().lower() in {"true", "1", "yes"}:
         raise ImageRequestError("streaming image generation is not supported by this proxy.")
 
@@ -1199,16 +1088,8 @@ def decode_image(b64_data: Any, index: int) -> bytes:
 
 def manifest_path(path: str, directory: str) -> str:
     """
-    One path as the manifest records it: relative to the directory the manifest sits in, with
-    forward slashes on every platform.
-
-    The manifest lives beside the images it describes, so its own directory is the only root
-    both sides already agree on -- no field to pass, nothing to configure, and the folder
-    stays readable after it is moved, renamed or copied to another machine. An absolute path
-    would be none of those things.
-
-    Absolute is kept only where relative is not expressible: a different Windows drive has no
-    common prefix at all, and a path that never resolved has nothing to be relative to.
+    Manifest paths are relative to the manifest directory, with forward slashes.
+    Absolute paths remain only when a relative path cannot be expressed.
     """
     if not path:
         return ""
@@ -1221,13 +1102,7 @@ def manifest_path(path: str, directory: str) -> str:
 
 def manifest_source_files(req: ImageRequest) -> List[Dict[str, str]]:
     """
-    The lineage recorded for one request, in one shape whichever route produced it.
-
-    A caller that declared its own wins, because only it knows which local file a
-    provider file id stands for. Otherwise it is derived from the references the request
-    actually carried, so an immediate edit gets the same field without anyone supplying
-    it. An upload has a name but no location on this machine, which is exactly what the
-    entry then says.
+    Lineage for one request. Declared source_files win; otherwise derive from references.
     """
     directory = output_dir_path()
 
@@ -1248,12 +1123,8 @@ def manifest_source_files(req: ImageRequest) -> List[Dict[str, str]]:
 
 def append_manifest(req: ImageRequest, saved: List[SavedImage], cost_usd: float, usage: Dict[str, Any], estimated: bool, batch_id: str = "") -> None:
     """
-    Appends one record per image to the sidecar manifest, creating it only if absent.
-
-    A corrupt or unreadable manifest is replaced rather than allowed to abort the
-    request: the images are already on disk, and losing the sidecar is the lesser
-    failure. IMAGE_MANIFEST_PROMPTS decides whether the prompt itself is recorded,
-    since the manifest outlives the session that produced it.
+    Append one record per image. A corrupt manifest is replaced rather than aborting
+    after the image has already been saved.
     """
     if not cfg.image_manifest_enabled or not saved:
         return
@@ -1266,11 +1137,6 @@ def append_manifest(req: ImageRequest, saved: List[SavedImage], cost_usd: float,
     for image in saved:
         record: Dict[str, Any] = {
             "image_id"           : image.image_id,
-            # Every path in a record follows one rule: relative to this manifest's own
-            # directory, forward slashes. For a generated image that makes 'path' equal
-            # 'file' -- redundant, and worth it for a reader that never has to ask which
-            # field follows which convention. 'file' remains the join key, since
-            # allocate_path() has already made it unique within the directory.
             "path"               : manifest_path(os.path.abspath(image.path), directory),
             "file"               : os.path.basename(image.path),
             "bytes"              : len(image.data) if image.data is not None else 0,
@@ -1292,21 +1158,16 @@ def append_manifest(req: ImageRequest, saved: List[SavedImage], cost_usd: float,
         }
         if batch_id:
             record["batch_id"] = batch_id
-        # An edit driven by 'edit: true' resolves against whatever the slots held at the
-        # time, so the inputs are recorded here or the result is unreproducible.
-        # An upload's origin is a marker rather than a location, so only the path form is
-        # rewritten -- there is nothing for 'upload:dropped.png' to be relative to.
-        def relative_origin(origin: str) -> str:
-            return origin if origin.startswith("upload:") else manifest_path(origin, directory)
-
         if req.images:
-            record["source_images"] = [relative_origin(reference.origin()) for reference in req.images]
+            record["source_images"] = [
+                origin if origin.startswith("upload:") else manifest_path(origin, directory)
+                for origin in (reference.origin() for reference in req.images)
+            ]
         if req.mask is not None:
-            record["mask"] = relative_origin(req.mask.origin())
+            origin = req.mask.origin()
+            record["mask"] = origin if origin.startswith("upload:") else manifest_path(origin, directory)
         if req.file_ids:
             record["source_references"] = list(req.file_ids)
-        # The durable half of the above: 'source_references' names ids that expire, this
-        # names the files on this machine they stood for.
         sources = manifest_source_files(req)
         if sources:
             record["source_files"] = sources
@@ -1551,23 +1412,14 @@ def generate_image(request: ImageRequest) -> ImageResult:
     )
 
 
-# Batch API
-#
-# A batch is a fundamentally different thing from n>1: n asks for several images now,
-# a batch trades latency (up to the completion window) for a lower rate. Nothing here
-# can be awaited inside a chat turn, so submission and retrieval are separate calls and
-# the CLI is what drives them.
+# Batch API. Submission and retrieval are separate because chat turns cannot wait on it.
 def batch_state_path() -> str:
-    """Deliberately does not create the output directory: reading state must not be what
-    brings a directory into existence for a feature nobody has used yet."""
+    """Reading state must not create an unused output directory."""
     return os.path.join(os.path.abspath(cfg.image_output_dir), BATCH_STATE_FILE)
 
 
 def number_legacy_batches() -> None:
-    """
-    Gives a number to any batch recorded before numbering existed, so an older state file
-    does not leave unreferenceable rows in the listing.
-    """
+    """Number batches recorded before short references existed."""
     with BATCH_LOCK:
         state   = read_batch_state()
         missing = [batch_id for batch_id, entry in state.items() if not entry.get("number")]
@@ -1583,11 +1435,7 @@ def number_legacy_batches() -> None:
 
 
 def next_batch_number(state: Dict[str, Any]) -> int:
-    """
-    The next short reference number. Numbers are assigned once, persisted, and never
-    reused, so the number printed when a batch was submitted still names the same batch
-    after a restart -- which is the whole point of having one instead of the provider's id.
-    """
+    """Next short reference number; numbers are never reused."""
     highest = 0
     for entry in state.values():
         try: highest = max(highest, int(entry.get("number") or 0))
@@ -1597,11 +1445,7 @@ def next_batch_number(state: Dict[str, Any]) -> int:
 
 
 def resolve_batch_id(token: str) -> str:
-    """
-    Turns whatever the user typed into a provider batch id. A bare number is looked up
-    among the submitted batches; anything else is taken as an id already, so a batch this
-    proxy never submitted can still be retrieved.
-    """
+    """Resolve a short number, or pass through a raw provider batch id."""
     token = str(token).strip()
     if not token.isdigit():
         return token
@@ -1636,11 +1480,7 @@ def read_batch_state() -> Dict[str, Any]:
 
 
 def write_batch_state(state: Dict[str, Any]) -> None:
-    """
-    Persists the request parameters behind each batch. The provider returns only the
-    images and the custom_id it was given, so without this the output format, filename
-    and prompt a batch was submitted with are gone by the time it completes.
-    """
+    """Persist request parameters the provider will not return with completed images."""
     path     = os.path.join(output_dir_path(), BATCH_STATE_FILE)
     tmp_path = f"{path}.{uuid.uuid4().hex[:8]}.part"
     try:
@@ -1666,8 +1506,6 @@ def request_to_state(req: ImageRequest) -> Dict[str, Any]:
         "filename"      : req.filename,
         "source"        : req.source,
         "file_ids"      : list(req.file_ids),
-        # Carried through the wait: the manifest is written at retrieval, by which time
-        # the request that declared this lineage is long gone.
         "source_files"  : [dict(entry) for entry in req.source_files],
     }
 

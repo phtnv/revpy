@@ -47,17 +47,13 @@ server      : Any = importlib.import_module("server")
 
 image_orchestrator : Any = importlib.import_module("image_orchestrator")
 
-# The three request builders, keyed by the wire protocol they speak.
 BUILDERS = {
     "messages"  : lambda prepared: v1_messages.build_body(prepared),
     "chat"      : lambda prepared: chat_api.build_body(prepared),
     "responses" : lambda prepared: resp_api.build_body(prepared),
 }
 
-# Where each OpenAI-style endpoint carries the message list build_message_list() produces.
-# The Anthropic body is shaped differently enough -- system is a field of its own, and
-# content is blocks rather than strings -- that its cases carry their own expected
-# 'system' and 'messages' instead of sharing this one.
+# OpenAI-style bodies share one message list under different field names.
 BUILDER_MESSAGE_KEY = {"chat": "messages", "responses": "input"}
 
 PROVIDER = "claude"
@@ -84,7 +80,6 @@ class FakeAnthropic:
 
 
 def make_config() -> Any:
-    # common.cfg is a shared singleton; configure it in place instead of rebinding it.
     cfg = common.cfg
     cfg.reload_from_env()
     cfg.model                    = MODEL
@@ -105,20 +100,14 @@ def make_config() -> Any:
     cfg.thinking_enabled         = False
     cfg.use_adaptive             = False
     cfg.preserve_thinking_blocks = 0
-    cfg.error_log_path           = str(ROOT / "test_error_log.txt")
-    # A model is what binds a backend, so the roundtrip tests need one selected. The
-    # cases that exercise a provider replace both.
+    cfg.error_log_path           = os.path.join(tempfile.gettempdir(), "revpy_test_error_log.txt")
     cfg.providers = {PROVIDER: make_provider(api="messages", api_key_name="CLAUDE_API_KEY")}
     cfg.backend   = PROVIDER
     return cfg
 
 
 def make_provider(**overrides: Any) -> dict[str, Any]:
-    """
-    A synthetic provider entry, in the shape RuntimeConfig.parse_provider builds them.
-    Defaults are the ones a provider gets with only BASE_URL and API_KEY set, so a
-    case only has to name what it actually exercises.
-    """
+    """A RuntimeConfig-style provider entry with only the exercised fields overridden."""
     provider = {
         "api"                 : "chat",
         "base_url"            : "https://provider.test/v1",
@@ -204,10 +193,16 @@ def check_equal(expected: dict[str, Any], received: dict[str, Any]) -> bool:
 
     return all_ok
 
+
+def check_case_equal(label: str, expected: dict[str, Any], received: dict[str, Any]) -> bool:
+    if expected == received:
+        return True
+    print(f"[{label}] ", end="")
+    return check_equal(expected, received)
+
+
 def run_cli_commands(commands: list[str]) -> None:
-    """
-    Feeds commands to the admin CLI loop, then EOF. CLI output is swallowed.
-    """
+    """Feed commands to the admin CLI loop, then EOF."""
     pending = iter(commands)
 
     def fake_input(prompt: str = "") -> str:
@@ -357,11 +352,7 @@ def test_provider_config_parsing() -> bool:
     return passed
 
 
-# What a model selection resolves its five prices to.
-#   (label, model id, expected prices)
-# Every provider resolves them the same way: the first matching cost family, else the
-# provider-level prices. Both cache write buckets fall back to cache_write, which falls
-# back to the input price -- so a provider that charges no write fee nets those to zero.
+# First matching cost family wins; otherwise provider prices are used.
 COST_CASES = [
     ("cost family wins, TTLs priced apart", "claude-opus-4-8",
      {"family": "claude:opus", "input": 5.00, "output": 25.00, "read": 0.50, "write_5m": 6.25, "write_1h": 10.00}),
@@ -371,29 +362,30 @@ COST_CASES = [
 ]
 
 
-def test_cost_resolution(case: tuple) -> bool:
+def test_cost_resolution() -> bool:
     global tests_ttl
     tests_ttl += 1
-    label, model_id, expected = case
-    print(f"Testing cost resolution: {label}... ", end="")
+    print("Testing cost resolution... ", end="")
 
     providers_parsed = parse_provider_env()
+    passed = True
 
-    cfg = make_config()
-    cfg.providers = providers_parsed
-    with contextlib.redirect_stdout(io.StringIO()):
-        providers.apply_model({"id": model_id, "provider": "claude"})
+    for label, model_id, expected in COST_CASES:
+        cfg = make_config()
+        cfg.providers = providers_parsed
+        with contextlib.redirect_stdout(io.StringIO()):
+            providers.apply_model({"id": model_id, "provider": "claude"})
 
-    received = {
-        "family"   : cfg.model_cost_family,
-        "input"    : cfg.input_token_cost_usd,
-        "output"   : cfg.output_token_cost_usd,
-        "read"     : cfg.cache_read_cost_usd,
-        "write_5m" : cfg.cache_write_5m_cost_usd,
-        "write_1h" : cfg.cache_write_1h_cost_usd,
-    }
+        received = {
+            "family"   : cfg.model_cost_family,
+            "input"    : cfg.input_token_cost_usd,
+            "output"   : cfg.output_token_cost_usd,
+            "read"     : cfg.cache_read_cost_usd,
+            "write_5m" : cfg.cache_write_5m_cost_usd,
+            "write_1h" : cfg.cache_write_1h_cost_usd,
+        }
+        passed &= check_case_equal(label, expected, received)
 
-    passed = check_equal(expected, received)
     if passed : print(f"{GREEN}PASS{RESET}")
     else      : print(f"{RED}FAIL{RESET}")
     return passed
@@ -413,10 +405,7 @@ def anthropic_usage(inp=0, out=0, read=0, creation=0, e1h=None, e5m=None) -> Any
     )
 
 
-# Every backend's parse_usage() feeds the same two consumers, so both are pinned here:
-# what the cost tracker bills from, and what the client is told. These are the numbers
-# the per-request cost report is computed from, so they are asserted exactly.
-#   (label, backend, raw usage, expected cost, expected client[, cfg overrides])
+# One normalized usage shape feeds both billing and the OpenAI-compatible response.
 USAGE_CASES: list[tuple] = [
     ("messages: cache read", "messages",
      anthropic_usage(inp=10, out=50, read=90),
@@ -492,24 +481,20 @@ USAGE_CASES: list[tuple] = [
 USAGE_BACKENDS = {"messages": v1_messages, "chat": chat_api, "responses": resp_api}
 
 
-def test_usage_normalization(case: tuple) -> bool:
-    """
-    One backend's parse_usage() plus the two shared consumers in common.py.
-    All three backends normalize to one counts shape; this pins what comes out of it.
-    """
+def test_usage_normalization() -> bool:
     global tests_ttl
     tests_ttl += 1
-    label, backend, raw, expected_cost, expected_client = case[:5]
-    overrides = case[5] if len(case) > 5 else {}
-    print(f"Testing usage normalization for {label}... ", end="")
+    print("Testing usage normalization across backends... ", end="")
 
-    cfg = make_config()
-    for key, value in overrides.items():
-        setattr(cfg, key, value)
-    counts = USAGE_BACKENDS[backend].parse_usage(raw)
+    passed = True
+    for label, backend, raw, expected_cost, expected_client, *rest in USAGE_CASES:
+        cfg = make_config()
+        for key, value in (rest[0] if rest else {}).items():
+            setattr(cfg, key, value)
+        counts = USAGE_BACKENDS[backend].parse_usage(raw)
 
-    passed  = check_equal(expected_cost  , common.usage_to_cost_tokens(counts))
-    passed &= check_equal(expected_client, common.usage_to_openai_dict(counts))
+        passed &= check_case_equal(f"{label} cost", expected_cost, common.usage_to_cost_tokens(counts))
+        passed &= check_case_equal(f"{label} client", expected_client, common.usage_to_openai_dict(counts))
 
     if passed : print(f"{GREEN}PASS{RESET}")
     else      : print(f"{RED}FAIL{RESET}")
@@ -909,57 +894,46 @@ def load_body_cases(name: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     return fixture["inputs"], fixture["cases"]
 
 
-def test_provider_request_body(inputs: dict[str, Any], case: dict[str, Any]) -> bool:
-    """
-    Builds one OpenAI-style request body and compares it to the golden dict.
-
-    Each case re-runs make_config() so it is isolated from the last one: cfg is a
-    shared singleton and these cases leave a provider backend selected on it.
-    """
+def test_provider_request_bodies() -> bool:
     global tests_ttl
     tests_ttl += 1
-    print(f"Testing request body for {case['name']}... ", end="")
+    print("Testing provider request bodies... ", end="")
 
-    entry = inputs[case["input"]]
+    inputs, cases = load_body_cases("provider_bodies.json5")
+    passed = True
 
-    # Config warnings from .env, and the sampling-refused warning, are not under test.
-    with contextlib.redirect_stdout(io.StringIO()):
-        cfg = make_config()
-        cfg.backend          = case["backend"]
-        cfg.model            = case["model"]
-        cfg.providers        = {case["backend"]: make_provider(api=case["builder"], **case.get("provider", {}))}
-        cfg.thinking_enabled = False
-        cfg.thinking_effort  = "medium"
-        for key, value in case.get("cfg", {}).items():
-            setattr(cfg, key, value)
+    for case in cases:
+        entry = inputs[case["input"]]
 
-        received = BUILDERS[case["builder"]](entry["prepared"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            cfg = make_config()
+            cfg.backend          = case["backend"]
+            cfg.model            = case["model"]
+            cfg.providers        = {case["backend"]: make_provider(api=case["builder"], **case.get("provider", {}))}
+            cfg.thinking_enabled = False
+            cfg.thinking_effort  = "medium"
+            for key, value in case.get("cfg", {}).items():
+                setattr(cfg, key, value)
 
-    if case["builder"] == "messages":
-        # The input's system/messages unless the case pins its own, which the cases
-        # exercising cache markers do -- those change the message shape itself.
-        expected = {**entry["anthropic"], **case["expected"]}
-    else:
-        expected = {**case["expected"], BUILDER_MESSAGE_KEY[case["builder"]]: entry["messages"]}
+            received = BUILDERS[case["builder"]](entry["prepared"])
 
-    passed = check_equal(expected, received)
-    # check_equal only walks the keys it was given, so a field the builder should not
-    # have sent at all would slip past it. For a golden body that is a failure too.
-    for key in received:
-        if key not in expected:
-            print(f"unexpected key={key} rec={received[key]!r}")
-            passed = False
+        if case["builder"] == "messages":
+            expected = {**entry["anthropic"], **case["expected"]}
+        else:
+            expected = {**case["expected"], BUILDER_MESSAGE_KEY[case["builder"]]: entry["messages"]}
+
+        passed &= check_case_equal(case["name"], expected, received)
+        for key in received:
+            if key not in expected:
+                print(f"[{case['name']}] unexpected key={key} rec={received[key]!r}")
+                passed = False
 
     if passed : print(f"{GREEN}PASS{RESET}")
     else      : print(f"{RED}FAIL{RESET}")
     return passed
 
 
-# Image generation
-#
-# None of these contact a provider: extraction, validation and filename confinement all
-# happen before transport, and the two chat cases stub generate_image out. The point is
-# that a request is rejected (or an image is placed) without anything being spent.
+# Image generation. None of these contact a provider.
 IMAGE_EXTRACTION_CASES = [
     {
         "name"       : "a block in the last user message triggers and is stripped",
@@ -1048,28 +1022,30 @@ def make_image_config() -> None:
     cfg.image_edit_roots              = []
 
 
-def test_image_extraction(case: dict[str, Any]) -> bool:
+def test_image_extraction() -> bool:
     global tests_ttl
     tests_ttl += 1
-    print(f"Testing image extraction: {case['name']}... ", end="")
+    print("Testing image block extraction... ", end="")
 
-    make_image_config()
-    extraction = image_orchestrator.extract({"messages": case["messages"]})
+    passed = True
+    for case in IMAGE_EXTRACTION_CASES:
+        make_image_config()
+        extraction = image_orchestrator.extract({"messages": case["messages"]})
 
-    received = {
-        "prompts"    : [req.prompt for req in extraction.requests],
-        "needs_text" : extraction.needs_text,
-        "errors"     : len(extraction.errors),
-        "cleaned"    : [msg["content"] for msg in extraction.messages],
-    }
-    expected = {
-        "prompts"    : case["prompts"],
-        "needs_text" : case["needs_text"],
-        "errors"     : case.get("errors", 0),
-        "cleaned"    : case["cleaned"],
-    }
+        received = {
+            "prompts"    : [req.prompt for req in extraction.requests],
+            "needs_text" : extraction.needs_text,
+            "errors"     : len(extraction.errors),
+            "cleaned"    : [msg["content"] for msg in extraction.messages],
+        }
+        expected = {
+            "prompts"    : case["prompts"],
+            "needs_text" : case["needs_text"],
+            "errors"     : case.get("errors", 0),
+            "cleaned"    : case["cleaned"],
+        }
+        passed &= check_case_equal(case["name"], expected, received)
 
-    passed = check_equal(expected, received)
     if passed : print(f"{GREEN}PASS{RESET}")
     else      : print(f"{RED}FAIL{RESET}")
     return passed
@@ -1094,9 +1070,10 @@ IMAGE_VALIDATION_CASES = [
     ({"prompt": "x", "n": 0}                            , "n must be between"),
     ({"prompt": "x", "n": 5}                            , "n must be between"),
     ({"prompt": "x", "n": "two"}                        , "n must be an integer"),
-    # Everything the caller must never choose. 'model' is absent on purpose: an OpenAI
-    # client always sends it, so it is accepted and discarded rather than rejected --
-    # see test_image_client_fields for the proof it is not honoured.
+    ({"prompt": "x", "model": "dall-e-3", "user": "u"}  , None),
+    ({"prompt": "x", "stream": True}                    , "streaming image generation is not supported"),
+    # Everything the caller must never choose. 'model' is accepted above only because
+    # OpenAI clients always send it; it is not an override.
     ({"prompt": "x", "qualtiy": "low"}                  , "unsupported field"),
     ({"prompt": "x", "provider": "gpt"}                 , "unsupported field"),
     ({"prompt": "x", "base_url": "http://evil.test"}    , "unsupported field"),
@@ -1126,28 +1103,30 @@ IMAGE_VALIDATION_CASES = [
 ]
 
 
-def test_image_validation(case: tuple) -> bool:
+def test_image_request_validation() -> bool:
     global tests_ttl
     tests_ttl += 1
-    overrides, expected_error = case
-    print(f"Testing image validation: {str(overrides)[:58]}... ", end="")
+    print("Testing image request validation... ", end="")
 
-    make_image_config()
+    passed = True
+    for overrides, expected_error in IMAGE_VALIDATION_CASES:
+        make_image_config()
 
-    received_error = None
-    try:
-        v1_images.build_request(overrides)
-    except Exception as exc:
-        received_error = str(exc)
+        received_error = None
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                v1_images.build_request(overrides)
+        except Exception as exc:
+            received_error = str(exc)
 
-    if expected_error is None:
-        passed = received_error is None
-        if not passed:
-            print(f"exp=accepted, rec={received_error!r} ", end="")
-    else:
-        passed = received_error is not None and expected_error in received_error
-        if not passed:
-            print(f"exp contains {expected_error!r}, rec={received_error!r} ", end="")
+        label = str(overrides)[:58]
+        if expected_error is None:
+            if received_error is not None:
+                print(f"[{label}] exp=accepted, rec={received_error!r} ", end="")
+                passed = False
+        elif received_error is None or expected_error not in received_error:
+            print(f"[{label}] exp contains {expected_error!r}, rec={received_error!r} ", end="")
+            passed = False
 
     if passed : print(f"{GREEN}PASS{RESET}")
     else      : print(f"{RED}FAIL{RESET}")
@@ -1245,24 +1224,25 @@ IMAGE_USAGE_CASES = [
 ]
 
 
-def test_image_usage(case: tuple) -> bool:
+def test_image_usage_accounting() -> bool:
     global tests_ttl
     tests_ttl += 1
-    name, payload, expected_counts, expected_cost = case
-    print(f"Testing image usage: {name}... ", end="")
+    print("Testing image usage accounting... ", end="")
 
-    make_image_config()
-    common.cfg.image_text_input_cost  = 5.00
-    common.cfg.image_image_input_cost = 8.00
-    common.cfg.image_output_cost      = 30.00
+    passed = True
+    for name, payload, expected_counts, expected_cost in IMAGE_USAGE_CASES:
+        make_image_config()
+        common.cfg.image_text_input_cost  = 5.00
+        common.cfg.image_image_input_cost = 8.00
+        common.cfg.image_output_cost      = 30.00
 
-    counts = v1_images.parse_usage(payload)
-    passed = check_equal(expected_counts, counts)
+        counts = v1_images.parse_usage(payload)
+        passed &= check_case_equal(f"{name} counts", expected_counts, counts)
 
-    cost = common.track_image_usage(counts, images=1, batch=False, model="gpt-image-2")
-    if round(cost, 6) != round(expected_cost, 6):
-        print(f"key=cost exp={expected_cost!r}, rec={round(cost, 6)!r}")
-        passed = False
+        cost = common.track_image_usage(counts, images=1, batch=False, model="gpt-image-2")
+        if round(cost, 6) != round(expected_cost, 6):
+            print(f"[{name} cost] exp={expected_cost!r}, rec={round(cost, 6)!r}")
+            passed = False
 
     if passed : print(f"{GREEN}PASS{RESET}")
     else      : print(f"{RED}FAIL{RESET}")
@@ -1851,50 +1831,6 @@ def test_image_uploaded_references() -> bool:
     return passed
 
 
-def test_image_client_fields() -> bool:
-    """
-    An OpenAI client sends fields this proxy does not honour. They must be accepted so
-    client.images.generate() works unmodified, without becoming overridable -- and a
-    genuine typo must still be an error.
-    """
-    global tests_ttl
-    tests_ttl += 1
-    print("Testing client fields: accepted, not honoured, typos still caught... ", end="")
-
-    make_image_config()
-    passed = True
-
-    # 'model' is proxy policy, exactly as it is for chat.
-    with contextlib.redirect_stdout(io.StringIO()):
-        request = v1_images.build_request({"prompt": "x", "model": "dall-e-3", "user": "u"}, source="direct")
-    if request.prompt != "x":
-        print("exp=request built, rec=failed ", end="")
-        passed = False
-
-    cases = [
-        ({"prompt": "x", "qualtiy": "low"}, "unsupported field"),
-        ({"prompt": "x", "stream": True}  , "streaming image generation is not supported"),
-    ]
-    for fields, expected in cases:
-        try:
-            v1_images.build_request(fields, source="direct")
-            print(f"exp={expected!r} rejected, rec=accepted ", end="")
-            passed = False
-        except v1_images.ImageRequestError as exc:
-            if expected not in str(exc):
-                print(f"exp contains {expected!r}, rec={exc} ", end="")
-                passed = False
-
-    # Ignoring a field must not make it settable.
-    if "model" in v1_images.ALLOWED_OVERRIDES:
-        print("exp=model not overridable, rec=in the allowlist ", end="")
-        passed = False
-
-    if passed : print(f"{GREEN}PASS{RESET}")
-    else      : print(f"{RED}FAIL{RESET}")
-    return passed
-
-
 def test_image_http_routes() -> bool:
     """
     The HTTP surface: generations and edits are split the way the upstream API splits
@@ -1947,7 +1883,8 @@ def test_image_http_routes() -> bool:
             print(f"exp=['id', 'path'], rec={sorted(r.get_json()['data'][0])} ", end="")
             passed = False
 
-        r = client.post("/v1/images/generations", json={"prompt": "x", "response_format": "jpeg"}, headers=headers)
+        with contextlib.redirect_stdout(io.StringIO()):
+            r = client.post("/v1/images/generations", json={"prompt": "x", "response_format": "jpeg"}, headers=headers)
         if r.status_code != 400:
             print(f"exp=400 for a bad response_format, rec={r.status_code} ", end="")
             passed = False
@@ -1964,7 +1901,8 @@ def test_image_http_routes() -> bool:
             passed = False
 
         # A multipart edit with no file at all is a clear error, not a crash.
-        r = client.post("/v1/images/edits", data={"prompt": "x"}, content_type="multipart/form-data", headers=headers)
+        with contextlib.redirect_stdout(io.StringIO()):
+            r = client.post("/v1/images/edits", data={"prompt": "x"}, content_type="multipart/form-data", headers=headers)
         if r.status_code != 400:
             print(f"exp=400 for a fileless multipart edit, rec={r.status_code} ", end="")
             passed = False
@@ -2418,7 +2356,7 @@ def test_image_failure_is_inline() -> bool:
 
     make_config()
     make_image_config()
-    common.cfg.error_log_path = str(ROOT / "test_error_log.txt")
+    common.cfg.error_log_path = os.path.join(tempfile.gettempdir(), "revpy_test_error_log.txt")
     passed = True
 
     html = "<html><head><title>520</title></head><body><h1>" + ("Web server error. " * 200) + "</h1></body></html>"
@@ -2516,11 +2454,9 @@ if __name__ == "__main__":
 
     tests_passed += test_provider_config_parsing()
 
-    for cost_case in COST_CASES:
-        tests_passed += test_cost_resolution(cost_case)
+    tests_passed += test_cost_resolution()
 
-    for usage_case in USAGE_CASES:
-        tests_passed += test_usage_normalization(usage_case)
+    tests_passed += test_usage_normalization()
 
     for stream_case in STREAM_CASES:
         tests_passed += test_responses_stream_termination(stream_case)
@@ -2528,22 +2464,16 @@ if __name__ == "__main__":
     for non_stream_case in NON_STREAM_CASES:
         tests_passed += test_responses_non_stream(non_stream_case)
 
-    body_inputs, body_cases = load_body_cases("provider_bodies.json5")
-    for body_case in body_cases:
-        tests_passed += test_provider_request_body(body_inputs, body_case)
+    tests_passed += test_provider_request_bodies()
 
-    for extraction_case in IMAGE_EXTRACTION_CASES:
-        tests_passed += test_image_extraction(extraction_case)
+    tests_passed += test_image_extraction()
 
-    for validation_case in IMAGE_VALIDATION_CASES:
-        tests_passed += test_image_validation(validation_case)
+    tests_passed += test_image_request_validation()
 
-    for image_usage_case in IMAGE_USAGE_CASES:
-        tests_passed += test_image_usage(image_usage_case)
+    tests_passed += test_image_usage_accounting()
 
     tests_passed += test_image_reference_validation()
     tests_passed += test_image_uploaded_references()
-    tests_passed += test_image_client_fields()
     tests_passed += test_image_http_routes()
     tests_passed += test_image_edit_path_security()
     tests_passed += test_image_edit_detection()

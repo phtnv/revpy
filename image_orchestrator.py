@@ -1,16 +1,9 @@
 """
 Chat-side image request detection.
 
-The trigger is user-written: a <IMAGE_REQUEST_TAG> block inside a user message, which
-this module parses, validates and removes before the conversation reaches the text
-model. Assistant output is never scanned -- the model cannot ask for an image, so it
-cannot spend money by talking about one.
-
-The one rule that matters here: chat clients resend the whole history on every turn, so
-a block written three turns ago arrives again with every request. Blocks are therefore
-stripped from *every* user message (the text model must never see the control syntax)
-but only *trigger* generation when they appear in the last one. Without that split,
-every turn would regenerate every image the conversation has ever asked for.
+User-written <IMAGE_REQUEST_TAG> blocks are stripped from every user message, but only
+the last user message can trigger generation. Chat clients resend history; old image
+blocks must not spend again.
 """
 
 import json5
@@ -23,18 +16,13 @@ from v1_images import ImageRequest, ImageRequestError, build_request
 
 
 class Extraction:
-    """
-    What one incoming payload turned into. Built empty and filled in as the messages are
-    walked, so the lists start empty rather than being handed in.
-    """
+    """What one incoming payload turned into."""
     def __init__(self, messages: Optional[List[Dict[str, Any]]] = None, needs_text: bool = True):
-        self.messages = messages if messages is not None else []
-        # False when the user's turn was nothing but image requests, which is the case
-        # that skips the text model entirely.
+        self.messages = messages or []
+        # False when the user's turn was only image requests.
         self.needs_text = needs_text
         self.found      = False
 
-        # Accumulated while the messages are walked.
         self.requests : List[ImageRequest] = []
         self.errors   : List[str]          = []
 
@@ -47,14 +35,7 @@ def block_pattern() -> re.Pattern:
 
 def parse_block_body(body: str) -> Dict[str, Any]:
     """
-    One control block's fields.
-
-    The documented syntax is json5 without the surrounding braces, so they are added back
-    before parsing. Two conveniences on top: a body that already carries its own braces is
-    taken as-is, and a body with no field syntax at all is taken as a bare prompt -- the
-    common case of a user typing the tag around a sentence. A body that looks like fields
-    but does not parse is an error rather than a prompt, so a typo is reported instead of
-    being generated verbatim.
+    Parse one control block. Bodies may be json5 fields, a braced object, or a bare prompt.
     """
     text = (body or "").strip()
     if not text:
@@ -78,9 +59,7 @@ def parse_block_body(body: str) -> Dict[str, Any]:
 
 def strip_blocks(content: Any, pattern: re.Pattern) -> Tuple[Any, List[str]]:
     """
-    Removes every control block from one message's content, returning the cleaned content
-    and the raw block bodies found. List-form content is walked so that a client sending
-    OpenAI content parts is handled without being flattened to a string.
+    Remove control blocks from one message and return the cleaned content plus raw bodies.
     """
     bodies: List[str] = []
 
@@ -89,8 +68,6 @@ def strip_blocks(content: Any, pattern: re.Pattern) -> Tuple[Any, List[str]]:
         if not matches:
             return text
         bodies.extend(match.group("body") for match in matches)
-        # Collapse the whitespace the removed block leaves behind, so a message that was
-        # only a block becomes genuinely empty rather than a run of newlines.
         return re.sub(r"\n{3,}", "\n\n", pattern.sub("", text)).strip()
 
     if isinstance(content, str):
@@ -132,11 +109,7 @@ def last_user_index(messages: List[Any]) -> int:
 
 def extract(payload: Dict[str, Any]) -> Extraction:
     """
-    Splits an incoming chat payload into the conversation the text model should see and
-    the image requests the proxy should run.
-
-    Returns an Extraction whose `messages` replaces payload["messages"]. When nothing was
-    found the original list is returned untouched, so the ordinary chat path is unchanged.
+    Split a chat payload into cleaned messages and image requests to run.
     """
     messages = payload.get("messages")
     if not cfg.image_enabled or not cfg.image_chat_enabled or not isinstance(messages, list):
@@ -160,7 +133,6 @@ def extract(payload: Dict[str, Any]) -> Extraction:
         result.found = True
         result.messages.append({**message, "content": cleaned})
 
-        # Older turns are cleaned but never re-run; see the module docstring.
         if index == trigger:
             triggered = bodies
             result.needs_text = not content_is_empty(cleaned)
@@ -176,9 +148,7 @@ def extract(payload: Dict[str, Any]) -> Extraction:
         except Exception as exc:
             result.errors.append(f"{exc.__class__.__name__}: {exc}")
 
-    # A block that only produced errors still consumed the user's turn. Sending the now
-    # empty message to the text model would ask it to reply to nothing, so the turn ends
-    # with the error text instead.
+    # If no current block existed, leave the normal chat path alone.
     if not result.requests and not result.errors:
         result.needs_text = True
 

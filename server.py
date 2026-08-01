@@ -1720,17 +1720,8 @@ def chat_snapshot():
     )
 
 
-# Image HTTP surface
-#
-# Two request encodings reach these routes:
-#   multipart  a client posting its own image bytes (what the OpenAI SDK sends)
-#   JSON       slots, allowlisted paths, or provider file ids for a batch
-#
-# The reply defaults to b64_json for both, because the chat path never comes through here
-# -- every caller on these routes is an external app, and an OpenAI client expects the
-# bytes. Encoding is deliberately not used to guess intent: images.generate() is JSON and
-# still wants b64_json, so that heuristic would break the case it was meant to serve.
-# The saved path rides along in either format, and response_format overrides per call.
+# Image HTTP surface: multipart uploads client bytes; JSON names slots, paths or file ids.
+# Direct endpoints default to b64_json for OpenAI-client compatibility.
 IMAGE_UPLOAD_FIELDS = ("image", "image[]", "image[0]")
 
 
@@ -1745,12 +1736,7 @@ def resolve_response_format(requested: Any) -> str:
 
 def make_image_response(result: v1_images.ImageResult, response_format: str = "path") -> Dict[str, Any]:
     """
-    The direct endpoint's reply.
-
-    'path' returns metadata only: the images are already on disk, and echoing megabytes of
-    Base64 back to a caller that asked the proxy to save them serves no one. 'b64_json'
-    additionally carries the bytes, which is what an OpenAI SDK client expects -- the file
-    is still written either way, and 'path' rides along so a local caller can find it.
+    Direct image endpoint reply. 'path' is metadata-only; 'b64_json' also includes bytes.
     """
     usage: Dict[str, Any] = {"estimated_cost_usd": round(result.cost_usd, 6), "cost_is_estimate": result.estimated}
     if result.usage.get("reported"):
@@ -1778,21 +1764,13 @@ def make_image_response(result: v1_images.ImageResult, response_format: str = "p
 EDIT_FIELDS = ("images", "edit", "mask", "file_ids")
 
 def multipart_edit_fields() -> Dict[str, Any]:
-    """
-    Turns a multipart edit into the same override dict a JSON request produces.
-
-    Uploaded bytes go straight to the validator without ever touching the filesystem, so
-    none of the path machinery -- allowlists, traversal checks, slots -- is involved or
-    needed. Scalars arrive as strings, which build_request already copes with.
-    """
+    """Turn a multipart edit into the same override dict JSON requests use."""
     uploads: List[Any] = []
     try:
         for field_name in IMAGE_UPLOAD_FIELDS:
             uploads.extend(request.files.getlist(field_name))
     except RequestEntityTooLarge:
-        # Touching request.files is what parses the body, so an oversized upload surfaces
-        # here rather than at the app's 413 handler. Werkzeug's own wording never mentions
-        # the limit, which is the one thing the caller needs to know.
+        # Parsing request.files is where Werkzeug surfaces oversized multipart bodies.
         abort(413, description=f"Upload exceeds REQUEST_MAX_BYTES ({cfg.request_max_bytes:,} bytes).")
 
     if not uploads:
@@ -1836,14 +1814,7 @@ def run_image_request(fields: Dict[str, Any], response_format: str):
 @app.route("/images/edits"   , methods=["POST"])
 @app.route("/v1/images/edits", methods=["POST"])
 def images_edits():
-    """
-    Image editing, in either of the two encodings the upstream endpoint accepts.
-
-    multipart/form-data carries the caller's own image bytes, which is what an OpenAI SDK
-    client sends and what an app that holds its own files needs -- it requires no
-    filesystem access on this machine and so bypasses the path allowlist entirely.
-    JSON carries slot numbers, allowlisted paths, or provider file ids for a batch.
-    """
+    """Image editing, via multipart uploads or JSON references."""
     uploaded = request.mimetype == "multipart/form-data"
 
     try:
