@@ -365,17 +365,6 @@ The reply comes back with a reference appended:
 
 If the message contained *nothing but* the block, no request is made to the text model at all — you get the reference on its own.
 
-Two things worth knowing:
-
-- **Only the latest user message triggers.** Chat clients resend the whole history every turn, so a block written three turns ago arrives again with every request. Old blocks are still stripped (the model never sees them) but never re-run — otherwise every turn would regenerate every image the chat has ever asked for.
-- **The assistant cannot request images.** Only user messages are scanned, so the model cannot spend your money by writing about the tag.
-
-A failed generation never costs you the turn. The model's prose still arrives, with the reason inlined:
-
-```text
-[Image generation failed: content policy violation]
-```
-
 ### Overridable fields
 
 `prompt`, `size`, `quality`, `output_format`, `background`, `n`, `batch`, `filename`, and for editing `images`, `edit`, `mask`, `file_ids`, `source_files`.
@@ -443,9 +432,13 @@ Each image appends a record to `img_generation.json` in the output directory (`I
 }
 ```
 
-`file` is the basename and `path` is relative to the proxy's working directory. A client reading the manifest out of the output directory has no way to resolve the latter, so **`file` is the key that joins a record to a directory listing** — `allocate_path` has already made it unique there.
+**Every path in a record is relative to the manifest's own directory, with forward slashes on both platforms.** The manifest sits beside the images it describes, so its folder is a root any reader already has — and one that survives the folder being moved, renamed, or copied to another machine. There is nothing to configure and nothing to pass between programs. A path stays absolute only where no relative form exists: a different Windows drive shares no prefix to climb through.
+
+That makes `path` equal `file` for a generated image. `file` is the key that joins a record to a directory listing, and `allocate_path` has already made it unique there.
 
 `request_parameters.size` is the size that was *asked* for, recorded as given, including the literal `"auto"`.
+
+Names are judged by what Windows and POSIX will *both* accept, not by what the machine running the proxy happens to allow — an output directory gets copied and read elsewhere, and a name only one of them can open is a problem postponed. So `nul`, `con`, `com3` and friends are refused whatever extension follows, a trailing dot is refused (Windows drops it silently), and `allocate_path` treats names case-insensitively, so `Cat.png` beside `cat.png` becomes `Cat_1.png` on Linux exactly as it would on Windows.
 
 `source_files` is the lineage: which file on this machine each reference came from. For an edit against paths or uploads the proxy derives it (a path knows where it came from; an upload only its name). For a batched edit it has to be declared, because the request names its inputs by provider file id and nothing else connects those to a local file — see below.
 
@@ -507,10 +500,6 @@ image edit mask clear
 ```
 
 A mask set this way applies to slot-driven edits automatically. Note that masking with GPT Image is prompt-guided: the model treats the mask as guidance rather than a precise stencil. A JPEG mask is rejected up front, since JPEG has no alpha channel — the provider's own docs call that the most common cause of edit failures.
-
-#### What edits cost
-
-Reference images are billed as image input tokens, and gpt-image-2 always processes them at high fidelity, so an edit costs noticeably more on input than a generation. In practice one 1024×1024 reference is about 1024 input image tokens, and they add up linearly — two references measured 2048. At the configured $8/MTok that is roughly $0.008 per reference on top of the output cost. The proxy reports it exactly, since the provider returns the split.
 
 #### Reliability
 

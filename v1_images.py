@@ -105,6 +105,12 @@ SIZE_RE     = re.compile(r"^(\d{1,5})\s*[x×]\s*(\d{1,5})$")
 FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 FILENAME_MAX_STEM = 120
 
+# Names Windows refuses to give a file, whatever extension follows. They are legal on every
+# other platform, so a manifest written on Linux can carry a name that cannot be checked out
+# on Windows -- which is exactly the sort of thing worth refusing at the point it is chosen
+# rather than discovering on the machine that cannot open it.
+RESERVED_STEMS = {"con", "prn", "aux", "nul"} | {f"com{n}" for n in range(1, 10)} | {f"lpt{n}" for n in range(1, 10)}
+
 BATCH_ENDPOINT      = "/v1/images/generations"
 BATCH_EDIT_ENDPOINT = "/v1/images/edits"
 BATCH_STATE_FILE = "img_batches.json"
@@ -457,6 +463,12 @@ def sanitize_filename_stem(raw: Any) -> str:
     directory component, traversal segment, separator or unusual character is a rejection
     rather than something to quietly strip -- a request that meant to escape the output
     directory should fail loudly, and one that did not is unaffected.
+
+    The rules are the intersection of what Windows and POSIX will both accept, not what the
+    machine running the proxy happens to allow: an output directory gets copied, synced and
+    read elsewhere, and a name only one of them can open is a problem deferred rather than
+    avoided. Hence the reserved-device check and the trailing-dot check, neither of which
+    Linux would ever complain about.
     """
     name = str(raw).strip()
     if not name:
@@ -468,7 +480,19 @@ def sanitize_filename_stem(raw: Any) -> str:
             f"filename must be a bare name matching [A-Za-z0-9._-] with no path separators, got {raw!r}."
         )
 
-    return stem[:FILENAME_MAX_STEM]
+    stem = stem[:FILENAME_MAX_STEM]
+
+    # Windows silently strips a trailing dot, so the file that appears is not the one that was
+    # asked for -- and the manifest would then name something that is not there. Reached by
+    # 'name..', since splitext has already taken a single trailing dot as the extension.
+    # A trailing space cannot get this far: it is stripped above and the pattern has no space.
+    if stem.endswith("."):
+        raise ImageRequestError(f"filename must not end in a dot, got {raw!r}.")
+
+    if stem.lower() in RESERVED_STEMS:
+        raise ImageRequestError(f"filename {raw!r} is a reserved device name on Windows; choose another.")
+
+    return stem
 
 
 # Reference image slots
@@ -1085,15 +1109,29 @@ def allocate_path(directory: str, stem: str, extension: str) -> str:
     A free path under `directory`. An existing file is never overwritten: a linear index
     is appended until the name is free. Call with STORAGE_LOCK held.
 
+    Freedom is judged case-insensitively, which is stricter than Linux requires and exactly
+    what Windows enforces. Deciding it by os.path.exists would make the same directory
+    behave differently on the two -- 'Cat.png' beside 'cat.png' on one, silently indexed on
+    the other -- and the manifest is meant to describe a directory that can be copied
+    between them unchanged.
+
     The result is confined to the output directory even if the stem somehow survived
     sanitisation -- storage is the last place able to catch that, and a path escaping
     here would be the model writing wherever it liked.
     """
-    candidate = os.path.join(directory, f"{stem}{extension}")
+    try:
+        taken = {name.lower() for name in os.listdir(directory)}
+    except OSError:
+        # A directory we cannot list is one we are about to fail to write into anyway; let
+        # that failure happen at the write, where it says something useful.
+        taken = set()
+
+    name      = f"{stem}{extension}"
     index     = 1
-    while os.path.exists(candidate):
-        candidate = os.path.join(directory, f"{stem}_{index}{extension}")
+    while name.lower() in taken:
+        name = f"{stem}_{index}{extension}"
         index += 1
+    candidate = os.path.join(directory, name)
 
     root     = os.path.realpath(directory)
     resolved = os.path.realpath(candidate)
@@ -1159,6 +1197,28 @@ def decode_image(b64_data: Any, index: int) -> bytes:
                             "invalid Base64 in image response")
 
 
+def manifest_path(path: str, directory: str) -> str:
+    """
+    One path as the manifest records it: relative to the directory the manifest sits in, with
+    forward slashes on every platform.
+
+    The manifest lives beside the images it describes, so its own directory is the only root
+    both sides already agree on -- no field to pass, nothing to configure, and the folder
+    stays readable after it is moved, renamed or copied to another machine. An absolute path
+    would be none of those things.
+
+    Absolute is kept only where relative is not expressible: a different Windows drive has no
+    common prefix at all, and a path that never resolved has nothing to be relative to.
+    """
+    if not path:
+        return ""
+    try:
+        relative = os.path.relpath(path, directory)
+    except ValueError:
+        return path.replace("\\", "/")
+    return relative.replace("\\", "/")
+
+
 def manifest_source_files(req: ImageRequest) -> List[Dict[str, str]]:
     """
     The lineage recorded for one request, in one shape whichever route produced it.
@@ -1169,13 +1229,18 @@ def manifest_source_files(req: ImageRequest) -> List[Dict[str, str]]:
     it. An upload has a name but no location on this machine, which is exactly what the
     entry then says.
     """
+    directory = output_dir_path()
+
     if req.source_files:
-        return [dict(entry) for entry in req.source_files]
+        return [
+            {key: (manifest_path(value, directory) if key == "path" else value) for key, value in entry.items()}
+            for entry in req.source_files
+        ]
 
     sources: List[Dict[str, str]] = []
     for reference in req.images:
         if reference.path:
-            sources.append({"path": reference.path, "file": os.path.basename(reference.path)})
+            sources.append({"path": manifest_path(reference.path, directory), "file": os.path.basename(reference.path)})
         else:
             sources.append({"file": reference.filename()})
     return sources
@@ -1201,11 +1266,12 @@ def append_manifest(req: ImageRequest, saved: List[SavedImage], cost_usd: float,
     for image in saved:
         record: Dict[str, Any] = {
             "image_id"           : image.image_id,
-            "path"               : image.path,
-            # 'path' is relative to the proxy's working directory, which a client reading
-            # this file out of the output directory has no way to resolve. The basename
-            # is what joins a record to a directory listing, and allocate_path() has
-            # already made it unique within that directory.
+            # Every path in a record follows one rule: relative to this manifest's own
+            # directory, forward slashes. For a generated image that makes 'path' equal
+            # 'file' -- redundant, and worth it for a reader that never has to ask which
+            # field follows which convention. 'file' remains the join key, since
+            # allocate_path() has already made it unique within the directory.
+            "path"               : manifest_path(os.path.abspath(image.path), directory),
             "file"               : os.path.basename(image.path),
             "bytes"              : len(image.data) if image.data is not None else 0,
             "provider"           : cfg.image_provider,
@@ -1228,10 +1294,15 @@ def append_manifest(req: ImageRequest, saved: List[SavedImage], cost_usd: float,
             record["batch_id"] = batch_id
         # An edit driven by 'edit: true' resolves against whatever the slots held at the
         # time, so the inputs are recorded here or the result is unreproducible.
+        # An upload's origin is a marker rather than a location, so only the path form is
+        # rewritten -- there is nothing for 'upload:dropped.png' to be relative to.
+        def relative_origin(origin: str) -> str:
+            return origin if origin.startswith("upload:") else manifest_path(origin, directory)
+
         if req.images:
-            record["source_images"] = [reference.origin() for reference in req.images]
+            record["source_images"] = [relative_origin(reference.origin()) for reference in req.images]
         if req.mask is not None:
-            record["mask"] = req.mask.origin()
+            record["mask"] = relative_origin(req.mask.origin())
         if req.file_ids:
             record["source_references"] = list(req.file_ids)
         # The durable half of the above: 'source_references' names ids that expire, this
@@ -1901,6 +1972,9 @@ def list_batches() -> List[Dict[str, Any]]:
             "requests"      : [
                 {
                     "custom_id"     : custom_id,
+                    # The name the user gave the job, which is what they will look for in
+                    # the folder -- more use in a listing than either id.
+                    "filename"      : item.get("filename", ""),
                     "prompt"        : item.get("prompt", ""),
                     "size"          : item.get("size", ""),
                     "quality"       : item.get("quality", ""),

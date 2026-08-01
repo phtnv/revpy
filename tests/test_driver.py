@@ -1110,6 +1110,19 @@ IMAGE_VALIDATION_CASES = [
     ({"prompt": "x", "filename": "..\\..\\win"}         , "no path separators"),
     ({"prompt": "x", "filename": ".hidden"}             , "no path separators"),
     ({"prompt": "x", "filename": ".."}                  , "no path separators"),
+    # An output directory gets copied and read on the other platform, so a name is judged by
+    # what both will accept rather than by what the machine writing it happens to allow.
+    ({"prompt": "x", "filename": "nul"}                 , "reserved device name"),
+    ({"prompt": "x", "filename": "CON"}                 , "reserved device name"),
+    ({"prompt": "x", "filename": "com4.png"}            , "reserved device name"),
+    # 'console' only starts like one, and 'nul_1' is what indexing a reserved name would
+    # produce -- neither is reserved, and rejecting them would be superstition.
+    ({"prompt": "x", "filename": "console"}             , None),
+    ({"prompt": "x", "filename": "nul_1"}               , None),
+    # Windows strips a trailing dot silently, so the file that appears is not the one asked
+    # for. A single one is already the extension by the time it is checked, so this is 'a..'.
+    ({"prompt": "x", "filename": "trailing.."}          , "must not end in a dot"),
+    ({"prompt": "x", "filename": "trailing."}           , None),
 ]
 
 
@@ -1171,6 +1184,15 @@ def test_image_storage_confinement() -> bool:
             if handle.read() != b"\x89PNG-one":
                 print("exp=first image intact, rec=overwritten ", end="")
                 passed = False
+
+        # A name differing only in case is taken. Windows would refuse it outright and Linux
+        # would allow it, and a directory meant to be copied between them cannot behave two
+        # ways -- so it indexes here on both.
+        cased = v1_images.save_image_bytes(v1_images.build_request({"prompt": "x", "filename": "SHOT"}),
+                                           b"\x89PNG-three", "img_cccc")
+        if os.path.basename(cased.path) != "SHOT_2.png":
+            print(f"exp=SHOT_2.png, rec={os.path.basename(cased.path)} ", end="")
+            passed = False
 
         # No .part file may survive a completed write.
         leftovers = [name for name in os.listdir(tmp) if name.endswith(".part")]
@@ -2053,6 +2075,9 @@ def test_image_source_files() -> bool:
     passed = True
 
     with tempfile.TemporaryDirectory() as tmp:
+        # The manifest's own directory is what every recorded path is relative to, so it has
+        # to be the real one from the first call that records anything.
+        common.cfg.image_output_dir = tmp
         base_path = write_file(tmp, "base.png", make_png(16, 16))
 
         # An object names all three parts; a bare string is a path only when it looks like
@@ -2118,11 +2143,24 @@ def test_image_source_files() -> bool:
                 v1_images.load_uploaded_reference("dropped.png", make_png(8, 8)),
             ],
         ))
-        expected = [
-            {"path": os.path.realpath(base_path), "file": "base.png"},
-            {"file": "dropped.png"},
-        ]
-        if not check_equal(expected, derived):
+        # Recorded relative to the manifest's directory, which is where base.png sits.
+        expected = [{"path": "base.png", "file": "base.png"}, {"file": "dropped.png"}]
+        if derived != expected:
+            print(f"exp={expected}, rec={derived} ", end="")
+            passed = False
+
+        # A source outside the output directory climbs out of it rather than going absolute,
+        # and says so with forward slashes on either platform.
+        outside = os.path.join(tmp, "refs", "held.png")
+        os.makedirs(os.path.dirname(outside), exist_ok=True)
+        write_file(os.path.dirname(outside), "held.png", make_png(8, 8))
+        nested = v1_images.manifest_source_files(v1_images.ImageRequest(
+            prompt="x", size="auto", quality="auto", output_format="png",
+            background="opaque", n=1, batch=False,
+            images=[v1_images.load_reference(outside, from_prompt=False)],
+        ))
+        if nested != [{"path": "refs/held.png", "file": "held.png"}]:
+            print(f"exp=[refs/held.png], rec={nested} ", end="")
             passed = False
 
         # The manifest is written when a batch is retrieved, hours after the request that
@@ -2131,10 +2169,9 @@ def test_image_source_files() -> bool:
         if not check_equal(request.source_files, restored.source_files):
             passed = False
 
-        # The record itself: a basename that joins it to a directory listing, its size,
-        # and the lineage. 'path' is relative to the proxy's cwd and cannot serve as the
-        # join key, which is the whole reason 'file' exists.
-        common.cfg.image_output_dir      = tmp
+        # The record itself: a basename that joins it to a directory listing, its size, and
+        # the lineage. Every path in it is relative to this manifest's directory, so a
+        # generated image's 'path' comes out equal to its 'file'.
         common.cfg.image_manifest_enabled = True
         common.cfg.image_manifest_prompts = True
 
@@ -2148,6 +2185,7 @@ def test_image_source_files() -> bool:
         record   = records[0] if records else {}
         received = {
             "file"         : record.get("file"),
+            "path"         : record.get("path"),
             "bytes"        : record.get("bytes"),
             "source_files" : record.get("source_files"),
             "size"         : (record.get("request_parameters") or {}).get("size"),
@@ -2155,6 +2193,7 @@ def test_image_source_files() -> bool:
         }
         expected = {
             "file"         : os.path.basename(saved.path),
+            "path"         : os.path.basename(saved.path),
             "bytes"        : len(payload),
             "source_files" : [{"file": "a.png", "file_id": "file-a"},
                               {"file": "b.png", "file_id": "file-b"}],
