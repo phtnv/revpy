@@ -1683,26 +1683,34 @@ def retrieve_image_batch(batch_id: str) -> ImageBatchResult:
             result.errors.append("already retrieved; images were saved on the first retrieval.")
             return result
 
-        if status != "completed":
-            # A batch that failed, expired or was cancelled will never produce images.
-            # Marking it settles it, so the poller stops asking about it every interval.
-            if status in BATCH_TERMINAL_STATUSES and entry:
-                entry["retrieved"]    = True
-                entry["final_status"] = status
-                state[batch_id]       = entry
-                write_batch_state(state)
+        if status not in BATCH_TERMINAL_STATUSES:
+            # Still validating, running or finalizing: there is nothing to read yet.
             return result
 
+        # From here the batch is settled below whatever it produced, which is not always an
+        # output file. A batch whose every request was rejected still reports 'completed',
+        # with only an error file to its name; a cancelled or expired one can carry results
+        # for the requests that finished before it stopped. Both files are read the same
+        # way -- the error lines carry the provider's reason for each failure, which is the
+        # only place the user can learn why nothing came back.
         output_file_id = str(data.get("output_file_id") or "")
-        if not output_file_id:
-            result.errors.append("batch completed without an output file.")
-            return result
+        error_file_id  = str(data.get("error_file_id") or "")
+
+        if not output_file_id and not error_file_id:
+            result.errors.append(f"batch {status} without an output file.")
 
         requests_state = entry.get("requests") or {}
-        total_counts   = {"text_input": 0, "image_input": 0, "output": 0, "reported": False}
+        total_counts   = {"text_input": 0, "image_input": 0, "output": 0, "reported": False, "estimated_cost_usd": 0.0}
         images_saved   = 0
 
-        for line in fetch_file_content(provider, output_file_id).splitlines():
+        # A fetch that fails here raises rather than settling the batch on a half-read
+        # result: the poller retries it next pass, where losing the images would be final.
+        result_lines: List[str] = []
+        for file_id in (output_file_id, error_file_id):
+            if file_id:
+                result_lines.extend(fetch_file_content(provider, file_id).splitlines())
+
+        for line in result_lines:
             line = line.strip()
             if not line:
                 continue
@@ -1743,20 +1751,32 @@ def retrieve_image_batch(batch_id: str) -> ImageBatchResult:
                 total_counts[key] += counts[key]
             total_counts["reported"] = total_counts["reported"] or counts["reported"]
 
+            # Accumulated per line, against this line's own request, because a batch may
+            # mix sizes and qualities and need not come back whole: pricing the images
+            # that did arrive off one arbitrary request bills the wrong rate as soon as
+            # that request is not representative -- or was itself one of the rejected ones.
+            if not counts["reported"]:
+                total_counts["estimated_cost_usd"] += estimate_image_cost(cfg.image_model, req.quality, req.size, len(saved))
+
             append_manifest(req, saved, 0.0, counts, not counts["reported"], batch_id=batch_id)
             result.images.extend(saved)
             images_saved += len(saved)
 
         if images_saved:
             # Billed once for the whole batch, at the batch rate, rather than per output
-            # line: the session report distinguishes batch from immediate spending.
-            billing_req = state_to_request(next(iter(requests_state.values()), {}))
-            result.cost_usd, _ = cost_for(billing_req, total_counts, images_saved, batch=True)
+            # line: the session report distinguishes batch from immediate spending. Only
+            # the lines that came back are counted, so a batch the provider fulfilled in
+            # part costs what it delivered rather than what it was asked for.
+            total_counts["estimated"] = not total_counts["reported"]
+            result.cost_usd = track_image_usage(total_counts, images=images_saved, batch=True, model=cfg.image_model)
 
         entry["retrieved"]    = True
         entry["retrieved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         entry["final_status"] = status
         entry["images"]       = [image.path for image in result.images]
+        # Kept so a batch that produced nothing can still say why long after the poller
+        # printed it once and moved on.
+        entry["errors"]       = list(result.errors)
         state[batch_id]       = entry
         write_batch_state(state)
 
