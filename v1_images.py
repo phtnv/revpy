@@ -72,6 +72,8 @@ FORMAT_EXTENSIONS = {"png": ".png", "jpeg": ".jpg", "webp": ".webp"}
 SOURCE_FILE_KEYS = {"file_id", "path", "file"}
 
 SIZE_RE     = re.compile(r"^(\d{1,5})\s*[x×]\s*(\d{1,5})$")
+# `data:<mediatype>;base64,` -- the mediatype is advisory, since the bytes are sniffed.
+DATA_URL_RE = re.compile(r"^data:([^,;]*)((?:;[^,]*)?),", re.IGNORECASE)
 # A filename override is a *name*, never a path: no separators, no traversal, no
 # leading dot, nothing outside this set. The extension is imposed from output_format.
 FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -87,6 +89,9 @@ MANIFEST_FILE    = "img_generation.json"
 SLOTS_FILE       = "img_slots.json"
 # The mask shares the slots file under a key no slot number can collide with.
 MASK_KEY         = "mask"
+# Where a mask that arrived as bytes is kept. A sub-folder rather than the output
+# directory itself, so masks do not crowd the listing of what was actually generated.
+MASK_SUBDIR      = "masks"
 
 # Guards the slot file the same way BATCH_LOCK guards the batch state.
 SLOT_LOCK = threading.RLock()
@@ -594,9 +599,48 @@ def load_uploaded_reference(name: str, data: bytes) -> ReferenceImage:
                           has_alpha=has_alpha)
 
 
+def load_data_url(spec: str) -> ReferenceImage:
+    """
+    One reference from an inline `data:` URL.
+
+    Base64 only: the percent-encoded alternative would have to be decoded before it could
+    be sized, and nothing that holds an image inline emits it. Otherwise this is an upload
+    by another route -- bytes the caller was already holding, reaching no filesystem -- so
+    it is judged by exactly the checks an upload gets.
+
+    It exists because a client can hold a picture without holding a file: a mask drawn in
+    an editor has no path to name, and a batch accepts no multipart upload at all.
+    """
+    match = DATA_URL_RE.match(spec)
+    if match is None:
+        raise ImageRequestError("a data URL must look like 'data:image/png;base64,<payload>'.")
+    if "base64" not in (match.group(2) or "").lower():
+        raise ImageRequestError("only base64 data URLs are accepted as an image reference.")
+
+    payload = spec[match.end():]
+    # Sized before decoding: four base64 characters carry three bytes, so an oversized
+    # payload is refused without ever being materialised.
+    estimated = len(payload)//4*3
+    if estimated > cfg.image_edit_max_bytes:
+        raise ImageRequestError(
+            f"the inline image is about {estimated:,} bytes; the limit is "
+            f"{cfg.image_edit_max_bytes:,} (IMAGE_EDIT_MAX_BYTES)."
+        )
+
+    try:
+        data = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ImageRequestError(f"the inline image is not valid Base64: {exc}")
+
+    # Advisory only -- describe_image sniffs the bytes, as it does for every other route.
+    mediatype = (match.group(1) or "").strip().lower()
+    name      = f"inline.{mediatype.split('/')[-1]}" if mediatype.startswith("image/") else "inline"
+    return load_uploaded_reference(name, data)
+
+
 def load_reference(spec: Any, from_prompt: bool, slot: int = 0) -> ReferenceImage:
     """
-    One validated reference image, from a slot number or a filesystem path.
+    One validated reference image, from a slot number, a data URL or a filesystem path.
 
     Rejects rather than skips, in this order: the path must resolve, be a regular file,
     be readable, be an image by its magic bytes, and fit the size cap. A caller that
@@ -617,7 +661,14 @@ def load_reference(spec: Any, from_prompt: bool, slot: int = 0) -> ReferenceImag
     if not isinstance(spec, str) or not spec.strip():
         raise ImageRequestError(f"an image reference must be a slot number or a path, got {spec!r}.")
 
-    raw = os.path.expanduser(spec.strip())
+    text = spec.strip()
+
+    # Checked before the path machinery because a data URL reaches no filesystem: there is
+    # nothing to resolve, no allowlist to consult, and no prompt-path setting to honour.
+    if text[:5].lower() == "data:":
+        return load_data_url(text)
+
+    raw = os.path.expanduser(text)
 
     if from_prompt:
         if not cfg.image_edit_allow_prompt_paths:
@@ -679,6 +730,37 @@ def validate_mask(mask: ReferenceImage, images: List[ReferenceImage]) -> None:
             f"the mask is {mask.width}x{mask.height} but the first reference image is "
             f"{images[0].width}x{images[0].height}; they must match."
         )
+
+
+def resolve_mask(fields: Dict[str, Any], from_prompt: bool, images: List[ReferenceImage]) -> Optional[ReferenceImage]:
+    """
+    The mask this request runs with: the one it named, none because it said so, or the one
+    left set from the console.
+
+    The console-set mask is a convenience for the CLI, but it is also a trap for every
+    other caller -- it would otherwise apply to requests that never asked for it and have
+    no way to say no. So `mask: false` (or "none"/"off") is a value in its own right,
+    distinct from leaving the key out, which still inherits.
+
+    With a batch there are no local references to measure against; validate_mask already
+    guards its geometry check on having one, so it falls back to the format and alpha
+    rules, which are the only ones that can be checked from here anyway.
+    """
+    given = fields.get("mask") if "mask" in fields else None
+    if isinstance(given, str):
+        given = given.strip()
+
+    if given is False or (isinstance(given, str) and given.lower() in {"none", "off", "false"}):
+        return None
+
+    if given is not None and given != "":
+        mask = load_reference(given, from_prompt)
+    else:
+        mask = stored_mask()
+
+    if mask is not None:
+        validate_mask(mask, images)
+    return mask
 
 
 def validate_file_ids(specs: Any) -> List[str]:
@@ -779,10 +861,16 @@ def resolve_edit_inputs(fields: Dict[str, Any], source: str, batch: bool) -> Tup
         file_ids without batch      rejected -- file_ids exist for the Batch API
         images + batch: true        rejected -- local files cannot be batched
         images + file_ids           rejected -- mutually exclusive
+
+    The mask is orthogonal to all of that and resolved by resolve_mask: named, refused
+    with `mask: false`, or inherited from the console when the key is left out.
     """
     has_images   = "images"   in fields and fields["images"] not in (None, [], "")
     has_file_ids = "file_ids" in fields and fields["file_ids"] not in (None, [], "")
-    has_mask     = "mask"     in fields and fields["mask"] not in (None, "")
+    has_mask     = "mask"     in fields and fields["mask"] not in (None, "", False)
+
+    # Pure, so it can be settled here and used by either branch below.
+    from_prompt = source == "chat"
 
     edit_given = "edit" in fields
     edit_flag  = validate_bool("edit", fields["edit"]) if edit_given else False
@@ -803,14 +891,14 @@ def resolve_edit_inputs(fields: Dict[str, Any], source: str, batch: bool) -> Tup
     if has_file_ids:
         if not batch:
             raise ImageRequestError("file_ids is for Batch API edits only. Add batch: true, or use images for an immediate edit.")
-        if has_mask:
-            raise ImageRequestError("a mask cannot be sent with a batched edit, because it would have to be uploaded as a file.")
-        return [], None, validate_file_ids(fields["file_ids"])
+        # A batch accepts no multipart upload, but the JSON body takes a mask by reference
+        # exactly as it takes the images -- so the bytes ride along as a data URL. Verified
+        # against the provider: a batch line carrying one validates and runs.
+        return [], resolve_mask(fields, from_prompt, []), validate_file_ids(fields["file_ids"])
 
     if batch:
         raise ImageRequestError("local reference images cannot be batched. Upload them to the provider and pass file_ids, or drop batch: true.")
 
-    from_prompt = source == "chat"
     if has_images:
         images = load_references(fields["images"], from_prompt)
     else:
@@ -823,15 +911,7 @@ def resolve_edit_inputs(fields: Dict[str, Any], source: str, batch: bool) -> Tup
     if not images:
         raise ImageRequestError("no usable reference images were given.")
 
-    if has_mask:
-        mask = load_reference(fields["mask"], from_prompt)
-    else:
-        mask = stored_mask()
-
-    if mask is not None:
-        validate_mask(mask, images)
-
-    return images, mask, []
+    return images, resolve_mask(fields, from_prompt, images), []
 
 
 def build_request(overrides: Optional[Dict[str, Any]] = None, source: str = "direct") -> ImageRequest:
@@ -912,6 +992,22 @@ def build_request(overrides: Optional[Dict[str, Any]] = None, source: str = "dir
     )
 
 
+def reference_param(reference: ReferenceImage) -> Dict[str, str]:
+    """
+    One local reference as the JSON body wants it: the provider's image reference object,
+    carrying the bytes inline.
+
+    Read whole rather than streamed, unlike the multipart form, because a JSON body has to
+    be materialised in full before it can be sent -- and because the only thing that takes
+    this route is a mask, which is a flat two-colour PNG.
+    """
+    payload = reference.data
+    if payload is None:
+        with open(reference.path, "rb") as handle:
+            payload = handle.read()
+    return {"image_url": f"data:{reference.mime};base64,{base64.b64encode(payload).decode('ascii')}"}
+
+
 def build_body(req: ImageRequest) -> Dict[str, Any]:
     """
     The provider request. 'auto' is left out rather than sent, so the provider applies
@@ -941,6 +1037,11 @@ def build_body(req: ImageRequest) -> Dict[str, Any]:
             {"image_url": value} if value.startswith("http") else {"file_id": value}
             for value in req.file_ids
         ]
+
+    # Same reference shape as an entry of 'images', which is what lets a batch carry a
+    # mask at all: there is no upload to make, so the bytes go inline as a data URL.
+    if req.mask is not None:
+        body["mask"] = reference_param(req.mask)
 
     return body
 
@@ -1075,6 +1176,49 @@ def save_image_bytes(req: ImageRequest, data: bytes, image_id: str) -> SavedImag
     return SavedImage(image_id=image_id, path=reported, data=data)
 
 
+def persist_mask(req: ImageRequest, directory: str, stem: str) -> str:
+    """
+    Where the manifest should say this request's mask is, writing it out first if it only
+    ever existed as bytes.
+
+    A mask named by path already has somewhere to point at and is left where it is. One
+    that arrived as an upload or a data URL has nowhere, and `upload:mask.png` records a
+    name with nothing behind it -- so it is written beside the images it shaped, under
+    `masks/`, and the manifest names that copy. One file per request, whatever `n` was:
+    the mask belongs to the request, not to any one image it produced.
+
+    Never fatal. The images are already on disk by the time this runs, and losing the
+    record of a mask is not worth losing the record of the pictures.
+    """
+    mask = req.mask
+    if mask is None:
+        return ""
+    if mask.path:
+        return manifest_path(mask.path, directory)
+
+    folder = os.path.join(directory, MASK_SUBDIR)
+    try:
+        os.makedirs(folder, exist_ok=True)
+        with STORAGE_LOCK:
+            path     = allocate_path(folder, stem, FORMAT_EXTENSIONS.get(mask.format, ".png"))
+            tmp_path = f"{path}.{uuid.uuid4().hex[:8]}.part"
+            try:
+                with open(tmp_path, "wb") as handle:
+                    handle.write(mask.data or b"")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp_path, path)
+            except Exception:
+                try: os.unlink(tmp_path)
+                except OSError: pass
+                raise
+    except Exception as exc:
+        print(f"WARNING: could not write the mask into {folder} ({exc}).")
+        return mask.origin()
+
+    return manifest_path(path, directory)
+
+
 def decode_image(b64_data: Any, index: int) -> bytes:
     if not isinstance(b64_data, str) or not b64_data:
         raise ProviderError(502, {"error": {"message": f"image {index} carried no b64_json data."}},
@@ -1133,6 +1277,10 @@ def append_manifest(req: ImageRequest, saved: List[SavedImage], cost_usd: float,
     path      = os.path.join(directory, MANIFEST_FILE)
     created   = time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
+    # Once for the request, before the loop: every record of a batch of n points at the
+    # same mask file, and writing it n times would be n different files saying one thing.
+    mask_record = persist_mask(req, directory, req.filename or default_stem(saved[0].image_id))
+
     records = []
     for image in saved:
         record: Dict[str, Any] = {
@@ -1163,9 +1311,8 @@ def append_manifest(req: ImageRequest, saved: List[SavedImage], cost_usd: float,
                 origin if origin.startswith("upload:") else manifest_path(origin, directory)
                 for origin in (reference.origin() for reference in req.images)
             ]
-        if req.mask is not None:
-            origin = req.mask.origin()
-            record["mask"] = origin if origin.startswith("upload:") else manifest_path(origin, directory)
+        if mask_record:
+            record["mask"] = mask_record
         if req.file_ids:
             record["source_references"] = list(req.file_ids)
         sources = manifest_source_files(req)

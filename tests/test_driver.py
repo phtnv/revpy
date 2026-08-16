@@ -1576,7 +1576,9 @@ def test_image_edit_batch_rules() -> bool:
 
     with tempfile.TemporaryDirectory() as tmp:
         common.cfg.image_output_dir = tmp
-        one = write_file(tmp, "one.png", make_png(32, 32))
+        one  = write_file(tmp, "one.png", make_png(32, 32))
+        flat = write_file(tmp, "flat.png", make_png(32, 32))
+        alpha_mask = write_file(tmp, "alpha.png", make_png(32, 32, alpha=True))
 
         cases = [
             ({"file_ids": ["file-abc"], "batch": True}                   , ""),
@@ -1585,7 +1587,10 @@ def test_image_edit_batch_rules() -> bool:
             ({"images": [one], "batch": True}                            , "cannot be batched"),
             ({"images": [one], "file_ids": ["file-abc"]}                 , "mutually exclusive"),
             ({"file_ids": ["/local/path.png"], "batch": True}            , "must be a provider file id"),
-            ({"file_ids": ["file-abc"], "mask": one, "batch": True}      , "mask cannot be sent"),
+            # A mask rides along in the JSON body, so a batch takes one -- held to the same
+            # alpha rule as anywhere else, since that is what marks the editable region.
+            ({"file_ids": ["file-abc"], "mask": alpha_mask, "batch": True}, ""),
+            ({"file_ids": ["file-abc"], "mask": flat, "batch": True}     , "no alpha channel"),
         ]
         for fields, expected in cases:
             try:
@@ -1615,6 +1620,28 @@ def test_image_edit_batch_rules() -> bool:
             passed = False
         if "input_reference" in body:
             print("exp=no input_reference field, rec=sent ", end="")
+            passed = False
+
+        # The mask takes the same reference shape as an entry of 'images', carrying its
+        # bytes inline because a batch has no upload to make. Verified against the
+        # provider: a batch line carrying one passes validation and runs.
+        request = v1_images.build_request(
+            {"prompt": "x", "file_ids": ["file-abc"], "mask": alpha_mask, "batch": True}, source="cli")
+        body    = v1_images.build_body(request)
+        mask_ref = body.get("mask")
+        if not isinstance(mask_ref, dict) or set(mask_ref) != {"image_url"}:
+            print(f"exp={{'image_url': ...}}, rec={mask_ref} ", end="")
+            passed = False
+        elif not mask_ref["image_url"].startswith("data:image/png;base64,"):
+            print(f"exp=png data url, rec={mask_ref['image_url'][:32]!r} ", end="")
+            passed = False
+        elif base64.b64decode(mask_ref["image_url"].split(",", 1)[1]) != Path(alpha_mask).read_bytes():
+            print("exp=the mask's own bytes, rec=something else ", end="")
+            passed = False
+
+        # A mask is only ever sent with an edit, so a plain generation must not grow one.
+        if "mask" in v1_images.build_body(v1_images.build_request({"prompt": "x"}, source="cli")):
+            print("exp=no mask on a generation, rec=sent ", end="")
             passed = False
 
         request = v1_images.build_request({"prompt": "x", "file_ids": ["file-a", "https://e.test/b.png"], "batch": True}, source="cli")
@@ -1748,6 +1775,188 @@ def test_image_mask_validation() -> bool:
         # The mask key must not be mistaken for a reference slot.
         if len(request.images) != 1:
             print(f"exp=1 reference (mask is not a slot), rec={len(request.images)} ", end="")
+            passed = False
+
+        # ...but a caller that never asked for it must be able to say so, or a mask left
+        # set from the console would silently shape every request that followed.
+        for refusal in (False, "none", "off", "false"):
+            refused = v1_images.build_request({"prompt": "x", "edit": True, "mask": refusal}, source="cli")
+            if refused.mask is not None:
+                print(f"exp=mask:{refusal!r} refuses the stored mask, rec=applied ", end="")
+                passed = False
+
+        # Leaving the key out is not the same as refusing: it still inherits.
+        if v1_images.build_request({"prompt": "x", "edit": True}, source="cli").mask is None:
+            print("exp=an omitted key still inherits, rec=refused ", end="")
+            passed = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_image_mask_persistence() -> bool:
+    """
+    A mask that only ever existed as bytes is written out beside the images it shaped, so
+    the manifest names a file rather than a bare 'upload:' label with nothing behind it.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing image mask persistence: bytes become a file the record can name... ", end="")
+
+    make_image_config()
+    passed = True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        common.cfg.image_output_dir      = tmp
+        common.cfg.image_manifest_enabled = True
+        base       = write_file(tmp, "base.png", make_png(64, 64))
+        mask_bytes = make_png(64, 64, alpha=True)
+        data_url   = "data:image/png;base64," + base64.b64encode(mask_bytes).decode("ascii")
+
+        request = v1_images.build_request(
+            {"prompt": "x", "filename": "redcoat", "images": [base], "mask": data_url, "n": 2}, source="cli")
+        saved = [v1_images.save_image_bytes(request, b"\x89PNG-one", "img_aaaa"),
+                 v1_images.save_image_bytes(request, b"\x89PNG-two", "img_bbbb")]
+        v1_images.append_manifest(request, saved, 0.01, {}, True)
+
+        with open(os.path.join(tmp, v1_images.MANIFEST_FILE), "r", encoding="utf-8") as handle:
+            records = json.load(handle)
+
+        masks = [record.get("mask") for record in records]
+        # One mask per request, whatever n was: it belongs to the request, not to any one
+        # image, so both records name the same file.
+        if masks != ["masks/redcoat.png", "masks/redcoat.png"]:
+            print(f"exp=both records name masks/redcoat.png, rec={masks} ", end="")
+            passed = False
+
+        written = os.path.join(tmp, "masks", "redcoat.png")
+        if not os.path.exists(written):
+            print(f"exp={written} written, rec=missing ", end="")
+            passed = False
+        elif Path(written).read_bytes() != mask_bytes:
+            print("exp=the mask's own bytes on disk, rec=something else ", end="")
+            passed = False
+
+        # A mask that already has a path is left where it is rather than copied.
+        on_disk = write_file(tmp, "hand.png", make_png(64, 64, alpha=True))
+        request = v1_images.build_request(
+            {"prompt": "x", "filename": "second", "images": [base], "mask": on_disk}, source="cli")
+        saved   = [v1_images.save_image_bytes(request, b"\x89PNG-three", "img_cccc")]
+        v1_images.append_manifest(request, saved, 0.01, {}, True)
+
+        with open(os.path.join(tmp, v1_images.MANIFEST_FILE), "r", encoding="utf-8") as handle:
+            records = json.load(handle)
+        if records[-1].get("mask") != "hand.png":
+            print(f"exp=hand.png named where it lies, rec={records[-1].get('mask')} ", end="")
+            passed = False
+        if os.path.exists(os.path.join(tmp, "masks", "second.png")):
+            print("exp=an on-disk mask is not copied, rec=copied ", end="")
+            passed = False
+
+        # A generation has no mask, and must not grow a masks/ folder or a record field.
+        request = v1_images.build_request({"prompt": "x", "filename": "plain"}, source="cli")
+        v1_images.append_manifest(request, [v1_images.save_image_bytes(request, b"\x89PNG-four", "img_dddd")],
+                                  0.01, {}, True)
+        with open(os.path.join(tmp, v1_images.MANIFEST_FILE), "r", encoding="utf-8") as handle:
+            records = json.load(handle)
+        if "mask" in records[-1]:
+            print(f"exp=no mask field on a generation, rec={records[-1]['mask']} ", end="")
+            passed = False
+
+        leftovers = [name for name in os.listdir(os.path.join(tmp, "masks")) if name.endswith(".part")]
+        if leftovers:
+            print(f"exp=no temp files, rec={leftovers} ", end="")
+            passed = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_image_data_url_references() -> bool:
+    """
+    A data URL is an upload by another route: bytes the caller already held, reaching no
+    filesystem. It is what lets a JSON request carry a mask it has no file for.
+    """
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing image data URLs: inline bytes, no filesystem... ", end="")
+
+    make_image_config()
+    passed = True
+
+    def data_url(payload: bytes, mediatype: str = "image/png") -> str:
+        return f"data:{mediatype};base64," + base64.b64encode(payload).decode("ascii")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        common.cfg.image_output_dir = tmp
+        base = write_file(tmp, "base.png", make_png(64, 64))
+
+        # A path names the reference, a data URL carries the mask: the two encodings mix,
+        # which is the point -- large references stay on disk, a drawn mask rides along.
+        request = v1_images.build_request(
+            {"prompt": "x", "images": [base], "mask": data_url(make_png(64, 64, alpha=True))}, source="cli")
+        if request.mask is None or request.mask.path or request.mask.data is None:
+            print(f"exp=mask held as bytes, rec={request.mask and request.mask.path!r} ", end="")
+            passed = False
+        elif (request.mask.width, request.mask.height) != (64, 64):
+            print(f"exp=64x64, rec={request.mask.width}x{request.mask.height} ", end="")
+            passed = False
+
+        # A reference may come the same way, so a caller holding no files at all still edits.
+        inline = v1_images.build_request(
+            {"prompt": "x", "images": [data_url(make_png(64, 64))]}, source="cli")
+        if len(inline.images) != 1 or inline.images[0].path:
+            print("exp=inline reference held as bytes, rec=otherwise ", end="")
+            passed = False
+
+        # Content decides, exactly as it does for a path or an upload: a mediatype that
+        # disagrees with the bytes is advisory, and a non-image is refused whatever it claims.
+        mislabelled = v1_images.build_request(
+            {"prompt": "x", "images": [data_url(make_png(64, 64), "image/jpeg")]}, source="cli")
+        if mislabelled.images[0].format != "png":
+            print(f"exp=png by content, rec={mislabelled.images[0].format} ", end="")
+            passed = False
+
+        cases = [
+            (data_url(JPEG_BYTES[:2])                      , "not a PNG, JPEG or WebP"),
+            ("data:image/png," + "x"*8                     , "only base64 data URLs"),
+            ("data:image/png;base64,!!!not-base64!!!"      , "not valid Base64"),
+            ("data:"                                       , "must look like"),
+        ]
+        for spec, expected in cases:
+            try:
+                v1_images.build_request({"prompt": "x", "images": [base], "mask": spec}, source="cli")
+            except Exception as exc:
+                if expected not in str(exc):
+                    print(f"exp={expected!r}, rec={exc} ", end="")
+                    passed = False
+                continue
+            print(f"exp={expected!r} rejected, rec=accepted ", end="")
+            passed = False
+
+        # Sized before it is decoded, so an oversized payload is never materialised.
+        common.cfg.image_edit_max_bytes = 1024
+        try:
+            v1_images.build_request(
+                {"prompt": "x", "images": [base], "mask": data_url(make_png(256, 256, alpha=True))}, source="cli")
+            print("exp=oversized inline mask rejected, rec=accepted ", end="")
+            passed = False
+        except Exception as exc:
+            if "IMAGE_EDIT_MAX_BYTES" not in str(exc):
+                print(f"exp=size cap cited, rec={exc} ", end="")
+                passed = False
+
+        # A prompt-supplied data URL touches no filesystem, so the path allowlist -- which
+        # exists to stop a prompt reading this disk -- has nothing to say about it.
+        common.cfg.image_edit_max_bytes         = 20*1024*1024
+        common.cfg.image_edit_allow_prompt_paths = False
+        try:
+            v1_images.build_request(
+                {"prompt": "x", "images": [data_url(make_png(64, 64))]}, source="chat")
+        except Exception as exc:
+            print(f"exp=inline reference allowed from a prompt, rec={exc} ", end="")
             passed = False
 
     if passed : print(f"{GREEN}PASS{RESET}")
@@ -2480,6 +2689,8 @@ if __name__ == "__main__":
     tests_passed += test_image_edit_batch_rules()
     tests_passed += test_image_edit_form()
     tests_passed += test_image_mask_validation()
+    tests_passed += test_image_mask_persistence()
+    tests_passed += test_image_data_url_references()
 
     tests_passed += test_image_source_files()
     tests_passed += test_image_batch_accounting()

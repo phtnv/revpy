@@ -428,12 +428,29 @@ IMAGE_EDIT_ROOTS=/home/you/pictures,/home/you/refs
 
 References are validated by content bytes, size and count before anything is sent. Multipart direct edits upload the caller's bytes and do not use the proxy host filesystem or prompt-path allowlist. `REQUEST_MAX_BYTES` caps multipart uploads.
 
-Optional masks must be PNGs with alpha, matching the first reference dimensions:
+Optional masks must be PNGs with alpha, matching the first reference dimensions. Fully transparent pixels are the region the model may repaint; everything opaque is left alone.
+
+Two things worth knowing before relying on one. The *whole* transparent region is regenerated, so the prompt should describe all of it rather than only what is being added. And with GPT Image the mask is guidance rather than a clipping path — a change will usually respect the boundary but may bleed past it, more so on a photograph than on flat colour.
 
 ```text
 image edit mask /home/you/pictures/coat_area.png
 image edit mask clear
 ```
+
+A mask set this way applies to every edit that does not name one of its own. A request that wants none says so with `mask: false` (or `"none"`/`"off"`) — leaving the key out still inherits the console's, which is the trap that value exists to avoid.
+
+### Inline references
+
+Any reference — a mask included — may be given as a base64 `data:` URL instead of a path:
+
+```json
+{"prompt": "…", "images": ["/home/you/pictures/coat.png"],
+ "mask": "data:image/png;base64,iVBORw0KGgo…"}
+```
+
+The two encodings mix freely, which is the point: large references stay on disk while something the caller holds only in memory — a mask drawn in an editor, a picture that was never a file — rides along inline. Inline bytes reach no filesystem, so the path allowlist does not apply to them, and they are held to exactly the checks an upload gets, `IMAGE_EDIT_MAX_BYTES` included (measured before decoding). Content decides the format; the mediatype in the URL is advisory.
+
+A mask that arrived as bytes is written into `masks/` under the output directory and the manifest names that file, so a record always points at something that exists. One file per request, whatever `n` was. A mask given as a path is recorded where it lies and never copied.
 
 Image calls retry gateway-class failures (502/503/504/520/522/524 and dropped connections). Tune with `IMAGE_RETRY_ATTEMPTS` and `IMAGE_RETRY_BACKOFF_SECONDS`.
 
@@ -460,6 +477,8 @@ Batched edits cannot upload local files; use provider file ids or URLs:
 ```
 
 `source_files` is optional local lineage for the manifest and never reaches the provider. It matters for batched edits because provider file ids expire.
+
+A batch **can** carry a mask, even though it can upload nothing: the JSON body takes a mask by the same reference shape it takes the images, so the bytes go inline as a data URL. Give it as a path or a `data:` URL exactly as for an immediate edit — the encoding is the proxy's problem, not the caller's.
 
 ```text
 image                  Show image status.
