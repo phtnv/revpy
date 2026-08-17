@@ -877,6 +877,18 @@ def get_bearer_token() -> str:
     return auth.strip()
 
 
+def check_proxy_key() -> None:
+    """
+    The proxy-key half of resolve_api_key, for routes that touch only this proxy's own recorded
+    state and so never resolve a provider key.
+
+    Enforced only when a PROXY_KEY exists, so a passthrough setup that works for generation is not
+    refused here. A client configured to generate is therefore configured for these too.
+    """
+    if cfg.require_proxy_key and cfg.proxy_key and get_bearer_token() != cfg.proxy_key:
+        abort(401, description="Invalid proxy key.")
+
+
 def resolve_api_key(configured_key: str, key_name: str) -> str:
     """
     Per-request auth shared by every backend.

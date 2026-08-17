@@ -35,6 +35,7 @@ from common import (
     PREFILL_MODES,
     UINT64_MAX,
     cfg,
+    check_proxy_key,
     content_to_plain_text,
     error_body,
     fmt_usd,
@@ -1790,6 +1791,12 @@ def multipart_edit_fields() -> Dict[str, Any]:
         if name in request.form:
             fields[name] = request.form[name]
 
+    # Structure has to travel as JSON here: a multipart body has no other way to carry it, which
+    # is why validate_annotation reads a string as well as an object.
+    for name in ("job_group", "job"):
+        if name in request.form:
+            fields[name] = request.form[name]
+
     return fields
 
 
@@ -1898,6 +1905,33 @@ def images_batch_list():
     """
     try:
         return jsonify({"data": v1_images.list_batches()})
+    except Exception as exc:
+        return make_error_response(exc, None)
+
+
+@app.route("/v1/images/manifest", methods=["PATCH"])
+def images_manifest_annotate():
+    """
+    Say which group and which attempt some images belong to.
+
+    The one writable path into this proxy's manifest, and narrow on purpose: it sets those two keys
+    and nothing else, so what an image *is* stays this proxy's to record. Held under the same lock
+    that appending takes, which is the reason it exists -- a client rewriting the file itself would
+    race a job landing.
+
+    Match a record by image_id, or by file for one written before ids were recorded. A null job
+    clears the stamp, which is how an attempt is filed back out of a group.
+    """
+    check_proxy_key()
+    payload = request.get_json(silent=True) or {}
+    updates = payload.get("updates")
+    if not isinstance(updates, list):
+        abort(400, description="expected an object with an 'updates' array.")
+    if len(updates) > 2000:
+        abort(400, description=f"{len(updates)} updates in one request; the limit is 2000.")
+
+    try:
+        return jsonify(v1_images.annotate_manifest(updates))
     except Exception as exc:
         return make_error_response(exc, None)
 

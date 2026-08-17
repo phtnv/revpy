@@ -52,6 +52,8 @@ ALLOWED_OVERRIDES = {
     "images", "mask", "edit", "file_ids",
     # Local lineage for provider-side references; recorded, never sent upstream.
     "source_files",
+    # Which line of work a request belongs to; recorded, never sent upstream.
+    "job_group", "job",
 }
 
 # Known OpenAI-client fields accepted for compatibility but ignored.
@@ -70,6 +72,13 @@ FORMAT_EXTENSIONS = {"png": ".png", "jpeg": ".jpg", "webp": ".webp"}
 
 # Allowed keys in manifest lineage entries.
 SOURCE_FILE_KEYS = {"file_id", "path", "file"}
+
+# Allowed keys in the job stamp: which group and which attempt produced an image. Recorded in the
+# manifest so a folder of pictures can say what line of work it came out of; never sent upstream.
+JOB_GROUP_KEYS = {"id", "name"}
+JOB_KEYS       = {"id", "parent", "comment", "run"}
+# A note on an attempt, not an essay. Long enough for a sentence about what was being tried.
+JOB_VALUE_MAX  = 500
 
 SIZE_RE     = re.compile(r"^(\d{1,5})\s*[x×]\s*(\d{1,5})$")
 # `data:<mediatype>;base64,` -- the mediatype is advisory, since the bytes are sniffed.
@@ -152,7 +161,9 @@ class ImageRequest:
                  images: Optional[List[ReferenceImage]] = None,
                  mask: Optional[ReferenceImage] = None,
                  file_ids: Optional[List[str]] = None,
-                 source_files: Optional[List[Dict[str, str]]] = None):
+                 source_files: Optional[List[Dict[str, str]]] = None,
+                 job_group: Optional[Dict[str, str]] = None,
+                 job: Optional[Dict[str, str]] = None):
         self.prompt        = prompt
         self.size          = size
         self.quality       = quality
@@ -170,6 +181,11 @@ class ImageRequest:
 
         # Empty means manifest_source_files() can derive lineage from local references.
         self.source_files = source_files or []
+
+        # Which group and which attempt this belongs to, as the caller stated it. Copied into the
+        # manifest verbatim and never sent upstream; this proxy does not interpret either.
+        self.job_group = job_group or {}
+        self.job       = job or {}
 
     @property
     def is_edit(self) -> bool:
@@ -847,6 +863,44 @@ def validate_source_files(specs: Any) -> List[Dict[str, str]]:
     return sources
 
 
+def validate_annotation(raw: Any, field_name: str, allowed: set) -> Dict[str, str]:
+    """
+    One job stamp: a flat map of short strings under known keys.
+
+    Accepts a JSON string as well as an object, because a multipart edit has no way to carry
+    structure -- the same reason source_files is read that way there.
+    """
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {}
+        try:
+            raw = json.loads(text)
+        except ValueError as exc:
+            raise ImageRequestError(f"{field_name} must be a JSON object: {exc}")
+
+    if not isinstance(raw, dict):
+        raise ImageRequestError(f"{field_name} must be an object, got {type(raw).__name__}.")
+
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ImageRequestError(f"unsupported {field_name} field(s) {unknown}; allowed: {sorted(allowed)}.")
+
+    stamp: Dict[str, str] = {}
+    for key, value in raw.items():
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            raise ImageRequestError(f"{field_name}.{key} must be a string, got {type(value).__name__}.")
+        text = str(value).strip()
+        if not text:
+            continue
+        if len(text) > JOB_VALUE_MAX:
+            raise ImageRequestError(f"{field_name}.{key} is {len(text)} characters; the limit is {JOB_VALUE_MAX}.")
+        stamp[key] = text
+    return stamp
+
+
 def resolve_edit_inputs(fields: Dict[str, Any], source: str, batch: bool) -> Tuple[List[ReferenceImage], Optional[ReferenceImage], List[str]]:
     """
     Decide whether this request edits, and against what:
@@ -967,6 +1021,16 @@ def build_request(overrides: Optional[Dict[str, Any]] = None, source: str = "dir
 
     source_files = validate_source_files(fields["source_files"]) if fields.get("source_files") else []
 
+    job_group = validate_annotation(fields["job_group"], "job_group", JOB_GROUP_KEYS) if fields.get("job_group") else {}
+    job       = validate_annotation(fields["job"]      , "job"      , JOB_KEYS      ) if fields.get("job")       else {}
+    # The attempt's id is what joins the images of one request to each other and to a group. A
+    # group named without one describes nothing that can be found again, so it is a mistake worth
+    # reporting rather than a stamp worth writing.
+    if job and not job.get("id"):
+        raise ImageRequestError("job.id is required when a job is given.")
+    if job_group and not job:
+        raise ImageRequestError("job_group needs a job; a group with no attempt in it records nothing joinable.")
+
     # Positional pairing, so a caller listing the same references in both fields does not
     # have to repeat each id inside the lineage entry it already lines up with. Only done
     # when the counts match and no entry named an id itself, since either of those means
@@ -989,6 +1053,8 @@ def build_request(overrides: Optional[Dict[str, Any]] = None, source: str = "dir
         mask          = mask,
         file_ids      = file_ids,
         source_files  = source_files,
+        job_group     = job_group,
+        job           = job,
     )
 
 
@@ -1318,6 +1384,10 @@ def append_manifest(req: ImageRequest, saved: List[SavedImage], cost_usd: float,
         sources = manifest_source_files(req)
         if sources:
             record["source_files"] = sources
+        if req.job_group:
+            record["job_group"] = dict(req.job_group)
+        if req.job:
+            record["job"] = dict(req.job)
         if cfg.image_manifest_prompts:
             record["prompt"] = req.prompt
         records.append(record)
@@ -1344,6 +1414,106 @@ def append_manifest(req: ImageRequest, saved: List[SavedImage], cost_usd: float,
             try: os.unlink(tmp_path)
             except OSError: pass
             print(f"WARNING: could not write {path} ({exc}).")
+
+
+def annotate_manifest(updates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Set the group and job keys on records already in the manifest, and nothing else.
+
+    This is the only writable path into this proxy's manifest, and it is deliberately narrow: a
+    client can say which attempt an image belongs to, and cannot touch what the image *is*. Provider,
+    model, prompt, parameters, cost and lineage stay this proxy's to record.
+
+    It exists because the alternative is worse. The manifest is rewritten whole under STORAGE_LOCK
+    whenever a job lands, so a client rewriting the file itself would race that and could drop a
+    record. Asking here has no such race.
+
+    A record is found by image_id, falling back to the file's basename for one written before ids
+    were recorded. Passing job as null clears both keys, which is what filing an attempt back out of
+    a group means.
+    """
+    if not cfg.image_manifest_enabled:
+        raise ImageRequestError("manifests are disabled on this proxy (IMAGE_MANIFEST_ENABLED=false).")
+
+    wanted: List[Dict[str, Any]] = []
+    for index, update in enumerate(updates):
+        if not isinstance(update, dict):
+            raise ImageRequestError(f"updates[{index}] must be an object.")
+        image_id = str(update.get("image_id", "") or "").strip()
+        file     = os.path.basename(str(update.get("file", "") or "").strip())
+        if not image_id and not file:
+            raise ImageRequestError(f"updates[{index}] must name a record by image_id or file.")
+
+        # Present-and-null is "clear it"; absent is "leave it as it is". The two are different
+        # instructions, so which keys were given has to survive validation.
+        entry: Dict[str, Any] = {"image_id": image_id, "file": file}
+        if "job_group" in update:
+            entry["job_group"] = validate_annotation(update["job_group"], "job_group", JOB_GROUP_KEYS) if update["job_group"] else None
+        if "job" in update:
+            entry["job"] = validate_annotation(update["job"], "job", JOB_KEYS) if update["job"] else None
+            if entry["job"] and not entry["job"].get("id"):
+                raise ImageRequestError(f"updates[{index}].job.id is required when a job is given.")
+        wanted.append(entry)
+
+    directory = output_dir_path()
+    path      = os.path.join(directory, MANIFEST_FILE)
+
+    with STORAGE_LOCK:
+        if not os.path.exists(path):
+            return {"changed": 0, "missing": [entry["image_id"] or entry["file"] for entry in wanted]}
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                records = json.load(handle)
+        except Exception as exc:
+            raise ImageRequestError(f"could not read {MANIFEST_FILE}: {exc}")
+        if not isinstance(records, list):
+            raise ImageRequestError(f"{MANIFEST_FILE} is not a JSON list.")
+
+        changed = 0
+        missing: List[str] = []
+        for entry in wanted:
+            found = None
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                if entry["image_id"] and str(record.get("image_id", "")) == entry["image_id"]:
+                    found = record
+                    break
+                if not entry["image_id"] and entry["file"]:
+                    named = str(record.get("file", "")) or os.path.basename(str(record.get("path", "")))
+                    if named == entry["file"]:
+                        found = record
+                        break
+            if found is None:
+                missing.append(entry["image_id"] or entry["file"])
+                continue
+
+            before = (found.get("job_group"), found.get("job"))
+            for key in ("job_group", "job"):
+                if key not in entry:
+                    continue
+                if entry[key]:
+                    found[key] = dict(entry[key])
+                else:
+                    found.pop(key, None)
+            if (found.get("job_group"), found.get("job")) != before:
+                changed += 1
+
+        # Written whole through a temporary file, as appending is: a failure here must leave the
+        # manifest that was there rather than half of a new one.
+        if changed:
+            tmp_path = f"{path}.{uuid.uuid4().hex[:8]}.part"
+            try:
+                with open(tmp_path, "w", encoding="utf-8") as handle:
+                    json.dump(records, handle, indent=2, ensure_ascii=False, default=str)
+                    handle.write("\n")
+                os.replace(tmp_path, path)
+            except Exception as exc:
+                try: os.unlink(tmp_path)
+                except OSError: pass
+                raise ImageRequestError(f"could not write {MANIFEST_FILE}: {exc}")
+
+    return {"changed": changed, "missing": missing}
 
 
 # Usage and cost
@@ -1654,6 +1824,10 @@ def request_to_state(req: ImageRequest) -> Dict[str, Any]:
         "source"        : req.source,
         "file_ids"      : list(req.file_ids),
         "source_files"  : [dict(entry) for entry in req.source_files],
+        # Carried so a batch retrieved days later is stamped as this proxy writes its record,
+        # whether or not the client that submitted it is still running.
+        "job_group"     : dict(req.job_group),
+        "job"           : dict(req.job),
     }
 
 
@@ -1673,6 +1847,8 @@ def state_to_request(entry: Dict[str, Any]) -> ImageRequest:
             {str(key): str(value) for key, value in item.items() if key in SOURCE_FILE_KEYS}
             for item in (entry.get("source_files") or []) if isinstance(item, dict)
         ],
+        job_group     = {str(key): str(value) for key, value in (entry.get("job_group") or {}).items() if key in JOB_GROUP_KEYS},
+        job           = {str(key): str(value) for key, value in (entry.get("job")       or {}).items() if key in JOB_KEYS},
     )
 
 
