@@ -2150,6 +2150,7 @@ def list_batches() -> List[Dict[str, Any]]:
             # the provider, so claiming one of its statuses would be inventing it.
             "status"        : str(entry.get("final_status") or ("settled" if retrieved else "pending")),
             "images"        : list(entry.get("images") or []),
+            "errors"        : list(entry.get("errors") or []),
             "requests"      : [
                 {
                     "custom_id"     : custom_id,
