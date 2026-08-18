@@ -1795,6 +1795,181 @@ def test_image_mask_validation() -> bool:
     return passed
 
 
+def test_image_manifest_patch() -> bool:
+    """The one writable path in: testimony can be corrected, measurement cannot."""
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing image manifest patch: corrections in, measurement out... ", end="")
+
+    make_image_config()
+    passed = True
+
+    def fail(what: str) -> None:
+        nonlocal passed
+        print(f"{what} ", end="")
+        passed = False
+
+    with tempfile.TemporaryDirectory() as tmp:
+        common.cfg.image_output_dir       = tmp
+        common.cfg.image_manifest_enabled = True
+        base   = write_file(tmp, "base.png", make_png(32, 32))
+        mask   = write_file(tmp, "alpha.png", make_png(32, 32, alpha=True))
+        region = {"size": {"width": 32, "height": 32}, "rects": [{"x": 1, "y": 2, "w": 3, "h": 4, "mode": "add"}]}
+
+        request = v1_images.build_request(
+            {"prompt": "a red coat", "filename": "redcoat", "images": [base], "mask": mask,
+             "mask_region": region, "size": "1024x1024"}, source="cli")
+        saved = [v1_images.save_image_bytes(request, b"\x89PNG-one", "img_aaaa")]
+        v1_images.append_manifest(request, saved, 0.01, {"input_tokens": 7}, True)
+
+        def record() -> dict:
+            with open(os.path.join(tmp, v1_images.MANIFEST_FILE), "r", encoding="utf-8") as handle:
+                return json.load(handle)[0]
+
+        # Everything a client can know better than the proxy, in one pass.
+        moved = {"size": {"width": 32, "height": 32}, "rects": [{"x": 0, "y": 0, "w": 8, "h": 8, "mode": "subtract"}]}
+        result = v1_images.patch_manifest([{
+            "image_id"          : "img_aaaa",
+            "prompt"            : "a red coat, wet cobbles",
+            "request_parameters": {"size": "1024x1536", "quality": "high"},
+            "mask"              : moved,
+            "provider"          : "openai",
+            "estimated_cost_usd": 0.25,
+            "cost_is_estimate"  : False,
+            "job"               : {"id": "job-1", "comment": "warmer"},
+            "job_group"         : {"id": "g-1", "name": "coats"},
+        }])
+        if result["changed"] != 1 or result["missing"]:
+            fail(f"exp=one record changed, rec={result}")
+
+        after = record()
+        if after.get("prompt") != "a red coat, wet cobbles":
+            fail(f"exp=the corrected prompt, rec={after.get('prompt')!r}")
+        # Merged, not replaced: a parameter the correction did not mention survives it.
+        if after.get("request_parameters", {}).get("size") != "1024x1536":
+            fail(f"exp=the corrected size, rec={after.get('request_parameters')}")
+        if after.get("request_parameters", {}).get("output_format") != "png":
+            fail(f"exp=output_format left alone, rec={after.get('request_parameters')}")
+        # The region is corrected; the picture the proxy rasterised is kept, since it cannot
+        # render it again from rectangles it was handed afterwards.
+        if after.get("mask", {}).get("rects") != moved["rects"]:
+            fail(f"exp=the corrected rectangles, rec={after.get('mask')}")
+        if after.get("mask", {}).get("file") != "alpha.png":
+            fail(f"exp=the rasterised mask kept, rec={after.get('mask')}")
+        if after.get("cost_is_estimate") is not False or after.get("estimated_cost_usd") != 0.25:
+            fail(f"exp=the corrected cost, rec={after.get('estimated_cost_usd')}")
+        if after.get("job", {}).get("comment") != "warmer":
+            fail(f"exp=the job stamp, rec={after.get('job')}")
+        # Measurement is untouched by a patch that never mentioned it.
+        if after.get("file") != "redcoat.png" or after.get("usage", {}).get("input_tokens") != 7:
+            fail(f"exp=file and usage left alone, rec={after.get('file')} {after.get('usage')}")
+
+        # Nothing to do is not a write: the manifest must not be rewritten on every poll.
+        if v1_images.patch_manifest([{"image_id": "img_aaaa", "prompt": "a red coat, wet cobbles"}])["changed"] != 0:
+            fail("exp=an identical patch changes nothing, rec=changed")
+
+        # Null clears; absent leaves alone.
+        v1_images.patch_manifest([{"image_id": "img_aaaa", "job": None, "mask": None}])
+        cleared = record()
+        if "job" in cleared or "mask" in cleared:
+            fail(f"exp=job and mask cleared, rec={sorted(cleared)}")
+        if cleared.get("prompt") != "a red coat, wet cobbles":
+            fail("exp=a key left out is left alone, rec=lost")
+
+        # A record nobody has is reported rather than invented.
+        if v1_images.patch_manifest([{"file": "nothing.png", "prompt": "x"}])["missing"] != ["nothing.png"]:
+            fail("exp=an unknown record reported missing, rec=otherwise")
+
+        # What the file *is* stays this proxy's to say.
+        for update, expected in [
+            ({"image_id": "img_aaaa", "bytes": 12}       , "unsupported"),
+            ({"image_id": "img_aaaa", "usage": {}}       , "unsupported"),
+            ({"image_id": "img_aaaa", "path": "e.png"}   , "unsupported"),
+            ({"image_id": "img_aaaa", "operation": "wat"}, "must be 'generate' or 'edit'"),
+            ({"prompt": "x"}                             , "must name a record"),
+        ]:
+            try:
+                v1_images.patch_manifest([update])
+                fail(f"exp={expected!r} rejected, rec=accepted for {sorted(update)}")
+            except Exception as exc:
+                if expected not in str(exc):
+                    fail(f"exp={expected}, rec={exc}")
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_image_mask_region() -> bool:
+    """The rectangles a mask was drawn as: recorded verbatim, validated, never acted on."""
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing image mask region: the rectangles behind the picture... ", end="")
+
+    make_image_config()
+    passed = True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        common.cfg.image_output_dir = tmp
+        base = write_file(tmp, "base.png", make_png(32, 32))
+        mask = write_file(tmp, "alpha.png", make_png(32, 32, alpha=True))
+        good = {"size": {"width": 32, "height": 32}, "rects": [{"x": 1, "y": 2, "w": 3, "h": 4, "mode": "add"}]}
+
+        def check(name: str, region: Any, expect_error: str = "", with_mask: bool = True) -> None:
+            nonlocal passed
+            fields: Dict[str, Any] = {"prompt": "x", "images": [base], "mask_region": region}
+            if with_mask:
+                fields["mask"] = mask
+            try:
+                request = v1_images.build_request(fields, source="cli")
+            except Exception as exc:
+                if not expect_error or expect_error not in str(exc):
+                    print(f"[{name}] exp={expect_error or 'accepted'}, rec={exc} ", end="")
+                    passed = False
+                return
+            if expect_error:
+                print(f"[{name}] exp={expect_error!r} rejected, rec=accepted ", end="")
+                passed = False
+            elif request.mask_region != good:
+                print(f"[{name}] exp={good}, rec={request.mask_region} ", end="")
+                passed = False
+
+        check("rectangles"       , good)
+        # Structure has to travel as a string through multipart, as the job stamps do.
+        check("as a JSON string" , json.dumps(good))
+        # Numbers as some clients spell them. Recorded as numbers either way, since a manifest
+        # read back has to give the same answer whichever door the request came in by.
+        check("numeric strings"  , {"size": {"width": "32", "height": "32"},
+                                    "rects": [{"x": "1", "y": "2", "w": "3", "h": "4", "mode": "add"}]})
+
+        check("not an object"    , "[]"                                        , "must be an object")
+        check("no size"          , {"rects": good["rects"]}                    , "size must be an object")
+        check("rects not a list" , {"size": good["size"], "rects": {}}         , "rects must be a list")
+        check("unknown rect key" , {"size": good["size"], "rects": [{"x": 1, "colour": "red"}]}, "unsupported")
+        check("bad mode"         , {"size": good["size"], "rects": [{"x": 1, "y": 1, "w": 1, "h": 1, "mode": "erase"}]},
+              "must be 'add' or 'subtract'")
+        check("unreadable number", {"size": good["size"], "rects": [{"x": "over there", "y": 1, "w": 1, "h": 1}]},
+              "must be a number")
+        check("too many rects"   , {"size": good["size"], "rects": [{"x": 0, "y": 0, "w": 1, "h": 1}] * 513},
+              "the limit is 512")
+
+        # A region describes a mask, so one arriving alone means the caller sent the two halves
+        # down different paths -- worth reporting rather than recording.
+        check("region, no mask"  , good, "without a mask", with_mask=False)
+
+        # A region with no rectangles selects nothing, so there is nothing to record.
+        empty = v1_images.build_request(
+            {"prompt": "x", "images": [base], "mask": mask, "size": "auto",
+             "mask_region": {"size": {"width": 32, "height": 32}, "rects": []}}, source="cli")
+        if empty.mask_region != {}:
+            print(f"exp=an empty region records nothing, rec={empty.mask_region} ", end="")
+            passed = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
 def test_image_mask_persistence() -> bool:
     """
     A mask that only ever existed as bytes is written out beside the images it shaped, so
@@ -1814,8 +1989,10 @@ def test_image_mask_persistence() -> bool:
         mask_bytes = make_png(64, 64, alpha=True)
         data_url   = "data:image/png;base64," + base64.b64encode(mask_bytes).decode("ascii")
 
+        region  = {"size": {"width": 64, "height": 64}, "rects": [{"x": 4, "y": 8, "w": 16, "h": 32, "mode": "add"}]}
         request = v1_images.build_request(
-            {"prompt": "x", "filename": "redcoat", "images": [base], "mask": data_url, "n": 2}, source="cli")
+            {"prompt": "x", "filename": "redcoat", "images": [base], "mask": data_url,
+             "mask_region": region, "n": 2}, source="cli")
         saved = [v1_images.save_image_bytes(request, b"\x89PNG-one", "img_aaaa"),
                  v1_images.save_image_bytes(request, b"\x89PNG-two", "img_bbbb")]
         v1_images.append_manifest(request, saved, 0.01, {}, True)
@@ -1825,9 +2002,11 @@ def test_image_mask_persistence() -> bool:
 
         masks = [record.get("mask") for record in records]
         # One mask per request, whatever n was: it belongs to the request, not to any one
-        # image, so both records name the same file.
-        if masks != ["masks/redcoat.png", "masks/redcoat.png"]:
-            print(f"exp=both records name masks/redcoat.png, rec={masks} ", end="")
+        # image, so both records say the same thing. The region is the durable half -- it can be
+        # read back, corrected and asked for again -- and the file is the picture it rasterised to.
+        expected = [{**region, "file": "masks/redcoat.png"}] * 2
+        if masks != expected:
+            print(f"exp={expected}, rec={masks} ", end="")
             passed = False
 
         written = os.path.join(tmp, "masks", "redcoat.png")
@@ -1847,7 +2026,9 @@ def test_image_mask_persistence() -> bool:
 
         with open(os.path.join(tmp, v1_images.MANIFEST_FILE), "r", encoding="utf-8") as handle:
             records = json.load(handle)
-        if records[-1].get("mask") != "hand.png":
+        # No region given, so the record says only where the picture is -- which is all a caller
+        # that never drew rectangles can honestly claim.
+        if records[-1].get("mask") != {"file": "hand.png"}:
             print(f"exp=hand.png named where it lies, rec={records[-1].get('mask')} ", end="")
             passed = False
         if os.path.exists(os.path.join(tmp, "masks", "second.png")):
@@ -2689,6 +2870,8 @@ if __name__ == "__main__":
     tests_passed += test_image_edit_batch_rules()
     tests_passed += test_image_edit_form()
     tests_passed += test_image_mask_validation()
+    tests_passed += test_image_manifest_patch()
+    tests_passed += test_image_mask_region()
     tests_passed += test_image_mask_persistence()
     tests_passed += test_image_data_url_references()
 

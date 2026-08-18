@@ -365,7 +365,7 @@ The reply comes back with a reference appended:
 
 If the user message contains only image blocks, the text backend is skipped.
 
-Allowed overrides are `prompt`, `size`, `quality`, `output_format`, `background`, `n`, `batch`, `filename`, `job_group`, `job`, and for editing `images`, `edit`, `mask`, `file_ids`, `source_files`. Everything else is proxy policy. `model` is accepted for OpenAI-client compatibility but ignored.
+Allowed overrides are `prompt`, `size`, `quality`, `output_format`, `background`, `n`, `batch`, `filename`, `job_group`, `job`, and for editing `images`, `edit`, `mask`, `mask_region`, `file_ids`, `source_files`. Everything else is proxy policy. `model` is accepted for OpenAI-client compatibility but ignored.
 
 `filename` is a bare name, never a path. Existing files are not overwritten; an index is appended. `size` may be `auto` or a valid model size; for `gpt-image-2`, `background: transparent` is rejected.
 

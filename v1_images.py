@@ -50,6 +50,8 @@ ALLOWED_OVERRIDES = {
     "prompt", "size", "quality", "output_format", "background", "n", "batch", "filename",
     # 'images' are local references; 'file_ids' are provider-side references for batches.
     "images", "mask", "edit", "file_ids",
+    # The rectangles the mask was drawn as; recorded beside it, never sent upstream.
+    "mask_region",
     # Local lineage for provider-side references; recorded, never sent upstream.
     "source_files",
     # Which line of work a request belongs to; recorded, never sent upstream.
@@ -77,6 +79,21 @@ SOURCE_FILE_KEYS = {"file_id", "path", "file"}
 # manifest so a folder of pictures can say what line of work it came out of; never sent upstream.
 JOB_GROUP_KEYS = {"id", "name"}
 JOB_KEYS       = {"id", "parent", "comment", "run"}
+
+# A mask region: the working-pixel size the rectangles are measured in, and the rectangles. Held
+# to a sane length because it is recorded verbatim, and a manifest is read far more often than
+# it is written.
+MASK_RECT_KEYS = {"x", "y", "w", "h", "mode"}
+MASK_RECT_MAX  = 512
+
+# What a client may correct in a record already written, and nothing else. The split is between
+# testimony and measurement: what a request *asked for* is something the person who made it can
+# know better than this proxy, while what the file is -- its name, its id, its bytes, the usage
+# the provider reported -- is measured here and is not the caller's to revise.
+PATCH_STRING_KEYS = {"prompt", "provider", "model", "created_at", "operation", "source", "batch_id"}
+PATCH_PARAM_KEYS  = {"size", "quality", "output_format", "background", "n"}
+PATCH_OTHER_KEYS  = {"image_id", "file", "job_group", "job", "mask", "request_parameters",
+                     "source_files", "estimated_cost_usd", "cost_is_estimate"}
 # A note on an attempt, not an essay. Long enough for a sentence about what was being tried.
 JOB_VALUE_MAX  = 500
 
@@ -160,6 +177,7 @@ class ImageRequest:
                  n: int, batch: bool, filename: str = "", source: str = "direct",
                  images: Optional[List[ReferenceImage]] = None,
                  mask: Optional[ReferenceImage] = None,
+                 mask_region: Optional[Dict[str, Any]] = None,
                  file_ids: Optional[List[str]] = None,
                  source_files: Optional[List[Dict[str, str]]] = None,
                  job_group: Optional[Dict[str, str]] = None,
@@ -177,6 +195,9 @@ class ImageRequest:
         # Local references and provider-side references are mutually exclusive.
         self.images   = images or []
         self.mask     = mask
+        # What the mask was drawn as. Recorded beside the picture it rasterised to and never sent
+        # upstream; the provider edits the PNG, and this is the form anyone can read back.
+        self.mask_region = mask_region or {}
         self.file_ids = file_ids or []
 
         # Empty means manifest_source_files() can derive lineage from local references.
@@ -863,6 +884,71 @@ def validate_source_files(specs: Any) -> List[Dict[str, str]]:
     return sources
 
 
+def validate_mask_region(raw: Any) -> Dict[str, Any]:
+    """
+    The rectangles a mask was drawn as, as the client states them.
+
+    Recorded verbatim and never sent upstream: what the provider edits is the PNG, and this is
+    what the PNG *meant* -- the form that can be read back, corrected and asked for again. The
+    proxy does not rasterise it, compare it against the mask, or act on it in any way.
+
+    Accepts a JSON string as well as an object, because a multipart edit has no way to carry
+    structure -- the same reason source_files and the job stamps are read that way there.
+    """
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {}
+        try:
+            raw = json.loads(text)
+        except ValueError as exc:
+            raise ImageRequestError(f"mask_region must be a JSON object: {exc}")
+
+    if not isinstance(raw, dict):
+        raise ImageRequestError(f"mask_region must be an object, got {type(raw).__name__}.")
+
+    size  = raw.get("size")
+    rects = raw.get("rects")
+    if not isinstance(size, dict):
+        raise ImageRequestError("mask_region.size must be an object with width and height.")
+    if not isinstance(rects, list):
+        raise ImageRequestError("mask_region.rects must be a list.")
+    if len(rects) > MASK_RECT_MAX:
+        raise ImageRequestError(f"{len(rects)} mask_region rectangles; the limit is {MASK_RECT_MAX}.")
+
+    def whole(value: Any, where: str) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            raise ImageRequestError(f"mask_region.{where} must be a number, got {value!r}.")
+
+    clean_rects: List[Dict[str, Any]] = []
+    for index, rect in enumerate(rects):
+        if not isinstance(rect, dict):
+            raise ImageRequestError(f"mask_region.rects[{index}] must be an object.")
+        unknown = sorted(set(rect) - MASK_RECT_KEYS)
+        if unknown:
+            raise ImageRequestError(f"unsupported mask_region.rects[{index}] field(s) {unknown}; allowed: {sorted(MASK_RECT_KEYS)}.")
+        mode = str(rect.get("mode", "add"))
+        if mode not in ("add", "subtract"):
+            raise ImageRequestError(f"mask_region.rects[{index}].mode must be 'add' or 'subtract', got {mode!r}.")
+        clean_rects.append({
+            "x"   : whole(rect.get("x", 0), f"rects[{index}].x"),
+            "y"   : whole(rect.get("y", 0), f"rects[{index}].y"),
+            "w"   : whole(rect.get("w", 0), f"rects[{index}].w"),
+            "h"   : whole(rect.get("h", 0), f"rects[{index}].h"),
+            "mode": mode,
+        })
+
+    # A region with no rectangles selects nothing, which is not a region worth recording.
+    if not clean_rects:
+        return {}
+    return {
+        "size" : {"width": whole(size.get("width", 0), "size.width"), "height": whole(size.get("height", 0), "size.height")},
+        "rects": clean_rects,
+    }
+
+
 def validate_annotation(raw: Any, field_name: str, allowed: set) -> Dict[str, str]:
     """
     One job stamp: a flat map of short strings under known keys.
@@ -1021,6 +1107,12 @@ def build_request(overrides: Optional[Dict[str, Any]] = None, source: str = "dir
 
     source_files = validate_source_files(fields["source_files"]) if fields.get("source_files") else []
 
+    mask_region = validate_mask_region(fields["mask_region"]) if fields.get("mask_region") else {}
+    # A region describes a mask, so one arriving without it describes nothing. Worth reporting
+    # rather than recording: it means the caller sent the two halves of a mask down different paths.
+    if mask_region and mask is None:
+        raise ImageRequestError("mask_region was given without a mask; it describes one, and records nothing on its own.")
+
     job_group = validate_annotation(fields["job_group"], "job_group", JOB_GROUP_KEYS) if fields.get("job_group") else {}
     job       = validate_annotation(fields["job"]      , "job"      , JOB_KEYS      ) if fields.get("job")       else {}
     # The attempt's id is what joins the images of one request to each other and to a group. A
@@ -1051,6 +1143,7 @@ def build_request(overrides: Optional[Dict[str, Any]] = None, source: str = "dir
         source        = source,
         images        = images,
         mask          = mask,
+        mask_region   = mask_region,
         file_ids      = file_ids,
         source_files  = source_files,
         job_group     = job_group,
@@ -1345,7 +1438,13 @@ def append_manifest(req: ImageRequest, saved: List[SavedImage], cost_usd: float,
 
     # Once for the request, before the loop: every record of a batch of n points at the
     # same mask file, and writing it n times would be n different files saying one thing.
-    mask_record = persist_mask(req, directory, req.filename or default_stem(saved[0].image_id))
+    mask_file   = persist_mask(req, directory, req.filename or default_stem(saved[0].image_id))
+    # What the mask was, rather than merely where its picture went. The region is the durable half
+    # -- it can be read back, corrected and asked for again, while the path only ever named a file
+    # that a move or a rename could leave pointing at nothing.
+    mask_record = dict(req.mask_region)
+    if mask_file:
+        mask_record["file"] = mask_file
 
     records = []
     for image in saved:
@@ -1416,29 +1515,55 @@ def append_manifest(req: ImageRequest, saved: List[SavedImage], cost_usd: float,
             print(f"WARNING: could not write {path} ({exc}).")
 
 
-def annotate_manifest(updates: List[Dict[str, Any]]) -> Dict[str, Any]:
+def patch_manifest(updates: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Set the group and job keys on records already in the manifest, and nothing else.
-
-    This is the only writable path into this proxy's manifest, and it is deliberately narrow: a
-    client can say which attempt an image belongs to, and cannot touch what the image *is*. Provider,
-    model, prompt, parameters, cost and lineage stay this proxy's to record.
-
-    It exists because the alternative is worse. The manifest is rewritten whole under STORAGE_LOCK
-    whenever a job lands, so a client rewriting the file itself would race that and could drop a
-    record. Asking here has no such race.
-
-    A record is found by image_id, falling back to the file's basename for one written before ids
-    were recorded. Passing job as null clears both keys, which is what filing an attempt back out of
-    a group means.
+    Correct records already in the manifest: what the request asked for, and which attempt it
+    belongs to.
     """
     if not cfg.image_manifest_enabled:
         raise ImageRequestError("manifests are disabled on this proxy (IMAGE_MANIFEST_ENABLED=false).")
+
+    def as_text(value: Any, where: str) -> str:
+        if not isinstance(value, (str, int, float)):
+            raise ImageRequestError(f"{where} must be a string, got {type(value).__name__}.")
+        return str(value).strip()
+
+    def as_params(raw: Any, where: str) -> Dict[str, Any]:
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw.strip() or "{}")
+            except ValueError as exc:
+                raise ImageRequestError(f"{where} must be a JSON object: {exc}")
+        if not isinstance(raw, dict):
+            raise ImageRequestError(f"{where} must be an object, got {type(raw).__name__}.")
+        unknown = sorted(set(raw) - PATCH_PARAM_KEYS)
+        if unknown:
+            raise ImageRequestError(f"unsupported {where} field(s) {unknown}; allowed: {sorted(PATCH_PARAM_KEYS)}.")
+        clean: Dict[str, Any] = {}
+        for key, value in raw.items():
+            if value is None:
+                clean[key] = None
+                continue
+            if key == "n":
+                try:
+                    clean[key] = int(value)
+                except (TypeError, ValueError):
+                    raise ImageRequestError(f"{where}.n must be an integer, got {value!r}.")
+            else:
+                clean[key] = as_text(value, f"{where}.{key}")
+        return clean
 
     wanted: List[Dict[str, Any]] = []
     for index, update in enumerate(updates):
         if not isinstance(update, dict):
             raise ImageRequestError(f"updates[{index}] must be an object.")
+
+        unknown = sorted(set(update) - PATCH_STRING_KEYS - PATCH_OTHER_KEYS)
+        if unknown:
+            raise ImageRequestError(
+                f"unsupported updates[{index}] field(s) {unknown}; this route records what a request "
+                f"asked for, not what the file is. Allowed: {sorted(PATCH_STRING_KEYS | PATCH_OTHER_KEYS)}.")
+
         image_id = str(update.get("image_id", "") or "").strip()
         file     = os.path.basename(str(update.get("file", "") or "").strip())
         if not image_id and not file:
@@ -1447,6 +1572,33 @@ def annotate_manifest(updates: List[Dict[str, Any]]) -> Dict[str, Any]:
         # Present-and-null is "clear it"; absent is "leave it as it is". The two are different
         # instructions, so which keys were given has to survive validation.
         entry: Dict[str, Any] = {"image_id": image_id, "file": file}
+
+        for key in sorted(PATCH_STRING_KEYS):
+            if key not in update:
+                continue
+            entry[key] = None if update[key] is None else as_text(update[key], f"updates[{index}].{key}")
+        if entry.get("operation") not in (None, "", "generate", "edit") and "operation" in entry:
+            raise ImageRequestError(f"updates[{index}].operation must be 'generate' or 'edit', got {entry['operation']!r}.")
+
+        if "request_parameters" in update:
+            entry["request_parameters"] = (
+                None if update["request_parameters"] is None
+                else as_params(update["request_parameters"], f"updates[{index}].request_parameters"))
+        if "mask" in update:
+            entry["mask"] = None if update["mask"] is None else validate_mask_region(update["mask"])
+        if "source_files" in update:
+            entry["source_files"] = validate_source_files(update["source_files"]) if update["source_files"] else None
+        if "estimated_cost_usd" in update:
+            if update["estimated_cost_usd"] is None:
+                entry["estimated_cost_usd"] = None
+            else:
+                try:
+                    entry["estimated_cost_usd"] = float(update["estimated_cost_usd"])
+                except (TypeError, ValueError):
+                    raise ImageRequestError(f"updates[{index}].estimated_cost_usd must be a number.")
+        if "cost_is_estimate" in update:
+            entry["cost_is_estimate"] = None if update["cost_is_estimate"] is None else bool(update["cost_is_estimate"])
+
         if "job_group" in update:
             entry["job_group"] = validate_annotation(update["job_group"], "job_group", JOB_GROUP_KEYS) if update["job_group"] else None
         if "job" in update:
@@ -1488,15 +1640,66 @@ def annotate_manifest(updates: List[Dict[str, Any]]) -> Dict[str, Any]:
                 missing.append(entry["image_id"] or entry["file"])
                 continue
 
-            before = (found.get("job_group"), found.get("job"))
-            for key in ("job_group", "job"):
+            # Compared over the whole record rather than key by key: several kinds of field are
+            # being written now, and "did this actually change anything" is one question, not nine.
+            before = json.dumps(found, sort_keys=True, default=str)
+
+            for key in sorted(PATCH_STRING_KEYS):
                 if key not in entry:
                     continue
                 if entry[key]:
-                    found[key] = dict(entry[key])
+                    found[key] = entry[key]
                 else:
                     found.pop(key, None)
-            if (found.get("job_group"), found.get("job")) != before:
+
+            for key in ("job_group", "job", "source_files"):
+                if key not in entry:
+                    continue
+                if entry[key]:
+                    found[key] = [dict(item) for item in entry[key]] if key == "source_files" else dict(entry[key])
+                else:
+                    found.pop(key, None)
+
+            # The region merges over what the record already said, so correcting the rectangles
+            # keeps the picture this proxy rasterised -- which it cannot render again.
+            if "mask" in entry:
+                if entry["mask"]:
+                    was = found.get("mask") if isinstance(found.get("mask"), dict) else {}
+                    found["mask"] = {**was, **entry["mask"]}
+                else:
+                    found.pop("mask", None)
+
+            # Merged for the reason the mask is: a proxy records parameters this route does not
+            # model, and a moderation setting must not be lost to a correction of the size beside it.
+            if "request_parameters" in entry:
+                if entry["request_parameters"] is None:
+                    found.pop("request_parameters", None)
+                else:
+                    params = dict(found.get("request_parameters") or {}) if isinstance(found.get("request_parameters"), dict) else {}
+                    for key, value in entry["request_parameters"].items():
+                        if value in (None, "", 0):
+                            params.pop(key, None)
+                        else:
+                            params[key] = value
+                    if params:
+                        found["request_parameters"] = params
+                    else:
+                        found.pop("request_parameters", None)
+
+            # The flag says how to read the number, so it goes when there is no number to read.
+            if "estimated_cost_usd" in entry:
+                if entry["estimated_cost_usd"]:
+                    found["estimated_cost_usd"] = entry["estimated_cost_usd"]
+                else:
+                    found.pop("estimated_cost_usd", None)
+                    found.pop("cost_is_estimate", None)
+            if "cost_is_estimate" in entry and found.get("estimated_cost_usd"):
+                if entry["cost_is_estimate"] is None:
+                    found.pop("cost_is_estimate", None)
+                else:
+                    found["cost_is_estimate"] = entry["cost_is_estimate"]
+
+            if json.dumps(found, sort_keys=True, default=str) != before:
                 changed += 1
 
         # Written whole through a temporary file, as appending is: a failure here must leave the
@@ -1826,6 +2029,7 @@ def request_to_state(req: ImageRequest) -> Dict[str, Any]:
         "source_files"  : [dict(entry) for entry in req.source_files],
         # Carried so a batch retrieved days later is stamped as this proxy writes its record,
         # whether or not the client that submitted it is still running.
+        "mask_region"   : dict(req.mask_region),
         "job_group"     : dict(req.job_group),
         "job"           : dict(req.job),
     }
@@ -1847,6 +2051,9 @@ def state_to_request(entry: Dict[str, Any]) -> ImageRequest:
             {str(key): str(value) for key, value in item.items() if key in SOURCE_FILE_KEYS}
             for item in (entry.get("source_files") or []) if isinstance(item, dict)
         ],
+        # Re-validated rather than trusted: this comes off disk, where a hand-edited state file is
+        # as likely as one we wrote.
+        mask_region   = validate_mask_region(entry.get("mask_region")) if entry.get("mask_region") else {},
         job_group     = {str(key): str(value) for key, value in (entry.get("job_group") or {}).items() if key in JOB_GROUP_KEYS},
         job           = {str(key): str(value) for key, value in (entry.get("job")       or {}).items() if key in JOB_KEYS},
     )

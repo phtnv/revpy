@@ -1793,7 +1793,7 @@ def multipart_edit_fields() -> Dict[str, Any]:
 
     # Structure has to travel as JSON here: a multipart body has no other way to carry it, which
     # is why validate_annotation reads a string as well as an object.
-    for name in ("job_group", "job"):
+    for name in ("job_group", "job", "mask_region"):
         if name in request.form:
             fields[name] = request.form[name]
 
@@ -1910,17 +1910,21 @@ def images_batch_list():
 
 
 @app.route("/v1/images/manifest", methods=["PATCH"])
-def images_manifest_annotate():
+def images_manifest_patch():
     """
-    Say which group and which attempt some images belong to.
+    Correct what some records say about the requests that made them.
 
-    The one writable path into this proxy's manifest, and narrow on purpose: it sets those two keys
-    and nothing else, so what an image *is* stays this proxy's to record. Held under the same lock
-    that appending takes, which is the reason it exists -- a client rewriting the file itself would
-    race a job landing.
+    The one writable path into this proxy's manifest, held under the same lock that appending
+    takes -- which is the reason it exists: a client rewriting the file itself would race a job
+    landing and could drop a record.
 
-    Match a record by image_id, or by file for one written before ids were recorded. A null job
-    clears the stamp, which is how an attempt is filed back out of a group.
+    What may be corrected is testimony: the prompt, the request parameters, the mask's region, the
+    lineage, the provider and model named, when it was made, what it cost, and which attempt it
+    belongs to. What may not is measurement -- `file`, `image_id`, `bytes` and the provider's
+    `usage` describe the file this proxy wrote.
+
+    Match a record by image_id, or by file for one written before ids were recorded. A key left out
+    is left alone; a null clears it, which for `job` is how an attempt is filed back out of a group.
     """
     check_proxy_key()
     payload = request.get_json(silent=True) or {}
@@ -1931,7 +1935,7 @@ def images_manifest_annotate():
         abort(400, description=f"{len(updates)} updates in one request; the limit is 2000.")
 
     try:
-        return jsonify(v1_images.annotate_manifest(updates))
+        return jsonify(v1_images.patch_manifest(updates))
     except Exception as exc:
         return make_error_response(exc, None)
 
