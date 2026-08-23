@@ -372,10 +372,12 @@ Allowed overrides are `prompt`, `size`, `quality`, `output_format`, `background`
 ### Direct endpoints
 
 ```text
-POST /v1/images/generations    text to image
-POST /v1/images/edits          image to image
-GET  /v1/images/batches        every batch submitted from this output directory
-GET  /v1/images/batches/<n>    one batch, retrieving it if it has completed
+POST  /v1/images/generations   text to image
+POST  /v1/images/edits         image to image
+GET   /v1/images/batches       every batch submitted from this output directory
+GET   /v1/images/batches/<n>   one batch, retrieving it if it has completed
+PATCH /v1/images/manifest      correct what records say about the requests that made them
+POST  /v1/images/rename        rename one image, and every mention of it in the manifest
 ```
 
 Direct routes fill omitted fields from config. They return `b64_json` by default for OpenAI SDK compatibility, always include the saved `path`, and accept `"response_format": "path"` for metadata-only responses.

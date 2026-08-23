@@ -1253,35 +1253,14 @@ def output_dir_path() -> str:
     return path
 
 
-def allocate_path(directory: str, stem: str, extension: str) -> str:
+def confine(directory: str, candidate: str) -> str:
     """
-    A free path under `directory`. An existing file is never overwritten: a linear index
-    is appended until the name is free. Call with STORAGE_LOCK held.
+    `candidate` back again if it really is inside `directory`, and a rejection if it is not.
 
-    Freedom is judged case-insensitively, which is stricter than Linux requires and exactly
-    what Windows enforces. Deciding it by os.path.exists would make the same directory
-    behave differently on the two -- 'Cat.png' beside 'cat.png' on one, silently indexed on
-    the other -- and the manifest is meant to describe a directory that can be copied
-    between them unchanged.
-
-    The result is confined to the output directory even if the stem somehow survived
-    sanitisation -- storage is the last place able to catch that, and a path escaping
-    here would be the model writing wherever it liked.
+    Storage is the last place able to catch a name that somehow survived sanitisation: everything
+    above validates a *stem*, and this validates the path it turned into. A path escaping here
+    would be the model, or a client, writing wherever it liked.
     """
-    try:
-        taken = {name.lower() for name in os.listdir(directory)}
-    except OSError:
-        # A directory we cannot list is one we are about to fail to write into anyway; let
-        # that failure happen at the write, where it says something useful.
-        taken = set()
-
-    name      = f"{stem}{extension}"
-    index     = 1
-    while name.lower() in taken:
-        name = f"{stem}_{index}{extension}"
-        index += 1
-    candidate = os.path.join(directory, name)
-
     root     = os.path.realpath(directory)
     resolved = os.path.realpath(candidate)
     try:
@@ -1294,6 +1273,38 @@ def allocate_path(directory: str, stem: str, extension: str) -> str:
         raise ImageRequestError(f"refusing to write outside {cfg.image_output_dir}.")
 
     return candidate
+
+
+def taken_names(directory: str) -> set:
+    """
+    Every name `directory` holds, lowercased -- so a name is judged taken case-insensitively,
+    which is stricter than Linux requires and exactly what Windows enforces. Deciding it by
+    os.path.exists would make the same directory behave differently on the two -- 'Cat.png'
+    beside 'cat.png' on one, silently indexed on the other -- and the manifest is meant to
+    describe a directory that can be copied between them unchanged. Call with STORAGE_LOCK held.
+    """
+    try:
+        return {entry.lower() for entry in os.listdir(directory)}
+    except OSError:
+        # A directory we cannot list is one we are about to fail to write into anyway; let
+        # that failure happen at the write, where it says something useful.
+        return set()
+
+
+def allocate_path(directory: str, stem: str, extension: str) -> str:
+    """
+    A free path under `directory`. An existing file is never overwritten: a linear index
+    is appended until the name is free. Call with STORAGE_LOCK held.
+    """
+    taken = taken_names(directory)
+
+    name  = f"{stem}{extension}"
+    index = 1
+    while name.lower() in taken:
+        name = f"{stem}_{index}{extension}"
+        index += 1
+
+    return confine(directory, os.path.join(directory, name))
 
 
 def default_stem(image_id: str) -> str:
@@ -1515,6 +1526,59 @@ def append_manifest(req: ImageRequest, saved: List[SavedImage], cost_usd: float,
             print(f"WARNING: could not write {path} ({exc}).")
 
 
+def read_manifest(path: str) -> List[Any]:
+    """
+    The manifest as a list, for a route about to rewrite it. Call with STORAGE_LOCK held.
+
+    Unreadable is an error here rather than the warning append_manifest settles for: appending
+    has an image already on disk and must not lose it to a corrupt manifest, while a route that
+    rewrites has nothing to salvage and no business overwriting what it could not read.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            records = json.load(handle)
+    except Exception as exc:
+        raise ImageRequestError(f"could not read {MANIFEST_FILE}: {exc}")
+    if not isinstance(records, list):
+        raise ImageRequestError(f"{MANIFEST_FILE} is not a JSON list.")
+    return records
+
+
+def write_manifest(path: str, records: List[Any]) -> None:
+    """
+    The manifest written whole through a temporary file, as appending is: a failure must leave
+    the manifest that was there rather than half of a new one. Call with STORAGE_LOCK held.
+    """
+    tmp_path = f"{path}.{uuid.uuid4().hex[:8]}.part"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(records, handle, indent=2, ensure_ascii=False, default=str)
+            handle.write("\n")
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        try: os.unlink(tmp_path)
+        except OSError: pass
+        raise ImageRequestError(f"could not write {MANIFEST_FILE}: {exc}")
+
+
+def find_record(records: List[Any], image_id: str, file: str) -> Optional[Dict[str, Any]]:
+    """
+    The record a client is naming: by the proxy's own id, or by filename for one written before
+    ids were recorded. An id is unique; a filename is only as unique as the directory holding it,
+    so it is the fallback rather than the join.
+    """
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if image_id and str(record.get("image_id", "")) == image_id:
+            return record
+        if not image_id and file:
+            named = str(record.get("file", "")) or os.path.basename(str(record.get("path", "")))
+            if named == file:
+                return record
+    return None
+
+
 def patch_manifest(updates: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Correct records already in the manifest: what the request asked for, and which attempt it
@@ -1613,29 +1677,12 @@ def patch_manifest(updates: List[Dict[str, Any]]) -> Dict[str, Any]:
     with STORAGE_LOCK:
         if not os.path.exists(path):
             return {"changed": 0, "missing": [entry["image_id"] or entry["file"] for entry in wanted]}
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                records = json.load(handle)
-        except Exception as exc:
-            raise ImageRequestError(f"could not read {MANIFEST_FILE}: {exc}")
-        if not isinstance(records, list):
-            raise ImageRequestError(f"{MANIFEST_FILE} is not a JSON list.")
+        records = read_manifest(path)
 
         changed = 0
         missing: List[str] = []
         for entry in wanted:
-            found = None
-            for record in records:
-                if not isinstance(record, dict):
-                    continue
-                if entry["image_id"] and str(record.get("image_id", "")) == entry["image_id"]:
-                    found = record
-                    break
-                if not entry["image_id"] and entry["file"]:
-                    named = str(record.get("file", "")) or os.path.basename(str(record.get("path", "")))
-                    if named == entry["file"]:
-                        found = record
-                        break
+            found = find_record(records, entry["image_id"], entry["file"])
             if found is None:
                 missing.append(entry["image_id"] or entry["file"])
                 continue
@@ -1702,21 +1749,146 @@ def patch_manifest(updates: List[Dict[str, Any]]) -> Dict[str, Any]:
             if json.dumps(found, sort_keys=True, default=str) != before:
                 changed += 1
 
-        # Written whole through a temporary file, as appending is: a failure here must leave the
-        # manifest that was there rather than half of a new one.
         if changed:
-            tmp_path = f"{path}.{uuid.uuid4().hex[:8]}.part"
-            try:
-                with open(tmp_path, "w", encoding="utf-8") as handle:
-                    json.dump(records, handle, indent=2, ensure_ascii=False, default=str)
-                    handle.write("\n")
-                os.replace(tmp_path, path)
-            except Exception as exc:
-                try: os.unlink(tmp_path)
-                except OSError: pass
-                raise ImageRequestError(f"could not write {MANIFEST_FILE}: {exc}")
+            write_manifest(path, records)
 
     return {"changed": changed, "missing": missing}
+
+
+def rename_in_records(records: List[Any], directory: str, was: str, now: str) -> int:
+    """
+    Every mention of one file rewritten to its new name, and how many records had to change.
+
+    The record *of* it, and every record naming it as a source, as a source image or as a mask --
+    an edit's lineage points at a file on this disk precisely because a provider id expires and a
+    path does not, so a rename that only fixed the record of the file itself would quietly break
+    the history of everything made from it.
+
+    The mirror of `renameInRecords` in mini-img's src/manifest.ts, which does exactly this for the
+    manifests that app owns. Records are rewritten in place; the caller writes the list back.
+    """
+    def here(value: str) -> str:
+        return os.path.normcase(os.path.abspath(os.path.join(directory, value)))
+
+    before   = here(was)
+    recorded = manifest_path(os.path.join(directory, now), directory)
+
+    def is_target(value: Any) -> bool:
+        text = str(value or "")
+        # An upload never had a name on this disk to keep up to date.
+        if not text or text.startswith("upload:"):
+            return False
+        return here(text) == before
+
+    changed = 0
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        touched = False
+
+        if is_target(record.get("path") or record.get("file")):
+            record["file"] = now
+            record["path"] = recorded
+            touched = True
+
+        sources = record.get("source_files")
+        if isinstance(sources, list):
+            for entry in sources:
+                if isinstance(entry, dict) and is_target(entry.get("path")):
+                    entry["path"] = recorded
+                    # `file` follows only where it was recorded: absent means the reference went
+                    # up as bytes, and never had a name here to keep up to date.
+                    if entry.get("file"):
+                        entry["file"] = now
+                    touched = True
+
+        images = record.get("source_images")
+        if isinstance(images, list):
+            for index, origin in enumerate(images):
+                if isinstance(origin, str) and is_target(origin):
+                    images[index] = recorded
+                    touched = True
+
+        mask = record.get("mask")
+        if isinstance(mask, dict) and is_target(mask.get("file")):
+            mask["file"] = recorded
+            touched = True
+
+        if touched:
+            changed += 1
+
+    return changed
+
+
+def rename_image(image_id: str, file: str, filename: str) -> Dict[str, Any]:
+    """
+    Rename one image this proxy wrote, and follow the new name through the manifest.
+
+    Deliberately not part of PATCH /v1/images/manifest, which refuses `file` on the grounds that a
+    record's filename is measurement rather than testimony -- it describes the file this proxy
+    wrote. That still holds: a rename does not correct the measurement, it changes the thing being
+    measured, and only the process holding STORAGE_LOCK can move the file and rewrite its record
+    without racing a job landing beside it.
+
+    The extension is imposed rather than chosen, as it is on the way in: the bytes decide the
+    format, and a rename from .png to .webp would leave the manifest describing a file that is
+    not what it says it is.
+    """
+    if not cfg.image_manifest_enabled:
+        raise ImageRequestError("manifests are disabled on this proxy (IMAGE_MANIFEST_ENABLED=false).")
+
+    image_id = str(image_id or "").strip()
+    file     = os.path.basename(str(file or "").strip())
+    if not image_id and not file:
+        raise ImageRequestError("name the image to rename by image_id or file.")
+
+    wanted    = str(filename or "").strip()
+    stem      = sanitize_filename_stem(wanted)
+    asked     = os.path.splitext(wanted)[1]
+
+    directory = output_dir_path()
+    path      = os.path.join(directory, MANIFEST_FILE)
+
+    with STORAGE_LOCK:
+        if not os.path.exists(path):
+            raise ImageRequestError(f"there is no {MANIFEST_FILE} in the output directory.")
+
+        records = read_manifest(path)
+        found   = find_record(records, image_id, file)
+        if found is None:
+            raise ImageRequestError(f"no record of {image_id or file} in {MANIFEST_FILE}.")
+
+        was = str(found.get("file", "")) or os.path.basename(str(found.get("path", "")))
+        if not was:
+            raise ImageRequestError(f"the record of {image_id or file} does not name a file to rename.")
+
+        held = os.path.splitext(was)[1]
+        if asked.lower() != held.lower():
+            raise ImageRequestError(
+                f"keep the {held} -- a rename does not change the format, and {wanted!r} asks for "
+                f"{asked or 'no extension'}.")
+
+        name = f"{stem}{held}"
+        if name == was:
+            return {"name": was, "changed": 0}
+
+        old_path = confine(directory, os.path.join(directory, was))
+        new_path = confine(directory, os.path.join(directory, name))
+        if not os.path.exists(old_path):
+            raise ImageRequestError(f"{was} is recorded but is no longer in the output directory.")
+
+        # A change of case alone is the file being renamed to itself, which Windows performs
+        # happily and which `taken_names` would otherwise read as a collision with itself.
+        itself = os.path.normcase(old_path) == os.path.normcase(new_path)
+        if not itself and name.lower() in taken_names(directory):
+            raise ImageRequestError(f"{name} is already taken in the output directory.")
+
+        os.replace(old_path, new_path)
+
+        changed = rename_in_records(records, directory, was, name)
+        write_manifest(path, records)
+
+    return {"name": name, "changed": changed}
 
 
 # Usage and cost

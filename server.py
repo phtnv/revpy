@@ -1940,6 +1940,38 @@ def images_manifest_patch():
         return make_error_response(exc, None)
 
 
+@app.route("/v1/images/rename", methods=["POST"])
+def images_rename():
+    """
+    Rename one image this proxy wrote, and bring its record with it.
+
+    Its own route rather than a field of the manifest patch, which refuses `file` because a
+    record's filename describes the file on disk rather than what was asked for. Renaming does not
+    correct that description -- it changes what is being described -- and it has to move the file
+    and rewrite the manifest together, under the lock appending takes. A client doing it itself
+    would leave the manifest naming something that is no longer there.
+
+    Every other record that names the file follows it, as a source or as a mask, so an edit's
+    lineage still points at a real file.
+
+    Name the image by `image_id`, or by `file` for one written before ids were recorded. The
+    extension is not the caller's to change: the bytes decide the format.
+    """
+    check_proxy_key()
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        abort(400, description="expected a JSON object.")
+
+    try:
+        return jsonify(v1_images.rename_image(
+            payload.get("image_id", ""),
+            payload.get("file", ""),
+            payload.get("filename", ""),
+        ))
+    except Exception as exc:
+        return make_error_response(exc, payload)
+
+
 @app.route("/images/batches/<token>"   , methods=["GET"])
 @app.route("/v1/images/batches/<token>", methods=["GET"])
 def images_batch_status(token: str):

@@ -1900,6 +1900,133 @@ def test_image_manifest_patch() -> bool:
     return passed
 
 
+def test_image_rename() -> bool:
+    """A rename moves the file and brings every mention of it in the manifest along."""
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing image rename: the file moves and its lineage follows... ", end="")
+
+    make_image_config()
+    passed = True
+
+    def fail(what: str) -> None:
+        nonlocal passed
+        print(f"{what} ", end="")
+        passed = False
+
+    with tempfile.TemporaryDirectory() as tmp:
+        common.cfg.image_output_dir       = tmp
+        common.cfg.image_manifest_enabled = True
+        mask = write_file(tmp, "alpha.png", make_png(32, 32, alpha=True))
+
+        # One generated image, then an edit of it: the second record names the first as a source,
+        # which is the half a rename would strand if it only fixed the record of the file itself.
+        png   = make_png(32, 32)
+        first = v1_images.build_request({"prompt": "a coat", "filename": "redcoat"}, source="cli")
+        v1_images.append_manifest(first, [v1_images.save_image_bytes(first, png, "img_aaaa")],
+                                  0.01, {"input_tokens": 7}, True)
+        made = os.path.join(tmp, "redcoat.png")
+
+        second = v1_images.build_request(
+            {"prompt": "a wet coat", "filename": "redcoat_wet", "images": [made], "mask": mask,
+             "mask_region": {"size": {"width": 32, "height": 32},
+                             "rects": [{"x": 1, "y": 2, "w": 3, "h": 4, "mode": "add"}]}},
+            source="cli")
+        v1_images.append_manifest(second, [v1_images.save_image_bytes(second, png, "img_bbbb")],
+                                  0.02, {"input_tokens": 9}, True)
+
+        def records() -> list:
+            with open(os.path.join(tmp, v1_images.MANIFEST_FILE), "r", encoding="utf-8") as handle:
+                return json.load(handle)
+
+        result = v1_images.rename_image("img_aaaa", "", "coat_final.png")
+        if result != {"name": "coat_final.png", "changed": 2}:
+            fail(f"exp=the file and the edit that used it, rec={result}")
+
+        if not os.path.exists(os.path.join(tmp, "coat_final.png")):
+            fail("exp=the file under its new name, rec=missing")
+        if os.path.exists(made):
+            fail("exp=nothing left under the old name, rec=still there")
+
+        one, two = records()
+        if one.get("file") != "coat_final.png" or one.get("path") != "coat_final.png":
+            fail(f"exp=the record renamed, rec={one.get('file')} {one.get('path')}")
+        if one.get("image_id") != "img_aaaa" or one.get("bytes") != len(png):
+            fail(f"exp=the rest of the measurement untouched, rec={one.get('image_id')} {one.get('bytes')}")
+
+        # The lineage: named twice, as a source file and as a source image, and both follow.
+        if [entry.get("file") for entry in two.get("source_files", [])] != ["coat_final.png"]:
+            fail(f"exp=the source renamed, rec={two.get('source_files')}")
+        if [entry.get("path") for entry in two.get("source_files", [])] != ["coat_final.png"]:
+            fail(f"exp=the source path renamed, rec={two.get('source_files')}")
+        if two.get("source_images") != ["coat_final.png"]:
+            fail(f"exp=the source image renamed, rec={two.get('source_images')}")
+        # A mask is a different file, and a rename of the image is not a rename of it.
+        if two.get("mask", {}).get("file") != "alpha.png":
+            fail(f"exp=the mask left alone, rec={two.get('mask')}")
+
+        # Renaming to what it is already called is not a write.
+        if v1_images.rename_image("img_aaaa", "", "coat_final.png") != {"name": "coat_final.png", "changed": 0}:
+            fail("exp=a rename to the same name changes nothing, rec=changed")
+
+        # A change of case alone is the file being renamed to itself, not a collision with it.
+        if v1_images.rename_image("img_aaaa", "", "Coat_Final.PNG")["name"] != "Coat_Final.png":
+            fail("exp=a change of case accepted, rec=refused")
+
+        # Matched by filename, for a record written before ids were recorded.
+        if v1_images.rename_image("", "Coat_Final.png", "coat.png")["name"] != "coat.png":
+            fail("exp=matched by file, rec=otherwise")
+
+        # Over HTTP, which is how mini-img asks: its own route rather than a field of the patch.
+        was_required = common.cfg.require_proxy_key
+        common.cfg.require_proxy_key = False
+        client = server.app.test_client()
+        try:
+            reply = client.post("/v1/images/rename", json={"image_id": "img_aaaa", "filename": "coat_http.png"})
+            if reply.status_code != 200 or reply.get_json().get("name") != "coat_http.png":
+                fail(f"exp=200 renaming, rec={reply.status_code} {reply.get_json()}")
+            # The refusal reaches the caller as a message it can show, not a bare status.
+            reply = client.post("/v1/images/rename", json={"image_id": "img_aaaa", "filename": "coat.webp"})
+            if reply.status_code != 400 or "keep the .png" not in reply.get_json()["error"]["message"]:
+                fail(f"exp=400 keeping the extension, rec={reply.status_code} {reply.get_json()}")
+            # A body naming no record is a 400 rather than a rename of something arbitrary.
+            reply = client.post("/v1/images/rename", json={"filename": "coat.png"})
+            if reply.status_code != 400 or "image_id or file" not in reply.get_json()["error"]["message"]:
+                fail(f"exp=400 naming no record, rec={reply.status_code} {reply.get_json()}")
+        finally:
+            common.cfg.require_proxy_key = was_required
+        v1_images.rename_image("img_aaaa", "", "coat.png")
+
+        for call, expected in [
+            (("img_bbbb", "", "redcoat_wet.webp") , "keep the .png"),
+            (("img_bbbb", "", "coat.png")         , "already taken"),
+            (("img_bbbb", "", "nul.png")          , "reserved device name"),
+            (("img_bbbb", "", "sub/coat.png")     , "bare name"),
+            (("img_bbbb", "", "")                 , "must not be empty"),
+            (("", "", "coat.png")                 , "by image_id or file"),
+            (("img_zzzz", "", "coat.png")         , "no record of img_zzzz"),
+        ]:
+            try:
+                v1_images.rename_image(*call)
+                fail(f"exp={expected!r} rejected, rec=accepted for {call}")
+            except Exception as exc:
+                if expected not in str(exc):
+                    fail(f"exp={expected}, rec={exc}")
+
+        # A record whose file has been deleted under it is a rename with nothing to move.
+        os.unlink(os.path.join(tmp, "coat.png"))
+        try:
+            v1_images.rename_image("img_aaaa", "", "gone.png")
+            fail("exp=a missing file refused, rec=accepted")
+        except Exception as exc:
+            if "no longer in the output directory" not in str(exc):
+                fail(f"exp=a missing file refused, rec={exc}")
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
 def test_image_mask_region() -> bool:
     """The rectangles a mask was drawn as: recorded verbatim, validated, never acted on."""
     global tests_ttl
@@ -2871,6 +2998,7 @@ if __name__ == "__main__":
     tests_passed += test_image_edit_form()
     tests_passed += test_image_mask_validation()
     tests_passed += test_image_manifest_patch()
+    tests_passed += test_image_rename()
     tests_passed += test_image_mask_region()
     tests_passed += test_image_mask_persistence()
     tests_passed += test_image_data_url_references()
