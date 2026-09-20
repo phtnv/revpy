@@ -24,7 +24,7 @@ REASONING_SUMMARIES = {"none", "auto", "concise", "detailed"}
 # 'transparent' is deliberately absent from the backgrounds: gpt-image-2 does not support
 # it, and offering a value the model will reject is worse than not offering it at all.
 IMAGE_RESPONSE_FORMATS = {"b64_json", "path"}
-IMAGE_QUALITIES   = {"auto", "low", "medium", "high"}
+IMAGE_QUALITIES   = {"auto", "low", "medium", "high", "xhigh", "max"}
 IMAGE_FORMATS     = {"png", "jpeg", "webp"}
 IMAGE_BACKGROUNDS = {"opaque", "automatic"}
 
