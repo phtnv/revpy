@@ -1,15 +1,14 @@
 """
 The provider registry, shared by all three backends.
 
-Everything here belongs to no single wire protocol: the registry and its aggregated
-model list, model selection and pricing, the HTTP transport, and the request message
-list the two OpenAI-style modules build from. The wire modules import from here; this
-module imports from none of them, so a provider can never depend on the endpoint that
-happens to be selected.
+Everything here belongs to no single wire protocol.
+It holds the registry and model list, selection and pricing, transport, and the shared message list.
+The wire modules import from here and this one imports from none of them.
+So a provider can never depend on whichever endpoint happens to be selected.
 
-The OpenAI-style modules use everything here. The Anthropic one keeps its own transport
-(it speaks its protocol through the Anthropic SDK) and its own message formatting, but
-is registered, listed, selected and priced through this module like any other provider.
+The OpenAI-style modules use everything here.
+The Anthropic one keeps its own transport and message formatting, speaking through the SDK.
+It is still registered, listed, selected and priced here like any other provider.
 """
 
 import httpx
@@ -32,10 +31,10 @@ from common import (
 
 def fold_effort(effort: str, ladder: Tuple[str, ...]) -> str:
     """
-    Folds a shared proxy effort onto a provider's own ladder by walking THINK_EFFORT_ORDER
-    downwards from the requested level and taking the first level the provider supports.
-    So 'max' becomes 'xhigh' on a ladder that stops at xhigh, and 'high' on one that stops
-    at high. `ladder` must be ordered weakest first and hold only thinking levels.
+    Folds a shared proxy effort onto a provider's own ladder.
+    Walks THINK_EFFORT_ORDER down from the request, taking the first level the provider has.
+    So 'max' becomes 'xhigh' on a ladder that stops at xhigh, and 'high' on one that stops at high.
+    `ladder` must be ordered weakest first and hold only thinking levels.
     """
     try: start = THINK_EFFORT_ORDER.index(effort)
     except ValueError: start = THINK_EFFORT_ORDER.index("medium")
@@ -47,8 +46,8 @@ def fold_effort(effort: str, ladder: Tuple[str, ...]) -> str:
     return ladder[0]
 
 
-# Effort levels that mean "do not reason", weakest first. Not thinking depths, so they
-# are excluded when folding an effort and are used only to answer a disable request.
+# Effort levels that mean "do not reason", weakest first.
+# Not thinking depths, so folding skips them; they only answer a disable request.
 # OpenAI spells its floor 'minimal' on gpt-5; Aion and later OpenAI models use 'none'.
 OFF_EFFORTS = ("none", "minimal")
 
@@ -57,21 +56,20 @@ OPENAI_MODEL_RE = re.compile(r"^(?:gpt-|o\d+(?:-|$)|chat-latest$)")
 
 def is_openai_model(model_id: str) -> bool:
     """
-    True for OpenAI's own model ids (gpt-*, o-series, chat-latest). Used for the
-    request-shape rules that hold across the whole OpenAI catalogue rather than
-    just its reasoning models.
+    True for OpenAI's own model ids (gpt-*, o-series, chat-latest).
+    Used for request-shape rules holding across the catalogue, not just reasoning models.
     """
     return OPENAI_MODEL_RE.match(model_id) is not None
 
 
 def api_style(backend: str = "") -> str:
     """
-    Which wire protocol the active (or named) provider speaks: 'messages', 'chat' or
-    'responses'. This is what picks the backend module (see server.active_backend), and
-    it is the list the provider was declared in -- nothing about it is guessed.
+    Which wire protocol the active (or named) provider speaks: 'messages', 'chat' or 'responses'.
+    This picks the backend module (see server.active_backend).
+    It is the list the provider was declared in; nothing about it is guessed.
 
-    Raises for a name that is not configured. There is no safe default to fall back on:
-    silently answering 'chat' would route the request to the wrong protocol.
+    Raises for a name that is not configured.
+    There is no safe default: answering 'chat' would route the request to the wrong protocol.
     """
     name     = backend or cfg.backend
     provider = cfg.providers.get(name)
@@ -88,9 +86,9 @@ MODEL_LOCK                    = threading.Lock()
 
 class ProviderError(Exception):
     """
-    Provider HTTP error. Carries status_code and a response body dict in the
-    same attribute shape the Anthropic SDK errors use, so server.build_error_body
-    and common.error_body handle it without special cases.
+    Provider HTTP error.
+    Carries status_code and a body dict in the attribute shape the Anthropic SDK errors use.
+    So server.build_error_body and common.error_body handle it without special cases.
     """
     def __init__(self, status_code: int, body: Dict[str, Any], message: str):
         super().__init__(message)
@@ -126,11 +124,10 @@ def error_from_response(provider_name: str, response: Any) -> ProviderError:
 
 def fetch_provider_models(name: str, provider: Dict[str, Any], timeout_s: float) -> List[Dict[str, Any]]:
     """
-    Fetches one provider's /models list. Runs in a worker thread during refresh;
-    failures raise and are reported by the caller.
+    Fetches one provider's /models list.
+    Runs in a worker thread during refresh; failures raise and are reported by the caller.
 
-    Anthropic's /models answers the same {"data": [...]} shape as the OpenAI-style
-    ones, so only the auth header differs (see auth_headers).
+    Anthropic's /models answers the same {"data": [...]} shape, so only the auth header differs.
     """
     headers = auth_headers(provider, provider["api_key"]) if provider["api_key"] else {}
 
@@ -139,14 +136,14 @@ def fetch_provider_models(name: str, provider: Dict[str, Any], timeout_s: float)
         raise error_from_response(name, response)
 
     data = response.json()
-    # OpenAI-style APIs return {"data": [...]}, but not everyone follows the
-    # spec: Aion returns {"models": [...]}, and some providers a bare list.
+    # OpenAI-style APIs return {"data": [...]}, but not everyone follows the spec.
+    # Aion returns {"models": [...]}, and some providers a bare list.
     if   isinstance(data, dict)  : entries = data.get("data") or data.get("models")
     elif isinstance(data, list)  : entries = data
     else                         : entries = None
 
-    # Some providers serve their whole catalogue here, chat models and all
-    # (OpenAI's /models also lists tts, image, embedding and realtime models).
+    # Some providers serve their whole catalogue here, chat models and all.
+    # OpenAI's /models also lists tts, image, embedding and realtime models.
     # <NAME>_MODELS_REGEX keeps the CLI list down to the ones worth selecting.
     models_regex = provider["models_regex"]
 
@@ -166,8 +163,8 @@ def refresh_models(timeout_s: float) -> None:
 
     Providers with a <NAME>_MODELS override skip the /models request entirely.
     A failing provider is skipped with a warning; it does not block the others.
-    The requests run in parallel, but results are collected in declaration order,
-    so the aggregated list (and the CLI numbering) does not depend on response order.
+    The requests run in parallel but results are collected in declaration order.
+    So the list, and the CLI numbering, does not depend on response order.
     """
     global MODELS
 
@@ -227,8 +224,8 @@ def print_no_models_available() -> None:
 
 def select_model_by_number(index: int) -> bool:
     """
-    Selects a model by its number in the aggregated list. Returns False when nothing
-    was selected, so the caller knows not to run the post-switch hook.
+    Selects a model by its number in the aggregated list.
+    Returns False when nothing was selected, so the caller knows not to run the post-switch hook.
     """
     with MODEL_LOCK:
         if not MODELS:
@@ -257,12 +254,12 @@ def print_model_info(index: int) -> None:
 
 def apply_model(entry: Dict[str, Any]) -> None:
     """
-    Points cfg at a model, its provider and its costs. This is what binds the active
-    backend: the provider decides the wire protocol, and so the module serving requests.
+    Points cfg at a model, its provider and its costs.
+    This binds the active backend: the provider decides the protocol, and so the serving module.
 
-    Nothing model-specific is resolved here -- thinking and prefill depend on the wire
-    protocol, and this module must not import the backends. The caller runs the backend's
-    own hook once the switch is done (see server.finish_model_switch).
+    Nothing model-specific is resolved here.
+    Thinking and prefill depend on the protocol, and this module must not import the backends.
+    The caller runs the backend's own hook once the switch is done (see server.finish_model_switch).
     """
     provider = cfg.providers[entry["provider"]]
 
@@ -272,8 +269,8 @@ def apply_model(entry: Dict[str, Any]) -> None:
     cfg.info       = dict(entry)
     cfg.model_info = dict(entry)
 
-    # Only the Anthropic backend reads the version (prefill and system-message rules
-    # turn on it), but extracting it for everyone is simpler than asking who is asking.
+    # Only the Anthropic backend reads the version, for its prefill and system-message rules.
+    # Extracting it for everyone is simpler than asking who is asking.
     version = extract_claude_version(entry.get("display_name") or "")
     if version == Version("0.0"):
         version = extract_claude_version(entry["id"])
@@ -304,12 +301,12 @@ def apply_model(entry: Dict[str, Any]) -> None:
 
 def apply_model_by_id(model_id: str) -> bool:
     """
-    Applies the model matching either "model-id" or "provider/model-id" in the fetched
-    list. Returns False quietly when nothing matches, so the caller can report it.
+    Applies the model matching either "model-id" or "provider/model-id" in the fetched list.
+    Returns False quietly when nothing matches, so the caller can report it.
 
-    The prefixed form names its own provider, so it is applied even when it is not in
-    the list -- which is the case whenever a provider's /models request failed, and the
-    reason MODEL=provider/model-id is the form worth configuring.
+    The prefixed form names its own provider, so it applies even when it is not in the list.
+    That happens whenever a provider's /models request failed.
+    It is why MODEL=provider/model-id is the form worth configuring.
     """
     with MODEL_LOCK:
         models = list(MODELS)
@@ -328,9 +325,8 @@ def apply_model_by_id(model_id: str) -> bool:
     return False
 
 
-# Anthropic authenticates with its own header rather than a bearer token, and requires
-# the API version on every request. The SDK sends both itself; this is for the requests
-# that do not go through it (the model list).
+# Anthropic authenticates with its own header, not a bearer token, and wants the API version too.
+# The SDK sends both itself; this is for the requests that do not go through it (the model list).
 ANTHROPIC_VERSION = "2023-06-01"
 
 
@@ -350,12 +346,12 @@ def request_timeout() -> httpx.Timeout:
 
 def build_message_list(prepared: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Turns a prepared chat request into the role/content message list both OpenAI
-    endpoints take (/chat/completions calls it 'messages', /responses 'input').
+    Turns a prepared chat request into the role/content list both OpenAI endpoints take.
+    /chat/completions calls it 'messages', /responses calls it 'input'.
 
-    Since the frontend already speaks OpenAI format this is a near-passthrough:
-    system segments become one leading system message, and the moved lorebook suffix
-    becomes a trailing system message (OpenAI-style APIs allow system anywhere).
+    The frontend already speaks OpenAI format, so this is a near-passthrough.
+    System segments become one leading message; a moved lorebook suffix becomes a trailing one.
+    OpenAI-style APIs allow system anywhere.
     """
     messages: List[Dict[str, Any]] = []
 
@@ -375,8 +371,8 @@ def build_message_list(prepared: Dict[str, Any]) -> List[Dict[str, Any]]:
         if cfg.assistant_prefill_mode == "instruction":
             append_prefill_instruction_to_last_user_message(messages, cfg.assistant_prefill)
         elif cfg.assistant_prefill_mode == "assistant":
-            # Trailing-assistant behavior varies wildly between OpenAI-style providers
-            # (continue vs. new turn vs. error), so only instruction mode is supported.
+            # Trailing-assistant behavior varies wildly here: continue, new turn or error.
+            # Only instruction mode is supported.
             print("WARNING: assistant prefill mode is not supported for OpenAI-style backends. Use 'prefill instruction'.")
 
     return messages
@@ -385,10 +381,9 @@ def build_message_list(prepared: Dict[str, Any]) -> List[Dict[str, Any]]:
 def reported_reasoning(details: Dict[str, Any]) -> Optional[int]:
     """
     The reasoning token count, or None when the provider does not report one.
-    OpenAI, GLM and Kimi all send completion_tokens_details.reasoning_tokens, OpenAI
-    even when it is 0. Aion omits the details object entirely, and None keeps the
-    proxy from reporting its thinking as zero. Where the count does appear it is a
-    subset of the output tokens, which is how the usage report splits them.
+    OpenAI, GLM and Kimi send completion_tokens_details.reasoning_tokens, OpenAI even when 0.
+    Aion omits the details object, and None keeps its thinking from being reported as zero.
+    Where it does appear it is a subset of the output tokens, which is how the report splits them.
     """
     raw = details.get("reasoning_tokens")
     return None if raw is None else max(0, int(raw or 0))
@@ -396,10 +391,9 @@ def reported_reasoning(details: Dict[str, Any]) -> Optional[int]:
 
 def warn_truncated_by_reasoning(finish_reason: str, output_text: str, counts: Dict[str, Any]) -> None:
     """
-    On OpenAI reasoning models the output limit also covers the invisible reasoning
-    tokens, so a budget that is small next to the effort can be spent entirely on
-    thinking, ending the request with no text at all. Janitor supplies its own
-    max_tokens, so this is easy to hit with nothing on screen to explain it.
+    On OpenAI reasoning models the output limit also covers the invisible reasoning tokens.
+    A budget small next to the effort can be spent entirely on thinking, ending with no text at all.
+    Janitor supplies its own max_tokens, so this is easy to hit with nothing to explain it.
     """
     if finish_reason != "length" or output_text.strip() or not counts["reasoning"]:
         return
@@ -410,8 +404,7 @@ def warn_truncated_by_reasoning(finish_reason: str, output_text: str, counts: Di
 
 def wrap_think(output_text: str, reasoning_text: str) -> str:
     """
-    Prepends the model's reasoning as a <think> block, which is how Janitor and
-    similar clients render it.
+    Prepends the reasoning as a <think> block, which is how Janitor and similar clients render it.
     """
     if not reasoning_text.strip():
         return output_text

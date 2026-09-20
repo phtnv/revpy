@@ -48,9 +48,10 @@ LATEST_CHAT_SNAPSHOT : Dict[str, Any] = {}
 LATEST_CHAT_LOCK                      = threading.Lock()
 
 
-# The backend module per wire protocol. All three expose the five entry points
-# dispatched through here: generate_non_stream, generate_stream, after_model_switch,
-# resolve_thinking and print_think_status. How each builds its request is its own business.
+# The backend module per wire protocol.
+# All three expose the same five entry points dispatched through here.
+# generate_non_stream, generate_stream, after_model_switch, resolve_thinking, print_think_status.
+# How each builds its request is its own business.
 BACKENDS = {
     "messages"  : v1_messages,
     "chat"      : v1_chat_completions,
@@ -60,8 +61,8 @@ BACKENDS = {
 
 def active_backend():
     """
-    The backend module serving requests: the one for the protocol the selected model's
-    provider was declared under (see providers.api_style).
+    The backend module serving requests.
+    It serves the protocol the model's provider was declared under (see providers.api_style).
     """
     return BACKENDS[providers.api_style()]
 
@@ -77,10 +78,10 @@ CORS(app)
 @app.before_request
 def enforce_request_size() -> None:
     """
-    Caps the body Flask will buffer. Without this any POST is read into memory whole,
-    which uploaded image edits turn from a theoretical concern into a real one -- this
-    proxy is meant to sit behind a public tunnel. Applied per request rather than once at
-    startup so 'reload' can change it.
+    Caps the body Flask will buffer.
+    Without this any POST is read into memory whole.
+    Uploaded image edits make that real, on a proxy meant to sit behind a public tunnel.
+    Applied per request rather than once at startup so 'reload' can change it.
     """
     app.config["MAX_CONTENT_LENGTH"] = cfg.request_max_bytes
 
@@ -117,12 +118,12 @@ def reload_runtime_env() -> None:
 
     providers.refresh_models(cfg.model_list_timeout_seconds)
 
-    # Image generation is configured independently of the text model, so it is resolved
-    # again here rather than riding along with the model switch below.
+    # Image generation is configured independently of the text model.
+    # It is resolved again here rather than riding along with the model switch below.
     v1_images.resolve_image_config()
     v1_images.refresh_image_models(cfg.model_list_timeout_seconds)
-    # Idempotent: arms the poller if this reload switched it on, and does nothing if one
-    # is already running (it re-reads the interval by itself).
+    # Idempotent: arms the poller if this reload switched it on, and does nothing if one runs.
+    # A running poller re-reads the interval by itself.
     v1_images.start_batch_poller()
 
     print("Reloaded runtime configuration from .env.")
@@ -131,12 +132,12 @@ def reload_runtime_env() -> None:
 
 def finish_model_switch(switched: bool) -> None:
     """
-    Runs the newly selected model through its backend's post-switch hook, which
-    validates the shared settings against it and reports how they land.
+    Runs the new model through its backend's post-switch hook.
+    That validates the shared settings against it and reports how they land.
 
-    providers.apply_model() does not do this itself: the registry serves all three wire
-    modules and cannot import one to ask without a cycle. Nothing runs when no switch
-    happened, which would report against a stale model.
+    providers.apply_model() cannot do this itself.
+    The registry serves all three wire modules and cannot import one without a cycle.
+    Nothing runs when no switch happened, which would report against a stale model.
     """
     if switched:
         active_backend().after_model_switch()
@@ -304,8 +305,8 @@ def cli_show_slots() -> None:
             geometry  = f"{reference.width}x{reference.height}" if reference.width else "?"
             print(f"  {number:>3}  {reference.format:<5} {geometry:>11}  {reference.size:>10,}B  {reference.path}")
         except Exception as exc:
-            # Slots are re-validated on use, so a file that has since vanished or been
-            # replaced shows up here rather than surprising the next chat turn.
+            # Slots are re-validated on use.
+            # A vanished or replaced file shows up here, not in the next chat turn.
             print(f"  {number:>3}  UNUSABLE  {slots[str(number)]}  ({exc})")
 
     if slots.get(v1_images.MASK_KEY):
@@ -367,8 +368,7 @@ def handle_image_edit_command(line: str, parts: List[str]) -> None:
         return
 
     if arg2 in {"s", "set"}:
-        # 'image edit set 2 /a b/c.png' -- the path is the rest of the line, unsplit,
-        # so a filename containing spaces survives.
+        # In 'image edit set 2 /a b/c.png' the path is the rest of the line, so spaces survive.
         split_line = line.split(maxsplit=4)
         if len(split_line) < 5:
             print(CLI_CMD_IMAGE_EDIT_INFO)
@@ -589,8 +589,8 @@ def admin_cli_loop() -> None:
                     continue
                 arg2 = parts[2].lower()
                 if arg1 in {"e", "effort"}:
-                    # Report the new effort in the active backend's own terms: providers
-                    # support different subsets, so the level sent is often not the one asked for.
+                    # Report the new effort in the backend's own terms.
+                    # Providers support different subsets, so the level sent may differ.
                     if cfg.set_think_effort(arg2):
                         active_backend().resolve_thinking()
                     continue
@@ -940,8 +940,7 @@ def apply_summary_blocks(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str,
     Removes summary control messages and optionally collapses covered ranges.
 
     Valid summary ranges are computed against the original normalized chat list.
-    Overlapping ranges become one removed span, with their summaries inserted in
-    closing-message order.
+    Overlapping ranges become one span, their summaries inserted in closing-message order.
     """
     if not messages:
         return messages, ""
@@ -1055,9 +1054,9 @@ def split_system_text(system_prompt: str) -> Tuple[List[str], str]:
     """
     Splits the joined system prompt into segments and an optional moved-to-end suffix.
 
-    This is pure string surgery driven by the lorebook settings; how the segments
-    are represented on the wire (Anthropic system blocks with cache markers, plain
-    OpenAI system messages, ...) is up to the backend.
+    Pure string surgery driven by the lorebook settings.
+    How the segments travel on the wire (Anthropic blocks with markers, OpenAI messages, ...)
+    is up to the backend.
 
     When SPLIT_LOREBOOK=true, the prompt is split into:
         1. stable core definition
@@ -1071,12 +1070,12 @@ def split_system_text(system_prompt: str) -> Tuple[List[str], str]:
         5. After the last </* Persona> marker
         6. Otherwise keep the whole system prompt as one segment
 
-    When LOREBOOK_AT_END=true, the suffix is returned as plain text instead of being
-    kept as a system segment. That moved suffix deliberately does not receive the old
-    system/lorebook cache marker; it is handled later as an ordinary end-of-conversation item.
+    With LOREBOOK_AT_END=true the suffix comes back as plain text, not a system segment.
+    The moved suffix deliberately loses the old system/lorebook cache marker.
+    It is handled later as an ordinary end-of-conversation item.
 
-    When LOREBOOK_XML_AT_END=true, every <lorebook>...</lorebook> block is removed from the
-    system prompt and appended after any other moved end-of-chat lorebook text.
+    With LOREBOOK_XML_AT_END=true every <lorebook> block leaves the system prompt.
+    It is appended after any other moved end-of-chat lorebook text.
 
     Returns:
         - system_segments: system prompt segments, or an empty list
@@ -1123,7 +1122,7 @@ def split_system_text(system_prompt: str) -> Tuple[List[str], str]:
                         existing_text = lorebook_at_end_text.strip()
                         lorebook_at_end_text = f"{existing_text}\n\n{after}" if existing_text else after
                     else:
-                        # Keep a clean visual/semantic separator between Scenario/Persona and suffix.
+                        # Keep a clean separator between Scenario/Persona and suffix.
                         segments.append("\n\n" + after)
         else:
             segments.append(text)
@@ -1171,7 +1170,7 @@ def split_system_and_messages(raw_messages: Any) -> Tuple[str, List[Dict[str, An
         if role not in ("user", "assistant"):
             role = "user"
 
-        # Strip every preservation envelope, but keep assistant envelopes only when preservation is enabled.
+        # Strip every preservation envelope; keep assistant ones only when preservation is on.
         content, thinking_blocks = v1_messages.extract_hidden_thinking_envelopes(content)
 
         msg_obj: Dict[str, Any] = {"role": role, "content": content}
@@ -1244,10 +1243,10 @@ def capture_chat_snapshot(payload: Dict[str, Any], assistant_content: str, assis
 
 def postprocess_chat_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Applies summary block substitutions to a raw snapshot, mirroring what
-    split_system_and_messages() does to the outgoing request: control messages
-    are removed, covered ranges collapse into their summaries, and role="system"
-    summaries are appended after the system prompt.
+    Applies summary block substitutions to a raw snapshot.
+    It mirrors what split_system_and_messages() does to the outgoing request.
+    Control messages go and covered ranges collapse into their summaries.
+    role="system" summaries follow the system prompt.
     """
     messages = snapshot.get("messages", [])
     if not isinstance(messages, list):
@@ -1272,8 +1271,8 @@ NATURAL_DUMP_ESCAPE_MAP = {"\\": "\\", "n": "\n", "t": "\t", "r": "\r", '"': '"'
 
 def naturalize_dump_text(text: str) -> str:
     """
-    Replaces literal JSON escape sequences (\\n, \\t, \\', ...) that leaked into
-    message text with the natural characters they represent.
+    Replaces literal JSON escape sequences (\\n, \\t, \\', ...)
+    that leaked into message text with the natural characters they represent.
     """
     return NATURAL_DUMP_ESCAPE_RE.sub(lambda m: NATURAL_DUMP_ESCAPE_MAP[m.group(1)], text)
 
@@ -1324,13 +1323,14 @@ def prepare_chat_request(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     system_prompt, chat_messages, system_summary_text = split_system_and_messages(payload.get("messages"))
 
-    # JanitorAI sends '.' as the first fake user message (because all chats start with a user message).
-    # We're replacing it with the <OOC>\nBegin the scenario.\n</OOC> version since it seems more natural.
+    # JanitorAI sends '.'
+    # as the first fake user message (because all chats start with a user message).
+    # Replaced with the <OOC>\nBegin the scenario.\n</OOC> version, which reads more naturally.
     if chat_messages and chat_messages[0].get("role") == "user" and chat_messages[0].get("content", "").strip() == ".":
         chat_messages = [{"role": "user", "content": OOC_SCENARIO_START}] + chat_messages[1:]
 
-    # Summary substitutions can leave the chat starting with an assistant message (or empty);
-    # ensure the conversation always opens with a user message.
+    # Summary substitutions can leave the chat starting with an assistant message, or empty.
+    # Ensure the conversation always opens with a user message.
     if not chat_messages or chat_messages[0].get("role") != "user":
         chat_messages = [{"role": "user", "content": OOC_SCENARIO_START}] + chat_messages
 
@@ -1414,15 +1414,6 @@ HTML_DOC_RE          = re.compile(r"<!DOCTYPE\s+html|<html[\s>]|<body[\s>]", re.
 def image_note_message(message: str) -> str:
     """
     An upstream error message fit to appear inside a chat reply.
-
-    A gateway failure (Cloudflare's 520 page, say) arrives as HTML rather than JSON, and
-    error_from_response falls back to the first 2000 characters of the body. Relaying that
-    verbatim buries the model's actual reply under a wall of markup, so it is stripped to
-    one short line here. The full body still reaches the error log.
-
-    Tags are only stripped from something that is actually a markup document: the proxy's
-    own messages use angle brackets for placeholders ("img edit set 1 <path>"), and an
-    indiscriminate strip silently deletes the most useful part of the advice.
     """
     text = str(message or "")
     if HTML_DOC_RE.search(text):
@@ -1435,9 +1426,9 @@ def image_note_message(message: str) -> str:
 
 def run_image_requests(extraction: image_orchestrator.Extraction) -> str:
     """
-    Runs the image requests a user turn asked for and returns the text to append to the
-    reply. A failure here never costs the conversation its turn: the error is logged in
-    full and reported inline, so the model's prose still reaches the client.
+    Runs the image requests a user turn asked for and returns the text to append to the reply.
+    A failure here never costs the conversation its turn.
+    The error is logged in full and reported inline, so the prose still reaches the client.
     """
     lines: List[str] = []
 
@@ -1466,8 +1457,8 @@ def run_image_requests(extraction: image_orchestrator.Extraction) -> str:
 
 def make_image_only_response(note: str) -> Dict[str, Any]:
     """
-    The chat completion for a turn that was nothing but image requests. No text backend
-    was called, so the model label reports the image model that actually did the work.
+    The chat completion for a turn that was nothing but image requests.
+    No text backend was called, so the label reports the image model that did the work.
     """
     return {
         "id"      : f"imggen-{int(time.time())}",
@@ -1543,8 +1534,8 @@ def generate_stream(payload: Dict[str, Any]):
                     "content" : data,
                 })
             elif kind == "final":
-                # Generated after the prose has streamed, so the reply is not held back
-                # for the seconds an image takes, then appended as one last text delta.
+                # Generated after the prose has streamed, so the reply is never held back for it.
+                # It is then appended as one last text delta.
                 note = run_image_requests(extraction) if extraction.found else ""
                 if note:
                     yield openai_stream_chunk(label, {"role": "assistant", "content": f"\n\n{note}"})
@@ -1647,15 +1638,13 @@ def running():
                 "provider"             : cfg.image_provider,
                 "model"                : cfg.image_model,
                 "output_dir"           : cfg.image_output_dir,
-                # The configured value is routinely relative, and relative to *this*
-                # process's working directory, which a client cannot know. A local app
-                # browsing the output folder needs the resolved one.
-                "output_dir_abs"       : os.path.abspath(cfg.image_output_dir),
-                "manifest_file"        : v1_images.MANIFEST_FILE,
-                "cost_family"          : cfg.image_cost_family,
-                "batch_auto_poll"      : cfg.image_batch_auto_poll,
-                "batch_poll_seconds"   : cfg.image_batch_poll_seconds,
-                "defaults"             : {
+                # The configured value is routinely relative to this process's directory.
+                "output_dir_abs"     : os.path.abspath(cfg.image_output_dir),
+                "manifest_file"      : v1_images.MANIFEST_FILE,
+                "cost_family"        : cfg.image_cost_family,
+                "batch_auto_poll"    : cfg.image_batch_auto_poll,
+                "batch_poll_seconds" : cfg.image_batch_poll_seconds,
+                "defaults"           : {
                     "size"       : cfg.image_default_size,
                     "quality"    : cfg.image_default_quality,
                     "format"     : cfg.image_default_format,
@@ -1663,9 +1652,8 @@ def running():
                     "n"          : cfg.image_default_n,
                     "batch"      : cfg.image_default_batch,
                 },
-                # Enough for a client to reject a bad request before sending it, rather
-                # than learning the rules one 400 at a time. Sizes are a constraint set
-                # rather than a list because validate_size() checks bounds, not an enum.
+                # Enough to reject a bad request instead of learning the rules one 400 at a time.
+                # Sizes are a constraint set: validate_size() checks bounds, not an enum.
                 "limits"               : {
                     "max_n"            : cfg.image_max_n,
                     "max_prompt_chars" : cfg.image_max_prompt_chars,
@@ -1686,14 +1674,14 @@ def running():
                     "formats"     : sorted(IMAGE_FORMATS),
                     "backgrounds" : sorted(IMAGE_BACKGROUNDS),
                 },
-                "session"              : images,
+                "session" : images,
             },
             "thinking" : {
-                "thinking_enabled"          : cfg.thinking_enabled,
-                "adaptive_thinking"         : cfg.use_adaptive,
-                "thinking_budget"           : cfg.thinking_budget,
-                "thinking_effort"           : cfg.thinking_effort,
-                "preserve_thinking_blocks"  : "inf" if cfg.preserve_thinking_blocks == UINT64_MAX else str(cfg.preserve_thinking_blocks),
+                "thinking_enabled"         : cfg.thinking_enabled,
+                "adaptive_thinking"        : cfg.use_adaptive,
+                "thinking_budget"          : cfg.thinking_budget,
+                "thinking_effort"          : cfg.thinking_effort,
+                "preserve_thinking_blocks" : "inf" if cfg.preserve_thinking_blocks == UINT64_MAX else str(cfg.preserve_thinking_blocks),
             }
         }
     )
@@ -1737,7 +1725,8 @@ def resolve_response_format(requested: Any) -> str:
 
 def make_image_response(result: v1_images.ImageResult, response_format: str = "path") -> Dict[str, Any]:
     """
-    Direct image endpoint reply. 'path' is metadata-only; 'b64_json' also includes bytes.
+    Direct image endpoint reply.
+    'path' is metadata-only; 'b64_json' also includes bytes.
     """
     usage: Dict[str, Any] = {"estimated_cost_usd": round(result.cost_usd, 6), "cost_is_estimate": result.estimated}
     if result.usage.get("reported"):
@@ -1791,8 +1780,8 @@ def multipart_edit_fields() -> Dict[str, Any]:
         if name in request.form:
             fields[name] = request.form[name]
 
-    # Structure has to travel as JSON here: a multipart body has no other way to carry it, which
-    # is why validate_annotation reads a string as well as an object.
+    # Structure has to travel as JSON here, since a multipart body cannot carry it otherwise.
+    # That is why validate_annotation reads a string as well as an object.
     for name in ("job_group", "job", "mask_region"):
         if name in request.form:
             fields[name] = request.form[name]
@@ -1835,8 +1824,8 @@ def images_edits():
 
         response_format = resolve_response_format(fields.pop("response_format", None))
 
-        # This route always edits, so a bare reference set with no explicit flag still
-        # means an edit -- and a caller who posted to it expecting a generation is told so.
+        # This route always edits, so a bare reference set with no flag still means an edit.
+        # A caller who posted here expecting a generation is told so.
         if not any(fields.get(name) for name in EDIT_FIELDS):
             return Response(json.dumps({"error": {"message":
                 "an edit needs reference images: upload them as multipart, or name slots/paths in 'images', "
@@ -1853,11 +1842,12 @@ def images_edits():
 @app.route("/v1/images/generations", methods=["POST"])
 def images_generations():
     """
-    Direct text-to-image generation, sharing every default, validator, storage rule and
-    cost path with the chat-triggered route. Only 'prompt' is required.
+    Direct text-to-image generation.
+    It shares every default, validator, storage rule and cost path with the chat route.
+    Only 'prompt' is required.
 
-    Editing lives at /v1/images/edits, mirroring the upstream API rather than overloading
-    this URL, so a client that knows one knows the other.
+    Editing lives at /v1/images/edits, mirroring the upstream API rather than overloading this URL.
+    A client that knows one knows the other.
     """
     payload = request.get_json(silent=True)
 
@@ -1877,8 +1867,8 @@ def images_generations():
         if req.batch:
             batch = v1_images.submit_image_batch([req])
             return jsonify({
-                # 'number' is the short reference the CLI and chat replies use; the
-                # provider id is kept for callers that talk to the provider directly.
+                # 'number' is the short reference the CLI and chat replies use.
+                # The provider id is kept for callers that talk to the provider directly.
                 "number"            : batch.number,
                 "batch_id"          : batch.batch_id,
                 "status"            : batch.status,
@@ -1900,8 +1890,7 @@ def images_batch_list():
     Every batch this proxy has submitted from its output directory.
 
     Reads recorded state only -- no provider call, and so no retrieval and no billing.
-    A client rebuilding a job list after a restart wants exactly this, and wants it to
-    stay cheap enough to poll.
+    A client rebuilding a job list after a restart wants this, cheap enough to poll.
     """
     try:
         return jsonify({"data": v1_images.list_batches()})
@@ -1914,17 +1903,18 @@ def images_manifest_patch():
     """
     Correct what some records say about the requests that made them.
 
-    The one writable path into this proxy's manifest, held under the same lock that appending
-    takes -- which is the reason it exists: a client rewriting the file itself would race a job
-    landing and could drop a record.
+    The one writable path into the manifest, held under the lock appending takes.
+    That is why it exists.
+    A client rewriting the file would race a landing job and drop a record.
 
-    What may be corrected is testimony: the prompt, the request parameters, the mask's region, the
-    lineage, the provider and model named, when it was made, what it cost, and which attempt it
-    belongs to. What may not is measurement -- `file`, `image_id`, `bytes` and the provider's
-    `usage` describe the file this proxy wrote.
+    What may be corrected is testimony.
+    The prompt, request parameters, mask region, lineage, provider and model.
+    Also when it was made, what it cost, and which attempt it belongs to.
+    What may not is measurement: `file`, `image_id`, `bytes` and `usage` describe the file written.
 
-    Match a record by image_id, or by file for one written before ids were recorded. A key left out
-    is left alone; a null clears it, which for `job` is how an attempt is filed back out of a group.
+    Match a record by image_id, or by file for one written before ids were recorded.
+    A key left out is left alone; a null clears it.
+    For `job` that files an attempt back out of a group.
     """
     check_proxy_key()
     payload = request.get_json(silent=True) or {}
@@ -1945,17 +1935,17 @@ def images_rename():
     """
     Rename one image this proxy wrote, and bring its record with it.
 
-    Its own route rather than a field of the manifest patch, which refuses `file` because a
-    record's filename describes the file on disk rather than what was asked for. Renaming does not
-    correct that description -- it changes what is being described -- and it has to move the file
-    and rewrite the manifest together, under the lock appending takes. A client doing it itself
-    would leave the manifest naming something that is no longer there.
+    Its own route rather than a field of the manifest patch.
+    That patch refuses `file`: a filename describes the file on disk, not what was asked.
+    Renaming changes what is described rather than correcting it.
+    It must move the file and rewrite the manifest together, under the lock appending takes.
+    A client doing it itself would leave the manifest naming something that is no longer there.
 
-    Every other record that names the file follows it, as a source or as a mask, so an edit's
-    lineage still points at a real file.
+    Every other record naming the file follows it, as a source or a mask.
+    An edit's lineage still points at a real file.
 
-    Name the image by `image_id`, or by `file` for one written before ids were recorded. The
-    extension is not the caller's to change: the bytes decide the format.
+    Name the image by `image_id`, or by `file` for one written before ids were recorded.
+    The extension is not the caller's to change: the bytes decide the format.
     """
     check_proxy_key()
     payload = request.get_json(silent=True) or {}
@@ -1976,8 +1966,8 @@ def images_rename():
 @app.route("/v1/images/batches/<token>", methods=["GET"])
 def images_batch_status(token: str):
     """
-    Batch status, saving the images once the batch has completed. Accepts either the
-    short number the proxy assigned or the provider's own batch id.
+    Batch status, saving the images once the batch has completed.
+    Accepts either the short number the proxy assigned or the provider's own batch id.
     """
     try:
         result = v1_images.retrieve_image_batch(v1_images.resolve_batch_id(token))
@@ -2005,9 +1995,9 @@ def v1_baseurl()    : return handle_chat_completion()
 
 def print_provider_table() -> None:
     """
-    What the three provider lists resolved to. A provider declared under the wrong
-    protocol is accepted here and only fails at the first request, so the resolved
-    table is worth seeing before that.
+    What the three provider lists resolved to.
+    A provider declared under the wrong protocol is accepted here and fails at the first request.
+    The resolved table is worth seeing before that.
     """
     print("Configured providers:")
     for name, provider in cfg.providers.items():
@@ -2029,9 +2019,9 @@ if __name__ == "__main__":
     print_provider_table()
     providers.refresh_models(cfg.model_list_timeout_seconds)
 
-    # MODEL is a bare id or "provider/model-id". The prefixed form resolves without a
-    # model list, which is the only thing that still works when a provider's /models
-    # request failed -- so it is the form worth configuring.
+    # MODEL is a bare id or "provider/model-id".
+    # The prefixed form resolves without a model list.
+    # It is all that still works when a provider's /models request failed, so prefer it.
     if not providers.apply_model_by_id(cfg.model):
         print()
         print(f"MODEL '{cfg.model}' matches no model of any configured provider.")

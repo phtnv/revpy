@@ -1,11 +1,11 @@
 """
-The /responses backend: OpenAI's own endpoint, and the only one that returns the
-model's reasoning. Ask for a summary and the response carries reasoning items whose
-text the proxy wraps in a <think> block, which /chat/completions cannot do at all.
+The /responses backend: OpenAI's own endpoint, and the only one that returns the model's reasoning.
+Ask for a summary and the response carries reasoning items.
+The proxy wraps their text in a <think> block, which /chat/completions cannot do at all.
 
-Everything here assumes OpenAI's catalogue and OpenAI's rules -- one effort ladder per
-model rather than one per model per endpoint -- since OpenAI is the only vendor serving
-this protocol. A model it does not recognize simply gets no reasoning parameter, and
+Everything here assumes OpenAI's catalogue and rules, one effort ladder per model.
+OpenAI is the only vendor serving this protocol.
+An unrecognized model simply gets no reasoning parameter.
 <NAME>_EXTRA_BODY is the escape hatch for a gateway with its own dialect.
 """
 
@@ -45,9 +45,9 @@ GPT_RE         = re.compile(r"^gpt-(\d+(?:\.\d+)?)")
 O_SERIES_RE    = re.compile(r"^o(\d+)(?:-|$)")
 
 # Reasoning effort levels each model accepts on this endpoint, weakest first.
-# Established by sending each level to each model: the endpoint's own "supported
-# values" error lists the union across models, not what the addressed model takes,
-# so it cannot be trusted on its own.
+# Established by sending each level to each model.
+# Its "supported values" error lists the union across models, not what the addressed one takes.
+# It cannot be trusted alone.
 EFFORTS_GPT56 = ("none", "low", "medium", "high", "xhigh", "max")  # gpt-5.6+
 EFFORTS_GPT52 = ("none", "low", "medium", "high", "xhigh")         # gpt-5.2..5.5
 EFFORTS_GPT51 = ("none", "low", "medium", "high")                  # gpt-5.1
@@ -57,10 +57,9 @@ EFFORTS_O     = ("low", "medium", "high")                          # o-series
 
 def effort_ladder(model_id: str) -> Optional[Tuple[str, ...]]:
     """
-    The reasoning effort ladder for an OpenAI model, weakest first. Returns None when
-    reasoning effort is not a parameter of the model at all (gpt-4 and older reject it
-    as an unknown argument), and an empty tuple for the *-chat-latest snapshots, which
-    accept only the default and never reason.
+    The reasoning effort ladder for an OpenAI model, weakest first.
+    Returns None when effort is not a parameter at all; gpt-4 and older reject it outright.
+    Returns an empty tuple for *-chat-latest, which takes only the default and never reasons.
     """
     if CHAT_LATEST_RE.search(model_id):
         return ()
@@ -81,12 +80,12 @@ def effort_ladder(model_id: str) -> Optional[Tuple[str, ...]]:
 
 def effort_for(model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[str]:
     """
-    The effort level to send for one model, or None when the model takes no effort
-    parameter at all.
+    The effort level to send for one model, or None when the model takes no effort parameter at all.
 
-    How far thinking can be turned down is model-dependent: gpt-5.1+ take 'none' and
-    stop reasoning outright, gpt-5 bottoms out at 'minimal', and the o-series has no
-    off switch at all, so a disable request sends the weakest level it does offer.
+    How far thinking can be turned down is model-dependent.
+    gpt-5.1+ take 'none' and stop outright; gpt-5 bottoms out at 'minimal'.
+    The o-series has no off switch.
+    A disable request then sends the weakest level offered.
     """
     ladder = effort_ladder(model_id)
     if not ladder:
@@ -96,19 +95,19 @@ def effort_for(model_id: str, thinking_enabled: bool, thinking_effort: str) -> O
     return fold_effort(thinking_effort, tuple(e for e in ladder if e not in OFF_EFFORTS))
 
 
-# OpenAI gates reasoning summaries behind organization verification and refuses the whole
-# request when an unverified account asks for one. Since the proxy is what adds the
-# summary, it remembers the refusal and drops it rather than failing every turn.
-# The gate is per model, not per account -- the gpt-5 family answers unverified while the
-# older o-series does not -- so one model's refusal must not mute the rest.
+# OpenAI gates reasoning summaries behind organization verification.
+# An unverified account asking for one has the whole request refused.
+# The proxy adds the summary, so it remembers the refusal and drops it rather than failing.
+# The gate is per model, not per account: gpt-5 answers unverified while the o-series does not.
+# One model's refusal must not mute the rest.
 SUMMARY_BLOCKED_MARKER = "verified to generate reasoning summaries"
 SUMMARY_BLOCKED_MODELS : set = set()
 
 
 def note_summary_blocked(exc: Exception) -> bool:
     """
-    True when the error is the unverified-organization refusal, in which case summaries
-    are disabled for that model so the caller can retry without one.
+    True for the unverified-organization refusal.
+    Summaries are then disabled for that model so the caller can retry without one.
     """
     if SUMMARY_BLOCKED_MARKER not in str(exc):
         return False
@@ -123,9 +122,9 @@ def note_summary_blocked(exc: Exception) -> bool:
 
 def reasoning_param(model_id: str, thinking_enabled: bool, thinking_effort: str, summary: str) -> Optional[Dict[str, Any]]:
     """
-    The 'reasoning' object: the effort plus, when thinking is on, the summary detail
-    level that makes the model's reasoning visible at all. Returns None for models
-    that take no reasoning parameter, which reject it outright.
+    The 'reasoning' object: the effort, plus the summary detail level when thinking is on.
+    That detail level is what makes the reasoning visible at all.
+    Returns None for models that take no reasoning parameter, which reject it outright.
     """
     effort = effort_for(model_id, thinking_enabled, thinking_effort)
     if effort is None:
@@ -139,18 +138,16 @@ def reasoning_param(model_id: str, thinking_enabled: bool, thinking_effort: str,
 
 def supports_sampling(model_id: str) -> bool:
     """
-    False for OpenAI models that reject sampling controls: every reasoning model and
-    every *-chat-latest snapshot refuses top_p outright and accepts no temperature
-    other than the default 1.
+    False for OpenAI models that reject sampling controls.
+    Every reasoning model and *-chat-latest refuses top_p and takes only temperature 1.
     """
     return not (is_openai_model(model_id) and effort_ladder(model_id) is not None)
 
 
 def resolve_thinking() -> None:
     """
-    Reports how the shared thinking settings map onto the selected model's reasoning
-    parameter. Unlike the Anthropic backend there is no capability metadata to check
-    and none of its parameter constraints apply, so nothing is adjusted here.
+    Reports how the shared thinking settings map onto the selected model's reasoning parameter.
+    Unlike the Anthropic backend there is no capability metadata to check, so nothing is adjusted.
     """
     ladder = effort_ladder(cfg.model)
     if ladder is None:
@@ -173,10 +170,10 @@ def resolve_background() -> None:
     """
     Reports whether responses are run as background jobs, and what that costs in privacy.
 
-    Worth saying out loud rather than leaving in .env: a background response is retained
-    by OpenAI for about ten minutes regardless of <NAME>_STORE, so that it can be polled
-    and resumed. That is a real, if brief, exception to the retention stance the store
-    setting otherwise buys.
+    Worth saying out loud rather than leaving in .env.
+    OpenAI keeps a background response about ten minutes whatever <NAME>_STORE says.
+    That is what allows polling and resuming.
+    That is a real, if brief, exception to the retention stance the store setting otherwise buys.
     """
     provider = cfg.providers[cfg.backend]
     if not provider["background"]:
@@ -190,9 +187,8 @@ def resolve_background() -> None:
 
 def after_model_switch() -> None:
     """
-    Post-switch hook for this backend (v1_messages and v1_chat_completions have their
-    own). There is nothing to validate against the model here, so this only reports how
-    the thinking settings land on it.
+    Post-switch hook for this backend (v1_messages and v1_chat_completions have their own).
+    There is nothing to validate against the model, so this only reports how it lands.
     """
     resolve_thinking()
     resolve_background()
@@ -200,8 +196,7 @@ def after_model_switch() -> None:
 
 def print_think_status() -> None:
     """
-    CLI 'think' status for this endpoint
-    (v1_messages.print_think_status and v1_chat_completions.print_think_status are the counterparts).
+    CLI 'think' status for this endpoint v1_messages and v1_chat_completions hold the counterparts.
     """
     ladder = effort_ladder(cfg.model)
     if ladder is None:
@@ -225,9 +220,9 @@ def print_think_status() -> None:
 
 def apply_sampling(body: Dict[str, Any]) -> None:
     """
-    Adds temperature/top_p in place, unless the model refuses them. OpenAI reasoning
-    models take no sampling controls at all: top_p is rejected outright, and
-    temperature accepts nothing but its default of 1.
+    Adds temperature/top_p in place, unless the model refuses them.
+    OpenAI reasoning models take no sampling controls.
+    top_p is rejected outright, and temperature accepts nothing but its default of 1.
     """
     if supports_sampling(cfg.model):
         if cfg.send_temperature : body["temperature"] = cfg.temperature
@@ -241,8 +236,8 @@ def build_body(prepared: Dict[str, Any]) -> Dict[str, Any]:
     """
     Builds a /responses request from a prepared chat request.
 
-    Note the model decides whether to reason: on adaptive models an easy turn can
-    come back with no reasoning at all, and then there is no summary to show.
+    Note the model decides whether to reason.
+    On adaptive models an easy turn can return no reasoning, and then there is no summary to show.
     """
     provider = cfg.providers[cfg.backend]
 
@@ -254,10 +249,9 @@ def build_body(prepared: Dict[str, Any]) -> Dict[str, Any]:
         "store"             : provider["store"],
     }
 
-    # A background response is run as a job rather than as the answer to this request,
-    # which is what lets a dropped connection be picked back up (see generate_stream).
-    # It is compatible with store=false: OpenAI keeps the job for about ten minutes so
-    # it can be polled, then forgets it.
+    # A background response runs as a job, not as the answer to this request.
+    # That is what lets a dropped connection be picked back up (see generate_stream).
+    # It works with store=false: OpenAI keeps the job about ten minutes, then forgets it.
     if provider["background"]:
         body["background"] = True
 
@@ -274,9 +268,9 @@ def build_body(prepared: Dict[str, Any]) -> Dict[str, Any]:
 
 def parse_usage(usage: Any) -> Dict[str, Any]:
     """
-    Pulls the token counts the proxy tracks out of a /responses usage payload. Same
-    counts as the chat endpoint under different names: input/output rather than
-    prompt/completion, and the details objects renamed to match.
+    Pulls the token counts the proxy tracks out of a /responses usage payload.
+    The same counts as the chat endpoint under different names.
+    input/output rather than prompt/completion, with the details objects renamed to match.
     """
     usage = usage if isinstance(usage, dict) else {}
 
@@ -289,8 +283,8 @@ def parse_usage(usage: Any) -> Dict[str, Any]:
     output_details = output_details if isinstance(output_details, dict) else {}
 
     cached_tokens = max(0, int(input_details.get("cached_tokens", 0) or 0))
-    # gpt-5.6+ reports the tokens written to the prompt cache, which it charges a
-    # premium for. Models without a write fee simply never send this field.
+    # gpt-5.6+ reports the tokens written to the prompt cache, which it charges a premium for.
+    # Models without a write fee simply never send this field.
     write_tokens  = max(0, int(input_details.get("cache_write_tokens", 0) or 0))
     cached_tokens = min(cached_tokens, input_tokens)
     write_tokens  = min(write_tokens, input_tokens - cached_tokens)
@@ -300,8 +294,8 @@ def parse_usage(usage: Any) -> Dict[str, Any]:
         "completion" : output_tokens,
         "total"      : max(0, int(usage.get("total_tokens", input_tokens + output_tokens) or 0)),
         "cached"     : cached_tokens,
-        # One cache rate and no TTL choice here, so every write is a 5m write
-        # (providers.apply_model prices both buckets identically).
+        # One cache rate and no TTL choice here, so every write is a 5m write.
+        # providers.apply_model prices both buckets identically.
         "write_1h"   : 0,
         "write_5m"   : write_tokens,
         "uncached"   : input_tokens - cached_tokens - write_tokens,
@@ -310,16 +304,16 @@ def parse_usage(usage: Any) -> Dict[str, Any]:
 
 
 # Generation.
-# The response is an 'output' list of items rather than a single message: reasoning items
-# carry the summary of the model's thinking, message items carry the reply. A turn can
-# produce several of each, and on adaptive models the reasoning items may be absent.
-# 'cancelled' is only reachable in background mode, where the proxy cancels a response
-# nobody is waiting for any more (cancel_response).
+# The response is an 'output' list rather than a single message.
+# Reasoning items carry the summary of the thinking; message items carry the reply.
+# A turn can produce several of each, and on adaptive models the reasoning items may be absent.
+# 'cancelled' is reachable only in background mode.
+# There the proxy cancels a response nobody is waiting for (cancel_response).
 STOP_REASONS = {"completed": "stop", "incomplete": "length", "failed": "error", "cancelled": "stop"}
 
-# The response statuses that end a turn. A stream that runs out of body without
-# reporting one of these was cut mid-response -- see generate_stream(). A mid-stream
-# 'error' event ends it too, but that path raises where it is read.
+# The response statuses that end a turn.
+# A stream that ends without reporting one of these was cut mid-response; see generate_stream().
+# A mid-stream 'error' event ends it too, but that path raises where it is read.
 TERMINAL_STATUSES = frozenset(STOP_REASONS)
 
 
@@ -327,15 +321,15 @@ def truncated_stream_message(text_chars: int, reasoning_chars: int, reason: str 
     """
     Explains a stream that stopped without OpenAI ever finishing the response.
 
-    Seen when the model reasons for a long stretch over a large prompt: /responses
-    sends nothing at all while reasoning (summary text only arrives once the reasoning
-    item closes), and the silent connection gets closed with no error and no terminal
-    event. It is not a time limit -- runs that stream output for minutes are fine,
-    while ones that sit in reasoning for under a minute are cut.
+    Seen when the model reasons for a long stretch over a large prompt.
+    /responses sends nothing while reasoning; summary text arrives once the item closes.
+    The silent connection is then closed with no error and no terminal event.
+    It is not a time limit.
+    Runs streaming output for minutes are fine; ones sitting in reasoning a minute are cut.
 
-    What arrived before the cut has already gone to the client, so say how much. In
-    background mode the cut alone is not what ended the turn -- 'reason' says what did,
-    which is the difference between a limit of this proxy's and one of OpenAI's.
+    What arrived before the cut has already gone to the client, so say how much.
+    In background mode the cut alone did not end the turn; 'reason' says what did.
+    That is the difference between a limit of this proxy's and one of OpenAI's.
     """
     got    = f"{text_chars} characters of reply and {reasoning_chars} of reasoning"
     advice = reason or (
@@ -353,7 +347,7 @@ def truncated_stream_message(text_chars: int, reasoning_chars: int, reason: str 
 def output_text(data: Dict[str, Any]) -> Tuple[str, str]:
     """
     Pulls (reply text, reasoning text) out of a non-streaming response body.
-    Multiple summary parts are joined with a blank line, the same way the streaming path separates them.
+    Summary parts join with a blank line, as the streaming path separates them.
     """
     text_parts      : List[str] = []
     reasoning_parts : List[str] = []
@@ -374,13 +368,13 @@ def output_text(data: Dict[str, Any]) -> Tuple[str, str]:
 
 
 # Background responses.
-# A background response is a job: it keeps running after the connection that started it
-# goes away, and every event it streams carries a sequence_number to resume from. That is
-# what makes the silent-reasoning cut recoverable -- but only while the job is still
-# running. Once it finishes there is no live stream left to attach to, and its events are
-# not replayed, so a response that completed while the proxy was disconnected has to be
-# collected from the response object instead. Both paths are needed; neither covers the
-# other. Retrieval works with store=false, which OpenAI keeps for about ten minutes.
+# A background response is a job that outlives the connection starting it.
+# Every event it streams carries a sequence_number to resume from.
+# That makes the silent-reasoning cut recoverable, but only while the job still runs.
+# Once it finishes there is no live stream to attach to and its events are not replayed.
+# A response that completed while the proxy was disconnected is collected from the object instead.
+# Both paths are needed; neither covers the other.
+# Retrieval works with store=false, which OpenAI keeps for about ten minutes.
 def fetch_response(provider: Dict[str, Any], response_id: str) -> Dict[str, Any]:
     """The current state of a response, by id."""
     response = httpx.get(
@@ -399,10 +393,9 @@ def cancel_response(provider: Dict[str, Any], response_id: str) -> None:
     """
     Drops a background response nobody is listening to any more.
 
-    Without this a client that walks away mid-turn leaves the model running, and
-    billing, until it finishes on its own. Best effort by design: this runs while an
-    error or a disconnect is already on its way out, and must not replace it with one
-    of its own.
+    Without this a client that walks away leaves the model running, and billing, to the end.
+    Best effort by design.
+    It runs while an error or disconnect is already on its way out, and must not replace it.
     """
     try:
         httpx.post(
@@ -416,8 +409,8 @@ def cancel_response(provider: Dict[str, Any], response_id: str) -> None:
 
 def await_response(provider: Dict[str, Any], response_id: str, deadline: float) -> Dict[str, Any]:
     """
-    Polls a background response until it reports a terminal status. Raises once the
-    deadline passes, cancelling what is still running rather than leaving it billing.
+    Polls a background response until it reports a terminal status.
+    Raises once the deadline passes, cancelling what still runs rather than leaving it billing.
     """
     while True:
         data = fetch_response(provider, response_id)
@@ -436,8 +429,8 @@ def await_response(provider: Dict[str, Any], response_id: str, deadline: float) 
 
 def raise_if_failed(data: Dict[str, Any]) -> None:
     """
-    A failed response arrives as HTTP 200 with the reason in the body. Without this it
-    is relayed as an ordinary reply, which is usually an empty one.
+    A failed response arrives as HTTP 200 with the reason in the body.
+    Without this it is relayed as an ordinary reply, which is usually an empty one.
     """
     if str(data.get("status") or "") != "failed":
         return
@@ -447,7 +440,8 @@ def raise_if_failed(data: Dict[str, Any]) -> None:
 
 def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Runs one non-streaming /responses request. Same result shape as v1_messages.generate_non_stream.
+    Runs one non-streaming /responses request.
+    Same result shape as v1_messages.generate_non_stream.
     """
     provider = cfg.providers[cfg.backend]
 
@@ -474,10 +468,10 @@ def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
     data = response.json()
     data = data if isinstance(data, dict) else {}
 
-    # A background request is accepted the moment it is queued, so the body answering the
-    # POST carries no reply at all -- the job has to be waited for and collected. Any
-    # other unfinished status is polled too: relaying one as a reply would hand the client
-    # an empty message, which is the failure this endpoint is prone to hiding.
+    # A background request is accepted the moment it is queued, so the POST body carries no reply.
+    # The job has to be waited for and collected.
+    # Any other unfinished status is polled too.
+    # Relaying one would hand the client an empty message, the failure this endpoint tends to hide.
     if str(data.get("status") or "") not in TERMINAL_STATUSES and data.get("id"):
         data = await_response(provider, str(data["id"]), time.monotonic() + cfg.responses_turn_timeout_seconds)
 
@@ -505,9 +499,9 @@ def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
 
 class StreamState:
     """
-    What one turn has received so far. Kept in an object rather than in locals because a
-    background turn can be served by several connections in a row, and each of them has
-    to carry on from what the last one left.
+    What one turn has received so far.
+    Kept in an object rather than locals because several connections can serve one background turn.
+    Each has to carry on from what the last one left.
     """
     def __init__(self) -> None:
         self.response_parts  : List[str] = []
@@ -515,8 +509,8 @@ class StreamState:
         self.finish_reason = "stop"
         self.message_id    = ""
         self.usage         : Any = None
-        # Every streamed event is numbered, and a resumed stream starts after a number
-        # the proxy names, so this is what says where to pick up.
+        # Every event is numbered, and a resumed stream starts after a number the proxy names.
+        # This is what says where to pick up.
         self.last_sequence = -1
         self.completed     = False
 
@@ -525,9 +519,9 @@ class StreamState:
 
     def content(self) -> Tuple[int, int]:
         """
-        How much of the reply exists so far. Deliberately not the sequence number: the
-        stream numbers its keepalives too, so counting those would report a connection
-        that carried nothing but heartbeats as one that made progress.
+        How much of the reply exists so far.
+        Deliberately not the sequence number, because the stream numbers its keepalives too.
+        Counting those would report a heartbeat-only connection as one that made progress.
         """
         return (len(self.text()), len(self.reasoning()))
 
@@ -543,8 +537,8 @@ def truncated_stream_error(state: StreamState, reason: str = "") -> ProviderErro
 def consume_events(response: Any, state: StreamState) -> Iterator[Tuple[str, str]]:
     """
     Reads one connection's SSE body into the state, yielding the deltas as they arrive.
-    Returns when the body ends, whether or not the response finished -- the caller
-    decides what an unfinished one means.
+    Returns when the body ends, finished or not.
+    The caller decides what an unfinished one means.
     """
     for line in response.iter_lines():
         if not line.startswith("data:"):
@@ -558,9 +552,9 @@ def consume_events(response: Any, state: StreamState) -> Iterator[Tuple[str, str
         if not isinstance(event, dict):
             continue
 
-        # A resumed stream is asked to start after the last number seen, so it should
-        # never repeat one. Dropping them here too means an off-by-one costs nothing;
-        # without it, it would duplicate text in the middle of the reply.
+        # A resumed stream starts after the last number seen, so it should never repeat one.
+        # Dropping them here too makes an off-by-one free.
+        # Without it, text would duplicate mid-reply.
         sequence = event.get("sequence_number")
         if isinstance(sequence, int):
             if sequence <= state.last_sequence:
@@ -606,11 +600,10 @@ def finish_from_object(data: Dict[str, Any], state: StreamState) -> Iterator[Tup
     """
     Completes a turn from the response object after the stream stopped carrying it.
 
-    A background response that finished while the proxy was disconnected has no live
-    stream left to attach to and does not replay the events it already sent, so the only
-    way to see the rest of the reply is to read it off the object. What was streamed is a
-    prefix of what the object holds, so only the remainder is yielded; on the off chance
-    that it is not, nothing is invented and the mismatch is reported.
+    A background response that finished while the proxy was disconnected has no live stream left.
+    It does not replay the events it already sent, so the rest of the reply is read off the object.
+    What was streamed is a prefix of what the object holds, so only the remainder is yielded.
+    If it is not, nothing is invented and the mismatch is reported.
     """
     raise_if_failed(data)
 
@@ -637,8 +630,8 @@ def finish_from_object(data: Dict[str, Any], state: StreamState) -> Iterator[Tup
 
 def open_stream(client: Any, provider: Dict[str, Any], body: Dict[str, Any], state: StreamState, resume: bool) -> Any:
     """
-    The connection a turn is read from: a POST that starts the response, or a GET that
-    picks a background one back up after the number it last delivered.
+    The connection a turn is read from.
+    Either a POST starting the response, or a GET resuming a background one after its last number.
     """
     if not resume:
         return client.stream(
@@ -657,20 +650,22 @@ def open_stream(client: Any, provider: Dict[str, Any], body: Dict[str, Any], sta
 
 def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
     """
-    Runs one streaming /responses request. Unlike the chat stream, which relays deltas
-    off one message, this is a typed event stream: reasoning summary text and reply
-    text arrive as separate event types, which is exactly the split the proxy needs.
+    Runs one streaming /responses request.
+    The chat stream relays deltas off one message; this is a typed event stream.
+    Summary text and reply text arrive as separate event types, exactly the split needed.
 
-    OpenAI cuts these streams mid-response -- no terminal event, no error, most often
-    while the model is reasoning silently over a long prompt. In background mode the
-    response outlives the connection, so a cut is recovered rather than lost: reconnect
-    to the running job, or read the finished one off its object. Without background mode
-    a cut is still an error, the same one as before.
+    OpenAI cuts these streams mid-response, with no terminal event and no error.
+    It happens most often while the model reasons silently over a long prompt.
+    In background mode the response outlives the connection, so a cut is recovered.
+    Reconnect to the running job, or read the finished one off its object.
+    Without background mode a cut is still an error, the same one as before.
     """
     provider = cfg.providers[cfg.backend]
     state    = StreamState()
 
-    # Two attempts at most: an unverified org rejects the summary request before any event is streamed, and note_summary_blocked drops it so the retry succeeds.
+    # Two attempts at most.
+    # An unverified org rejects the summary before any event streams.
+    # note_summary_blocked drops it so the retry succeeds.
     for attempt in (0, 1):
         body = build_body(prepared)
         body["stream"] = True
@@ -702,25 +697,24 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
                             yield from consume_events(response, state)
 
                     except httpx.TimeoutException:
-                        # A connection that goes quiet is the same cut in another shape:
-                        # nothing at all arrived before the read timeout. It is recovered
-                        # the same way, and without a job to recover it is a real failure.
+                        # A quiet connection is the same cut in another shape.
+                        # Nothing arrived before the read timeout.
+                        # Recovered the same way; without a job to recover it is a real failure.
                         if not background or not state.message_id:
                             raise
 
                     if state.completed:
                         break
 
-                    # The stream stopped without the response ever finishing. Only a
-                    # background response can be recovered: anything else is gone.
+                    # The stream stopped without the response ever finishing.
+                    # Only a background response can be recovered: anything else is gone.
                     if not background or not state.message_id:
                         raise truncated_stream_error(state)
 
-                    # The job itself says whether there is anything left to stream, and it
-                    # is the only thing that does: a connection carrying nothing means the
-                    # model is thinking silently, not that the turn is lost. If the job has
-                    # finished, its events are not replayed and only the object still has
-                    # the reply; if it is still running, reconnecting resumes it.
+                    # Only the job says whether anything is left to stream.
+                    # A connection carrying nothing means silent thinking, not a lost turn.
+                    # A finished job does not replay its events, so only the object has the reply.
+                    # A running one resumes on reconnect.
                     current = fetch_response(provider, state.message_id)
                     status  = str(current.get("status") or "")
 
@@ -733,8 +727,8 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
                     print(f"WARNING: the response stream was cut after {elapsed:.0f}s (status '{status}', "
                           f"reconnect {reconnects}); resuming background response {state.message_id}.")
 
-                    # A still-running job is never given up on for any reason but this one,
-                    # which is a limit of this proxy rather than anything OpenAI reported.
+                    # A running job is given up on for this reason alone.
+                    # It is a limit of this proxy, not anything OpenAI reported.
                     if elapsed >= cfg.responses_turn_timeout_seconds:
                         raise truncated_stream_error(state,
                             f"This proxy stopped waiting after {elapsed:.0f}s "
@@ -742,17 +736,16 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
                             f"response was still '{status}' at OpenAI, so it was cancelled; raising that setting "
                             "lets a long turn finish.")
 
-                    # Nothing new arrived, so the model is mid-thought and there is no
-                    # point reconnecting instantly -- that would just spin on the API.
+                    # Nothing new arrived, so the model is mid-thought.
+                    # Reconnecting instantly would just spin on the API.
                     if state.content() == before:
                         time.sleep(min(cfg.responses_poll_seconds, max(0.0, deadline - time.monotonic())))
 
                     resume = True
 
             finally:
-                # A background response keeps running, and billing, whether or not anyone
-                # is still reading it -- including when the client hung up and closed this
-                # generator, which is why this is a finally.
+                # A background response keeps running, and billing, whether or not anyone reads it.
+                # That includes a client hanging up and closing this generator, hence the finally.
                 if background and state.message_id and not state.completed:
                     cancel_response(provider, state.message_id)
 

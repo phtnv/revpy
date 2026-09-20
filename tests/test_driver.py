@@ -280,9 +280,9 @@ def test_chat_dump_formats(name: str) -> bool:
     return passed
 
 
-# The environment one config-parsing pass reads. Exercises all three lists, a name
-# declared twice, a name with no base URL, and a cost family with the two cache TTLs
-# priced apart.
+# The environment one config-parsing pass reads.
+# Exercises all three lists, a name declared twice, and a name with no base URL.
+# Also a cost family with the two cache TTLs priced apart.
 PROVIDER_ENV = {
     "V1_MESSAGES_PROVIDERS"        : "claude",
     "V1_CHAT_COMPLETIONS_PROVIDERS": "glm,twice,nourl",
@@ -301,8 +301,8 @@ PROVIDER_ENV = {
 
 def parse_provider_env() -> Any:
     """
-    Reloads the config over PROVIDER_ENV, then restores the test config. Config parsing
-    reads os.environ directly, so this is the only way to exercise it.
+    Reloads the config over PROVIDER_ENV, then restores the test config.
+    Config parsing reads os.environ directly, so this is the only way to exercise it.
     """
     for key, value in PROVIDER_ENV.items():
         os.environ[key] = value
@@ -318,9 +318,9 @@ def parse_provider_env() -> Any:
 
 def test_provider_config_parsing() -> bool:
     """
-    The wire protocol is the list a provider was declared in, and nothing else decides
-    which backend module serves it. This pins that mapping, the declaration order the
-    CLI numbering follows, and the two ways a declaration is rejected.
+    The wire protocol is the list a provider was declared in.
+    Nothing else picks the backend module.
+    This pins that mapping, the declaration order the CLI follows, and the two rejection paths.
     """
     global tests_ttl
     tests_ttl += 1
@@ -421,8 +421,9 @@ USAGE_CASES: list[tuple] = [
       "input_tokens_uncached": 10, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 0}),
 
     # A legacy payload reports only a total cache write, with no 5m/1h split to read.
-    # fallback_cache_write_ttl() then guesses from the configured markers, so the same
-    # payload is billed differently depending on them. Both directions are pinned.
+    # fallback_cache_write_ttl() then guesses from the configured markers.
+    # The same payload bills differently depending on them.
+    # Both directions are pinned.
     ("messages: legacy write, 1h marker active", "messages",
      anthropic_usage(inp=10, out=50, creation=100),
      {"uncached_input": 10, "cache_read": 0, "cache_write_1h": 100, "cache_write_5m": 0, "output": 50, "reasoning": None},
@@ -446,8 +447,7 @@ USAGE_CASES: list[tuple] = [
      {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150,
       "input_tokens_uncached": 20, "cache_creation_input_tokens": 30, "cache_read_input_tokens": 50}),
 
-    # A payload claiming more cached/written tokens than there were input tokens must
-    # not drive uncached input negative.
+    # A payload claiming more cached tokens than input tokens must not make uncached input negative.
     ("chat: overclaimed cache clamps", "chat",
      {"prompt_tokens": 10, "completion_tokens": 5,
       "prompt_tokens_details": {"cached_tokens": 999, "cache_write_tokens": 999}},
@@ -514,8 +514,8 @@ class FakeStream:
 
 class FakeStreamClient:
     """
-    Serves one canned body per connection, in the order the case lists them: a
-    background turn that is cut reconnects, and each connection gets the next body.
+    Serves one canned body per connection, in the order the case lists them.
+    A cut background turn reconnects, and each connection gets the next body.
     """
     def __init__(self, bodies: list[list[str]], calls: list[tuple[str, str]]) -> None:
         self._bodies = list(bodies)
@@ -545,10 +545,10 @@ class FakeResponse:
 def fake_httpx(bodies: list[list[str]], objects: list[dict[str, Any]], calls: list[tuple[str, str]],
                posts: list[dict[str, Any]] | None = None) -> SimpleNamespace:
     """
-    Stands in for the httpx module in v1_responses: streamed bodies for the connections,
-    canned response objects for the retrievals, and one list recording every call so a
-    case can assert what the recovery path actually did. 'posts' answers the
-    non-streaming request; without it a POST is a cancellation.
+    Stands in for the httpx module in v1_responses.
+    Streamed bodies for the connections, canned response objects for the retrievals.
+    One list records every call, so a case can assert what the recovery path did.
+    'posts' answers the non-streaming request; without it a POST is a cancellation.
     """
     def get(url: str, **kwargs: Any) -> FakeResponse:
         calls.append(("GET", url))
@@ -594,13 +594,13 @@ def response_object(status: str, text: str = "", reasoning: str = "") -> dict[st
 
 
 # A /responses stream is only finished when the response reports a terminal status.
-# Running out of body without one means the connection was cut mid-response; relaying
-# that as a clean stop hands the client an empty message and no reason for it, which
-# is indistinguishable from the model choosing to say nothing.
+# Running out of body without one means the connection was cut mid-response.
+# Relaying that as a clean stop hands the client an empty message and no reason.
+# That is indistinguishable from the model choosing to say nothing.
 #
-# In background mode a cut is recoverable instead: the response outlives the connection,
-# so the proxy reconnects to it while it is still running, and reads it off the response
-# object once it has finished (a finished response does not replay its events).
+# In background mode a cut is recoverable instead, because the response outlives the connection.
+# The proxy reconnects while it still runs, and reads it off the object once finished.
+# A finished response does not replay its events.
 STREAM_CASES = [
     {
         "name"   : "completed stream is relayed",
@@ -645,9 +645,9 @@ STREAM_CASES = [
         "reasoning"  : "Thinking...",
     },
     {
-        # The recovered reply should continue what the client already has. When it does
-        # not, the two cannot be stitched together, and guessing at a join would corrupt
-        # the message -- so the reply is left as it arrived.
+        # The recovered reply should continue what the client already has.
+        # When it does not, the two cannot be stitched together.
+        # Guessing at a join would corrupt the message, so the reply is left as it arrived.
         "name"       : "background will not graft on a reply that does not continue",
         "background" : True,
         "bodies"     : [sse(seq(0, CREATED_EVENT), seq(1, TEXT_EVENT))],
@@ -666,9 +666,9 @@ STREAM_CASES = [
         "text"       : "Hello.",
     },
     {
-        # A job that is still running is not given up on for bringing nothing: that is
-        # what silent reasoning looks like from here. Only the turn timeout ends it, and
-        # then the job is cancelled rather than left running.
+        # A running job is not given up on for bringing nothing.
+        # That is what silent reasoning looks like from here.
+        # Only the turn timeout ends it, and then the job is cancelled rather than left running.
         "name"         : "background keeps resuming a job that is still running",
         "background"   : True,
         "turn_timeout" : 0.0,
@@ -680,8 +680,8 @@ STREAM_CASES = [
         "resumes"      : 0,
     },
     {
-        # The same job, with room to work: reconnecting continues until it finishes,
-        # however many cuts that takes and however little some of them carry.
+        # The same job, with room to work.
+        # Reconnecting continues until it finishes, whatever the cuts cost.
         "name"         : "background outlasts several empty reconnects",
         "background"   : True,
         "bodies"       : [
@@ -710,7 +710,8 @@ STREAM_CASES = [
         "error"   : True,
     },
     {
-        # The client hung up. The response would otherwise keep running, and billing.
+        # The client hung up.
+        # The response would otherwise keep running, and billing.
         "name"       : "background cancels when the client walks away",
         "background" : True,
         "bodies"     : [sse(seq(0, CREATED_EVENT), seq(1, TEXT_EVENT), seq(2, COMPLETED_EVENT))],
@@ -730,8 +731,8 @@ def test_responses_stream_termination(case: dict[str, Any]) -> bool:
     cfg.model     = "gpt-5.6-sol"
     cfg.providers = {"gpt": make_provider(api="responses", background=case.get("background", False))}
     cfg.responses_poll_seconds          = 0.0
-    # Short on purpose: a recovery loop that fails to terminate should fail the case
-    # quickly rather than sit there until a real timeout expires.
+    # Short on purpose.
+    # A recovery loop that will not terminate should fail fast, not wait out a real timeout.
     cfg.responses_turn_timeout_seconds  = case.get("turn_timeout", 5.0)
 
     prepared = {"messages": [{"role": "user", "content": "hi"}], "system_segments": [],
@@ -751,8 +752,8 @@ def test_responses_stream_termination(case: dict[str, Any]) -> bool:
                 for kind, data in stream:
                     if kind == "final" : final = data
                     else               : chunks[kind].append(data)
-                    # Walking away mid-turn is what a disconnected client looks like from
-                    # here: the generator is closed while it is still producing.
+                    # A disconnected client looks like this from here.
+                    # The generator is closed while still producing.
                     if case.get("abandon") and kind == "text":
                         stream.close()
                         break
@@ -804,9 +805,9 @@ def test_responses_stream_termination(case: dict[str, Any]) -> bool:
     return passed
 
 
-# A background request is answered with 'queued' and no reply at all, so the
-# non-streaming path has to wait for the job and collect it. Relaying that first body
-# would hand the client an empty message -- the failure this endpoint is prone to hiding.
+# A background request is answered with 'queued' and no reply.
+# The non-streaming path has to wait for the job and collect it.
+# Relaying that first body would hand back an empty message, the failure this endpoint hides.
 NON_STREAM_CASES = [
     {
         "name"       : "background waits for the job and collects the reply",
@@ -825,8 +826,8 @@ NON_STREAM_CASES = [
         "error"      : True,
     },
     {
-        # Without background the POST already carries the whole response, and nothing
-        # about this path changes: no retrieval at all.
+        # Without background the POST carries the whole response, and nothing here changes.
+        # No retrieval at all.
         "name"       : "a finished response is used as it arrives",
         "posts"      : [response_object("completed", text="Hello.")],
         "text"       : "Hello.",
@@ -933,7 +934,8 @@ def test_provider_request_bodies() -> bool:
     return passed
 
 
-# Image generation. None of these contact a provider.
+# Image generation.
+# None of these contact a provider.
 IMAGE_EXTRACTION_CASES = [
     {
         "name"       : "a block in the last user message triggers and is stripped",
@@ -1063,8 +1065,7 @@ IMAGE_VALIDATION_CASES = [
     ({"prompt": "x", "size": "512x512"}                 , "pixels"),
     ({"prompt": "x", "size": "wide"}                    , "WIDTHxHEIGHT"),
     ({"prompt": "x", "quality": "ultra"}                , "quality must be one of"),
-    # gpt-image-2 has no transparent background; offering the value would only produce
-    # a provider-side rejection later.
+    # gpt-image-2 has no transparent background; offering it only earns a rejection later.
     ({"prompt": "x", "background": "transparent"}       , "background must be one of"),
     ({"prompt": "x", "output_format": "gif"}            , "output_format must be one of"),
     ({"prompt": "x", "n": 0}                            , "n must be between"),
@@ -1072,8 +1073,8 @@ IMAGE_VALIDATION_CASES = [
     ({"prompt": "x", "n": "two"}                        , "n must be an integer"),
     ({"prompt": "x", "model": "dall-e-3", "user": "u"}  , None),
     ({"prompt": "x", "stream": True}                    , "streaming image generation is not supported"),
-    # Everything the caller must never choose. 'model' is accepted above only because
-    # OpenAI clients always send it; it is not an override.
+    # Everything the caller must never choose.
+    # 'model' is accepted above only because OpenAI clients always send it; it is not an override.
     ({"prompt": "x", "qualtiy": "low"}                  , "unsupported field"),
     ({"prompt": "x", "provider": "gpt"}                 , "unsupported field"),
     ({"prompt": "x", "base_url": "http://evil.test"}    , "unsupported field"),
@@ -1087,17 +1088,17 @@ IMAGE_VALIDATION_CASES = [
     ({"prompt": "x", "filename": "..\\..\\win"}         , "no path separators"),
     ({"prompt": "x", "filename": ".hidden"}             , "no path separators"),
     ({"prompt": "x", "filename": ".."}                  , "no path separators"),
-    # An output directory gets copied and read on the other platform, so a name is judged by
-    # what both will accept rather than by what the machine writing it happens to allow.
+    # An output directory gets copied and read on the other platform.
+    # A name is judged by what both accept, not by what the writing machine allows.
     ({"prompt": "x", "filename": "nul"}                 , "reserved device name"),
     ({"prompt": "x", "filename": "CON"}                 , "reserved device name"),
     ({"prompt": "x", "filename": "com4.png"}            , "reserved device name"),
-    # 'console' only starts like one, and 'nul_1' is what indexing a reserved name would
-    # produce -- neither is reserved, and rejecting them would be superstition.
+    # 'console' only starts like one, and 'nul_1' is what indexing a reserved name produces.
+    # Neither is reserved, and rejecting them would be superstition.
     ({"prompt": "x", "filename": "console"}             , None),
     ({"prompt": "x", "filename": "nul_1"}               , None),
-    # Windows strips a trailing dot silently, so the file that appears is not the one asked
-    # for. A single one is already the extension by the time it is checked, so this is 'a..'.
+    # Windows strips a trailing dot silently, so the file that appears is not the one asked for.
+    # A single one is already the extension by the time it is checked, so this is 'a..'.
     ({"prompt": "x", "filename": "trailing.."}          , "must not end in a dot"),
     ({"prompt": "x", "filename": "trailing."}           , None),
 ]
@@ -1135,8 +1136,8 @@ def test_image_request_validation() -> bool:
 
 def test_image_storage_confinement() -> bool:
     """
-    Storage is the last line able to catch a path escaping the output directory, and it
-    is what guarantees an existing image is never overwritten.
+    Storage is the last line able to catch a path escaping the output directory.
+    It is what guarantees an existing image is never overwritten.
     """
     global tests_ttl
     tests_ttl += 1
@@ -1157,16 +1158,16 @@ def test_image_storage_confinement() -> bool:
             print(f"exp=['shot.png', 'shot_1.png'], rec={names} ", end="")
             passed = False
 
-        # The first file must still hold its own bytes; an index that overwrote it
-        # would leave both names pointing at the second image.
+        # The first file must keep its own bytes.
+        # An index that overwrote it would leave both names on the second image.
         with open(os.path.join(tmp, "shot.png"), "rb") as handle:
             if handle.read() != b"\x89PNG-one":
                 print("exp=first image intact, rec=overwritten ", end="")
                 passed = False
 
-        # A name differing only in case is taken. Windows would refuse it outright and Linux
-        # would allow it, and a directory meant to be copied between them cannot behave two
-        # ways -- so it indexes here on both.
+        # A name differing only in case is taken.
+        # Windows would refuse it and Linux would allow it.
+        # A directory meant to be copied between them cannot behave two ways, so it indexes on both.
         cased = v1_images.save_image_bytes(v1_images.build_request({"prompt": "x", "filename": "SHOT"}),
                                            b"\x89PNG-three", "img_cccc")
         if os.path.basename(cased.path) != "SHOT_2.png":
@@ -1251,8 +1252,8 @@ def test_image_usage_accounting() -> bool:
 
 def test_image_batch_accounting() -> bool:
     """
-    Batch spending is billed at its own rate and kept in its own bucket, so the session
-    report can tell immediate from batch spending rather than blending them.
+    Batch spending is billed at its own rate and kept in its own bucket.
+    The session report can then tell immediate from batch rather than blending them.
     """
     global tests_ttl
     tests_ttl += 1
@@ -1301,8 +1302,9 @@ def test_image_batch_accounting() -> bool:
 # Image editing
 def make_png(width: int, height: int, alpha: bool = False) -> bytes:
     """
-    A minimal valid PNG. Built by hand rather than with an imaging library, because the
-    proxy deliberately has no such dependency -- it reads headers, so the tests write them.
+    A minimal valid PNG.
+    Built by hand rather than with an imaging library, since the proxy has no such dependency.
+    It reads headers, so the tests write them.
     Colour type 6 is RGBA, 2 is RGB; that byte is what the mask check reads.
     """
     channels    = 4 if alpha else 2 + 1  # RGBA = 4 bytes, RGB = 3
@@ -1333,8 +1335,8 @@ def write_file(directory: str, name: str, payload: bytes) -> str:
 
 def test_image_reference_validation() -> bool:
     """
-    A reference image is identified by its content, never its name, and anything the
-    proxy cannot use is rejected outright rather than dropped from the list.
+    A reference image is identified by content, never by name.
+    Anything unusable is rejected outright rather than dropped from the list.
     """
     global tests_ttl
     tests_ttl += 1
@@ -1416,9 +1418,10 @@ def test_image_reference_validation() -> bool:
 
 def test_image_edit_path_security() -> bool:
     """
-    The load-bearing test. A path written in a chat block is a file-read primitive aimed
-    at whatever the proxy can reach, so it must be refused unless explicitly enabled and
-    inside an allowed root -- and a symlink must not be able to walk out of one.
+    The load-bearing test.
+    A path written in a chat block is a file-read primitive aimed at whatever the proxy can reach.
+    It is refused unless explicitly enabled and inside an allowed root.
+    A symlink must not be able to walk out of one.
     """
     global tests_ttl
     tests_ttl += 1
@@ -1587,8 +1590,8 @@ def test_image_edit_batch_rules() -> bool:
             ({"images": [one], "batch": True}                            , "cannot be batched"),
             ({"images": [one], "file_ids": ["file-abc"]}                 , "mutually exclusive"),
             ({"file_ids": ["/local/path.png"], "batch": True}            , "must be a provider file id"),
-            # A mask rides along in the JSON body, so a batch takes one -- held to the same
-            # alpha rule as anywhere else, since that is what marks the editable region.
+            # A mask rides along in the JSON body, so a batch takes one.
+            # It is held to the same alpha rule, since that marks the editable region.
             ({"file_ids": ["file-abc"], "mask": alpha_mask, "batch": True}, ""),
             ({"file_ids": ["file-abc"], "mask": flat, "batch": True}     , "no alpha channel"),
         ]
@@ -1608,11 +1611,11 @@ def test_image_edit_batch_rules() -> bool:
                 passed = False
 
         # A batched edit carries its references in the body, since multipart is unavailable.
-        # The shape below was verified against the provider: 'images', always an array,
-        # always objects. A bare id string inside the array is rejected with "expected an
-        # object", a bare string instead of the array with "expected an array of objects",
-        # and the 'input_reference' field the batch guide documents (which belongs to
-        # image-guided generation) with "Missing required parameter: 'images'".
+        # Verified against the provider: 'images', always an array, always objects.
+        # A bare id string inside the array is rejected with "expected an object".
+        # A bare string instead of the array gets "expected an array of objects".
+        # The 'input_reference' field the batch guide documents belongs to image-guided generation.
+        # It gets "Missing required parameter: 'images'".
         request = v1_images.build_request({"prompt": "x", "file_ids": ["file-abc"], "batch": True}, source="cli")
         body    = v1_images.build_body(request)
         if body.get("images") != [{"file_id": "file-abc"}]:
@@ -1622,9 +1625,9 @@ def test_image_edit_batch_rules() -> bool:
             print("exp=no input_reference field, rec=sent ", end="")
             passed = False
 
-        # The mask takes the same reference shape as an entry of 'images', carrying its
-        # bytes inline because a batch has no upload to make. Verified against the
-        # provider: a batch line carrying one passes validation and runs.
+        # The mask takes the same shape as an entry of 'images'.
+        # Its bytes ride inline, because a batch has no upload to make.
+        # Verified against the provider: a batch line carrying one passes validation and runs.
         request = v1_images.build_request(
             {"prompt": "x", "file_ids": ["file-abc"], "mask": alpha_mask, "batch": True}, source="cli")
         body    = v1_images.build_body(request)
@@ -1777,8 +1780,8 @@ def test_image_mask_validation() -> bool:
             print(f"exp=1 reference (mask is not a slot), rec={len(request.images)} ", end="")
             passed = False
 
-        # ...but a caller that never asked for it must be able to say so, or a mask left
-        # set from the console would silently shape every request that followed.
+        # ...but a caller that never asked for it must be able to say so.
+        # Otherwise a console mask would silently shape every request after it.
         for refusal in (False, "none", "off", "false"):
             refused = v1_images.build_request({"prompt": "x", "edit": True, "mask": refusal}, source="cli")
             if refused.mask is not None:
@@ -1850,8 +1853,8 @@ def test_image_manifest_patch() -> bool:
             fail(f"exp=the corrected size, rec={after.get('request_parameters')}")
         if after.get("request_parameters", {}).get("output_format") != "png":
             fail(f"exp=output_format left alone, rec={after.get('request_parameters')}")
-        # The region is corrected; the picture the proxy rasterised is kept, since it cannot
-        # render it again from rectangles it was handed afterwards.
+        # The region is corrected and the rasterised picture kept.
+        # It cannot be rendered again from rectangles handed over afterwards.
         if after.get("mask", {}).get("rects") != moved["rects"]:
             fail(f"exp=the corrected rectangles, rec={after.get('mask')}")
         if after.get("mask", {}).get("file") != "alpha.png":
@@ -1919,8 +1922,9 @@ def test_image_rename() -> bool:
         common.cfg.image_manifest_enabled = True
         mask = write_file(tmp, "alpha.png", make_png(32, 32, alpha=True))
 
-        # One generated image, then an edit of it: the second record names the first as a source,
-        # which is the half a rename would strand if it only fixed the record of the file itself.
+        # One generated image, then an edit of it.
+        # The second record names the first as a source.
+        # That is the half a rename would strand.
         png   = make_png(32, 32)
         first = v1_images.build_request({"prompt": "a coat", "filename": "redcoat"}, source="cli")
         v1_images.append_manifest(first, [v1_images.save_image_bytes(first, png, "img_aaaa")],
@@ -2064,8 +2068,9 @@ def test_image_mask_region() -> bool:
         check("rectangles"       , good)
         # Structure has to travel as a string through multipart, as the job stamps do.
         check("as a JSON string" , json.dumps(good))
-        # Numbers as some clients spell them. Recorded as numbers either way, since a manifest
-        # read back has to give the same answer whichever door the request came in by.
+        # Numbers as some clients spell them.
+        # Recorded as numbers either way.
+        # A manifest read back gives the same answer whichever door the request used.
         check("numeric strings"  , {"size": {"width": "32", "height": "32"},
                                     "rects": [{"x": "1", "y": "2", "w": "3", "h": "4", "mode": "add"}]})
 
@@ -2080,8 +2085,8 @@ def test_image_mask_region() -> bool:
         check("too many rects"   , {"size": good["size"], "rects": [{"x": 0, "y": 0, "w": 1, "h": 1}] * 513},
               "the limit is 512")
 
-        # A region describes a mask, so one arriving alone means the caller sent the two halves
-        # down different paths -- worth reporting rather than recording.
+        # A region describes a mask, so one alone means the halves came down different paths.
+        # Worth reporting rather than recording.
         check("region, no mask"  , good, "without a mask", with_mask=False)
 
         # A region with no rectangles selects nothing, so there is nothing to record.
@@ -2099,8 +2104,8 @@ def test_image_mask_region() -> bool:
 
 def test_image_mask_persistence() -> bool:
     """
-    A mask that only ever existed as bytes is written out beside the images it shaped, so
-    the manifest names a file rather than a bare 'upload:' label with nothing behind it.
+    A mask that only existed as bytes is written beside the images it shaped.
+    The manifest then names a file, not a bare 'upload:' label with nothing behind it.
     """
     global tests_ttl
     tests_ttl += 1
@@ -2128,9 +2133,10 @@ def test_image_mask_persistence() -> bool:
             records = json.load(handle)
 
         masks = [record.get("mask") for record in records]
-        # One mask per request, whatever n was: it belongs to the request, not to any one
-        # image, so both records say the same thing. The region is the durable half -- it can be
-        # read back, corrected and asked for again -- and the file is the picture it rasterised to.
+        # One mask per request, whatever n was.
+        # It belongs to the request, not one image, so both records agree.
+        # The region is the durable half: readable, correctable, askable again.
+        # The file is the picture it rasterised to.
         expected = [{**region, "file": "masks/redcoat.png"}] * 2
         if masks != expected:
             print(f"exp={expected}, rec={masks} ", end="")
@@ -2153,8 +2159,8 @@ def test_image_mask_persistence() -> bool:
 
         with open(os.path.join(tmp, v1_images.MANIFEST_FILE), "r", encoding="utf-8") as handle:
             records = json.load(handle)
-        # No region given, so the record says only where the picture is -- which is all a caller
-        # that never drew rectangles can honestly claim.
+        # No region given, so the record says only where the picture is.
+        # That is all a caller who drew no rectangles can claim.
         if records[-1].get("mask") != {"file": "hand.png"}:
             print(f"exp=hand.png named where it lies, rec={records[-1].get('mask')} ", end="")
             passed = False
@@ -2184,8 +2190,8 @@ def test_image_mask_persistence() -> bool:
 
 def test_image_data_url_references() -> bool:
     """
-    A data URL is an upload by another route: bytes the caller already held, reaching no
-    filesystem. It is what lets a JSON request carry a mask it has no file for.
+    A data URL is an upload by another route: bytes the caller already held, reaching no filesystem.
+    It is what lets a JSON request carry a mask it has no file for.
     """
     global tests_ttl
     tests_ttl += 1
@@ -2201,8 +2207,8 @@ def test_image_data_url_references() -> bool:
         common.cfg.image_output_dir = tmp
         base = write_file(tmp, "base.png", make_png(64, 64))
 
-        # A path names the reference, a data URL carries the mask: the two encodings mix,
-        # which is the point -- large references stay on disk, a drawn mask rides along.
+        # A path names the reference and a data URL carries the mask.
+        # Mixing the encodings is the point: big references stay on disk, a drawn mask rides along.
         request = v1_images.build_request(
             {"prompt": "x", "images": [base], "mask": data_url(make_png(64, 64, alpha=True))}, source="cli")
         if request.mask is None or request.mask.path or request.mask.data is None:
@@ -2219,8 +2225,8 @@ def test_image_data_url_references() -> bool:
             print("exp=inline reference held as bytes, rec=otherwise ", end="")
             passed = False
 
-        # Content decides, exactly as it does for a path or an upload: a mediatype that
-        # disagrees with the bytes is advisory, and a non-image is refused whatever it claims.
+        # Content decides, exactly as for a path or an upload.
+        # A mediatype disagreeing with the bytes is advisory; a non-image is refused regardless.
         mislabelled = v1_images.build_request(
             {"prompt": "x", "images": [data_url(make_png(64, 64), "image/jpeg")]}, source="cli")
         if mislabelled.images[0].format != "png":
@@ -2256,8 +2262,8 @@ def test_image_data_url_references() -> bool:
                 print(f"exp=size cap cited, rec={exc} ", end="")
                 passed = False
 
-        # A prompt-supplied data URL touches no filesystem, so the path allowlist -- which
-        # exists to stop a prompt reading this disk -- has nothing to say about it.
+        # A prompt-supplied data URL touches no filesystem.
+        # The allowlist exists to stop a prompt reading this disk, so it says nothing here.
         common.cfg.image_edit_max_bytes         = 20*1024*1024
         common.cfg.image_edit_allow_prompt_paths = False
         try:
@@ -2274,8 +2280,8 @@ def test_image_data_url_references() -> bool:
 
 def test_image_uploaded_references() -> bool:
     """
-    Uploaded bytes are validated by the same content rules as a path, and touch the
-    filesystem not at all -- which is why the path allowlist does not apply to them.
+    Uploaded bytes get the same content rules as a path and never touch the filesystem.
+    That is why the path allowlist does not apply to them.
     """
     global tests_ttl
     tests_ttl += 1
@@ -2350,8 +2356,9 @@ def test_image_uploaded_references() -> bool:
 
 def test_image_http_routes() -> bool:
     """
-    The HTTP surface: generations and edits are split the way the upstream API splits
-    them, and the reply carries what an OpenAI client expects.
+    The HTTP surface.
+    Generations and edits split as the upstream API does.
+    The reply carries what an OpenAI client expects.
     """
     global tests_ttl
     tests_ttl += 1
@@ -2433,8 +2440,8 @@ def test_image_http_routes() -> bool:
 
 def test_image_batch_numbering() -> bool:
     """
-    Batches are referenced by a short number, not the provider's hash: numbers are
-    assigned once, survive a restart, are never reused, and resolve back to the id.
+    Batches are referenced by a short number, not the provider's hash.
+    Numbers are assigned once, survive a restart, are never reused, and resolve back to the id.
     """
     global tests_ttl
     tests_ttl += 1
@@ -2489,8 +2496,7 @@ def test_image_batch_numbering() -> bool:
             print("exp=next number 4, rec=reused ", end="")
             passed = False
 
-        # Starting the poller twice (boot, then a 'reload' that re-enables it) must not
-        # leave two threads racing for the same batches.
+        # Starting the poller twice, at boot then on a 'reload', must not leave two threads racing.
         common.cfg.image_batch_auto_poll = True
         threads_before = threading.active_count()
         with contextlib.redirect_stdout(io.StringIO()):
@@ -2517,10 +2523,10 @@ def test_image_source_files() -> bool:
     """
     Declared lineage outlives the reference it describes.
 
-    A batched edit names its inputs by provider file id, and those ids expire and are
-    deleted -- so the manifest records which file on this machine each one stood for.
-    Declared by the caller when only the caller can know, derived from the references
-    otherwise, and carried through the batch wait either way.
+    A batched edit names its inputs by provider file id, and those ids expire.
+    The manifest records which file on this machine each one stood for.
+    Declared by the caller when only they can know, derived from the references otherwise.
+    Carried through the batch wait either way.
     """
     global tests_ttl
     tests_ttl += 1
@@ -2530,13 +2536,14 @@ def test_image_source_files() -> bool:
     passed = True
 
     with tempfile.TemporaryDirectory() as tmp:
-        # The manifest's own directory is what every recorded path is relative to, so it has
-        # to be the real one from the first call that records anything.
+        # Every recorded path is relative to the manifest's own directory.
+        # It has to be the real one from the first call that records anything.
         common.cfg.image_output_dir = tmp
         base_path = write_file(tmp, "base.png", make_png(16, 16))
 
-        # An object names all three parts; a bare string is a path only when it looks like
-        # one, because reading "base.png" as a path would invent a location it never had.
+        # An object names all three parts.
+        # A bare string is a path only when it looks like one.
+        # Reading "base.png" as a path would invent a location.
         received = v1_images.validate_source_files([
             {"file_id": "file-abc", "file": "base.png", "path": base_path},
             base_path,
@@ -2550,8 +2557,7 @@ def test_image_source_files() -> bool:
         if not check_equal(expected, received):
             passed = False
 
-        # A path that no longer resolves is kept as given: the file may have moved, and a
-        # stale link beats no link.
+        # A path that no longer resolves is kept as given; the file may have moved.
         moved = v1_images.validate_source_files(["/gone/away/old.png"])
         if moved != [{"path": "/gone/away/old.png", "file": "old.png"}]:
             print(f"exp=unresolvable path kept, rec={moved} ", end="")
@@ -2565,8 +2571,8 @@ def test_image_source_files() -> bool:
             except v1_images.ImageRequestError:
                 pass
 
-        # Listing the same references in both fields pairs them positionally, so the
-        # caller does not repeat every id inside the entry it already lines up with.
+        # Listing the same references in both fields pairs them positionally.
+        # The caller need not repeat every id inside the entry it lines up with.
         request = v1_images.build_request({
             "prompt"       : "restyle these",
             "batch"        : True,
@@ -2588,8 +2594,8 @@ def test_image_source_files() -> bool:
             print(f"exp=caller's own pairing kept, rec={paired} ", end="")
             passed = False
 
-        # Nothing declared: an immediate edit still gets the field, derived from what it
-        # actually carried. A path knows where it came from, an upload only its name.
+        # Nothing declared, so an immediate edit derives the field from what it carried.
+        # A path knows where it came from, an upload only its name.
         derived = v1_images.manifest_source_files(v1_images.ImageRequest(
             prompt="x", size="auto", quality="auto", output_format="png",
             background="opaque", n=1, batch=False,
@@ -2604,8 +2610,8 @@ def test_image_source_files() -> bool:
             print(f"exp={expected}, rec={derived} ", end="")
             passed = False
 
-        # A source outside the output directory climbs out of it rather than going absolute,
-        # and says so with forward slashes on either platform.
+        # A source outside the output directory climbs out rather than going absolute.
+        # It says so with forward slashes on either platform.
         outside = os.path.join(tmp, "refs", "held.png")
         os.makedirs(os.path.dirname(outside), exist_ok=True)
         write_file(os.path.dirname(outside), "held.png", make_png(8, 8))
@@ -2618,15 +2624,14 @@ def test_image_source_files() -> bool:
             print(f"exp=[refs/held.png], rec={nested} ", end="")
             passed = False
 
-        # The manifest is written when a batch is retrieved, hours after the request that
-        # declared the lineage is gone -- so the state file has to carry it.
+        # The manifest is written on retrieval, hours after the declaring request is gone.
+        # The state file has to carry it.
         restored = v1_images.state_to_request(v1_images.request_to_state(request))
         if not check_equal(request.source_files, restored.source_files):
             passed = False
 
-        # The record itself: a basename that joins it to a directory listing, its size, and
-        # the lineage. Every path in it is relative to this manifest's directory, so a
-        # generated image's 'path' comes out equal to its 'file'.
+        # The record itself: a basename joining it to a listing, its size, and the lineage.
+        # Paths are relative to the manifest's directory, so a generated image's 'path' is its name.
         common.cfg.image_manifest_enabled = True
         common.cfg.image_manifest_prompts = True
 
@@ -2670,8 +2675,8 @@ def test_image_batch_listing() -> bool:
     """
     The listing a client rebuilds its job list from: recorded state only, newest first.
 
-    It must not ask the provider about anything. A listing is polled, and one that fanned
-    out would both cost and, through retrieval, bill.
+    It must not ask the provider about anything.
+    A listing is polled, and one that fanned out would both cost and, through retrieval, bill.
     """
     global tests_ttl
     tests_ttl += 1
@@ -2727,8 +2732,8 @@ def test_image_batch_listing() -> bool:
 
 def test_image_batch_polling() -> bool:
     """
-    The poller settles finished batches, leaves running ones alone, keeps going past a
-    batch that errors, and stops chasing one that failed or expired.
+    The poller settles finished batches and leaves running ones alone.
+    It keeps going past one that errors, and stops chasing one that failed or expired.
     """
     global tests_ttl
     tests_ttl += 1
@@ -2769,8 +2774,7 @@ def test_image_batch_polling() -> bool:
         finally:
             v1_images.retrieve_image_batch = original
 
-        # Every pending batch is checked, in number order, and one raising does not
-        # stop the ones after it.
+        # Every pending batch is checked in number order; one raising does not stop the rest.
         if seen != ["batch_done", "batch_running", "batch_broken", "batch_expired"]:
             print(f"exp=all four checked in order, rec={seen} ", end="")
             passed = False
@@ -2793,8 +2797,9 @@ def test_image_batch_polling() -> bool:
 
 def test_image_chat_integration() -> bool:
     """
-    The two chat outcomes: an image-only turn never reaches a text backend, and a mixed
-    turn keeps the model's prose with the reference appended.
+    The two chat outcomes.
+    An image-only turn never reaches a text backend.
+    A mixed turn keeps the prose, reference appended.
     """
     global tests_ttl
     tests_ttl += 1
@@ -2864,8 +2869,8 @@ def test_image_chat_integration() -> bool:
 
 def test_image_failure_is_inline() -> bool:
     """
-    A provider failure must cost the turn its image, never its text -- and an HTML
-    gateway error page must not be relayed into the reply verbatim.
+    A provider failure must cost the turn its image, never its text.
+    An HTML gateway error page must not reach the reply verbatim.
     """
     global tests_ttl
     tests_ttl += 1
@@ -2922,8 +2927,8 @@ def test_image_failure_is_inline() -> bool:
 
 def test_image_model_selection_is_isolated() -> bool:
     """
-    The rule the whole feature rests on: choosing an image model must leave the
-    conversation, its backend and its text prices exactly as they were.
+    The rule the whole feature rests on.
+    Choosing an image model must leave the conversation, its backend and its text prices untouched.
     """
     global tests_ttl
     tests_ttl += 1

@@ -1,9 +1,9 @@
 """
 Chat-side image request detection.
 
-User-written <IMAGE_REQUEST_TAG> blocks are stripped from every user message, but only
-the last user message can trigger generation. Chat clients resend history; old image
-blocks must not spend again.
+User-written <IMAGE_REQUEST_TAG> blocks are stripped from every user message.
+Only the last user message can trigger generation.
+Chat clients resend history; old image blocks must not spend again.
 """
 
 import json5
@@ -28,14 +28,18 @@ class Extraction:
 
 
 def block_pattern() -> re.Pattern:
-    """The control block regex for the configured tag. Built per call because the tag is reloadable."""
+    """
+    The control block regex for the configured tag.
+    Built per call because the tag is reloadable.
+    """
     tag = re.escape(cfg.image_request_tag)
     return re.compile(rf"<{tag}\s*>(?P<body>.*?)</{tag}\s*>", re.IGNORECASE | re.DOTALL)
 
 
 def parse_block_body(body: str) -> Dict[str, Any]:
     """
-    Parse one control block. Bodies may be json5 fields, a braced object, or a bare prompt.
+    Parse one control block.
+    Bodies may be json5 fields, a braced object, or a bare prompt.
     """
     text = (body or "").strip()
     if not text:

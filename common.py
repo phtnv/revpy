@@ -14,36 +14,34 @@ THINK_EFFORTS  = {"low", "medium", "high", "xhigh", "max"}
 INF_VALUES     = {"inf", "all", "infinite", "infinity", "*", "∞"}
 UINT64_MAX     = 2**64 - 1
 
-# The same thinking efforts, weakest first. Provider dialects fold this ladder onto
-# their own supported subset by walking it downwards from the requested level.
+# The same thinking efforts, weakest first.
+# Provider dialects fold this ladder onto their own subset, walking down from the request.
 THINK_EFFORT_ORDER  = ("low", "medium", "high", "xhigh", "max")
 MAX_TOKENS_PARAMS   = {"auto", "max_tokens", "max_completion_tokens"}
 REASONING_SUMMARIES = {"none", "auto", "concise", "detailed"}
 
 # Image generation enums, as accepted by /images/generations on the gpt-image family.
-# 'transparent' is deliberately absent from the backgrounds: gpt-image-2 does not support
-# it, and offering a value the model will reject is worse than not offering it at all.
+# 'transparent' is deliberately absent: gpt-image-2 does not support it.
+# Offering a value the model will reject is worse than not offering it at all.
 IMAGE_RESPONSE_FORMATS = {"b64_json", "path"}
 IMAGE_QUALITIES   = {"auto", "low", "medium", "high", "xhigh", "max"}
 IMAGE_FORMATS     = {"png", "jpeg", "webp"}
 IMAGE_BACKGROUNDS = {"opaque", "automatic"}
 
-# Size constraints rather than a size allowlist. gpt-image-2 accepts any resolution
-# meeting all of these, so an enum of the four popular sizes would reject valid requests
-# and would go stale the moment the model's range changes.
+# Size constraints rather than a size allowlist.
+# gpt-image-2 accepts any resolution meeting all of these.
+# An enum of the four popular sizes would reject valid requests and go stale quickly.
 IMAGE_SIZE_MAX_EDGE     = 3840
 IMAGE_SIZE_EDGE_MULTIPLE = 16
 IMAGE_SIZE_MAX_ASPECT   = 3.0
 IMAGE_SIZE_MIN_PIXELS   = 655_360
 IMAGE_SIZE_MAX_PIXELS   = 8_294_400
 
-# Which wire protocol a provider speaks, and the variable declaring the providers that
-# speak it. A provider is served by the module for the list it was declared in; nothing
-# is derived from its endpoint, so pointing a provider at any host that implements the
-# protocol is a matter of putting its name in the right list.
+# Which wire protocol a provider speaks, and the variable declaring the providers that speak it.
+# A provider is served by the module for its list; nothing is derived from its endpoint.
+# Pointing one at any host speaking the protocol means putting its name in the right list.
 #
-# Declaration order across the three lists is the order of this dict, which is also the
-# order of the CLI model list.
+# Declaration order across the three lists is this dict's order, and the CLI list's order.
 API_STYLE_VARS = {
     "messages"  : "V1_MESSAGES_PROVIDERS",
     "chat"      : "V1_CHAT_COMPLETIONS_PROVIDERS",
@@ -224,9 +222,8 @@ class RuntimeConfig:
             {text_input: 5.00, image_input: 8.00, image_output: 30.00}
         See resolve_image_costs() for what a missing key falls back to.
 
-        This is deliberately a separate namespace from parse_cost_families(): the same
-        provider serves text and image models, and <PREFIX>_MODEL_* must keep pricing only
-        the text ones.
+        Deliberately a separate namespace from parse_cost_families().
+        One provider serves text and image models, and <PREFIX>_MODEL_* must price only text.
         """
         families: List[Dict[str, Any]] = []
         family_var_re = re.compile(rf"^{re.escape(prefix)}_IMAGE_MODEL_([A-Za-z0-9]+)_REGEX$")
@@ -257,8 +254,8 @@ class RuntimeConfig:
 
     def parse_provider(self, name: str, api: str) -> Optional[Dict[str, Any]]:
         """
-        One provider entry, from the <NAME>_* variables. Returns None when the provider
-        cannot be used at all, which is a missing base URL and nothing else.
+        One provider entry, from the <NAME>_* variables.
+        Returns None when the provider is unusable, which means a missing base URL and nothing else.
 
         Required:
             <NAME>_BASE_URL            the /v1 root, without a trailing slash
@@ -281,7 +278,8 @@ class RuntimeConfig:
             <NAME>_CACHE_WRITE_5M_COST_USD, <NAME>_CACHE_WRITE_1H_COST_USD
             <NAME>_MODEL_<FAMILY>_REGEX / _COST   see parse_cost_families()
 
-        The wire protocol is not among these. It is the list the name was declared in.
+        The wire protocol is not among these.
+        It is the list the name was declared in.
         """
         prefix = re.sub(r"[^A-Z0-9]", "_", name.upper())
 
@@ -329,13 +327,13 @@ class RuntimeConfig:
             "models_regex"        : models_regex,
             "max_tokens_param"    : max_tokens_param,
             "reasoning_summary"   : reasoning_summary,
-            # The /responses endpoint retains responses for 30 days by default. Chat
-            # content is nobody else's business, so the proxy opts out unless asked.
+            # The /responses endpoint retains responses for 30 days by default.
+            # Chat content is nobody else's business, so the proxy opts out unless asked.
             "store"               : getenv_bool(f"{prefix}_STORE", False),
-            # Background responses survive the connection that started them, which is what
-            # makes a cut stream resumable rather than a lost turn. OpenAI keeps them for
-            # about 10 minutes so they can be polled, whatever 'store' says -- see
-            # v1_responses.generate_stream and the README.
+            # Background responses outlive the connection that started them.
+            # That makes a cut stream resumable rather than a lost turn.
+            # OpenAI keeps them about 10 minutes for polling, whatever 'store' says.
+            # See v1_responses.generate_stream and the README.
             "background"          : getenv_bool(f"{prefix}_BACKGROUND", False),
             "extra_body"          : extra_body,
             "cost_families"       : self.parse_cost_families(prefix),
@@ -351,19 +349,18 @@ class RuntimeConfig:
         self.host = os.getenv("HOST", "127.0.0.1")
         self.port = getenv_int("PORT", 5001)
 
-        # The model to start on, as a bare id or "provider/model-id". The prefixed form
-        # names its own provider and so resolves without a model list, which is what to
-        # use when a provider's /models request is unavailable (see server startup).
+        # The model to start on, as a bare id or "provider/model-id".
+        # The prefixed form names its own provider, so it resolves without a model list.
+        # Use it when a provider's /models request is unavailable (see server startup).
         self.model = os.getenv("MODEL", "").strip()
         self.version = extract_claude_version(self.model)
         self.model_info = {}
-        # Full model record from the provider model list. Empty until providers.apply_model
-        # runs, so capability checks (v1_messages.resolve_thinking) fail closed instead of
-        # crashing.
+        # Full model record from the provider model list.
+        # Empty until providers.apply_model runs, so capability checks fail closed, not crash.
         self.info = {}
 
-        # Active backend: the name of a configured provider. Empty until a model is
-        # selected, which is what binds a backend (see providers.apply_model).
+        # Active backend: the name of a configured provider.
+        # Empty until a model is selected, which binds a backend (see providers.apply_model).
         self.backend = ""
 
         # Every configured provider, keyed by name, in declaration order.
@@ -380,9 +377,9 @@ class RuntimeConfig:
 
         self.request_timeout_seconds = getenv_float("REQUEST_TIMEOUT_SECONDS", 600.0)
 
-        # Background /responses recovery (see v1_responses). How long a whole turn may
-        # take, which is a different question from how long one HTTP call may take:
-        # a recovered turn is many calls, and the model reasons silently between them.
+        # Background /responses recovery (see v1_responses).
+        # How long a whole turn may take, which is a different question from one HTTP call.
+        # A recovered turn is many calls, and the model reasons silently between them.
         # This is the only thing that ends a turn whose job is still running.
         self.responses_turn_timeout_seconds = max(0.0, getenv_float("RESPONSES_TURN_TIMEOUT_SECONDS", 1800.0))
         self.responses_poll_seconds         = max(0.1, getenv_float("RESPONSES_POLL_SECONDS", 2.0))
@@ -395,7 +392,8 @@ class RuntimeConfig:
         self.auto_trim = getenv_bool("AUTO_TRIM", True)
         self.summary_blocks_enabled = getenv_bool("SUMMARY_BLOCKS_ENABLED", True)
 
-        # Leave empty by default. The original notebook used a strong assistant prefill.
+        # Leave empty by default.
+        # The original notebook used a strong assistant prefill.
         # For safety and reliability, keep this blank unless you have a benign reason to use it.
         self.assistant_prefill = os.getenv("ASSISTANT_PREFILL", "")
 
@@ -423,13 +421,13 @@ class RuntimeConfig:
         self.thinking_budget  = getenv_int("THINKING_BUDGET", 2048)
         self.thinking_effort  = os.getenv("THINKING_EFFORT", "medium").lower()
 
-        # Round-trip Anthropic signed thinking blocks through clients that only preserve message.content.
-        # 0 disables preservation, N preserves the last N assistant messages, and inf/all preserves every assistant message.
+        # Round-trip signed thinking blocks through clients that keep only message.content.
+        # 0 disables it, N keeps the last N assistant messages, and inf/all keeps every one.
         self.preserve_thinking_blocks = getenv_preserve_thinking_blocks("PRESERVE_THINKING_BLOCKS", "0")
 
-        # Cost tracking. Values are USD per 1 million tokens, and are configured per
-        # provider rather than here; these are the inert values a request would be billed
-        # at before a model has been selected (see providers.apply_model).
+        # Cost tracking.
+        # Values are USD per 1 million tokens, configured per provider rather than here.
+        # These are the inert values a request would bill at before a model is selected.
         self.model_cost_family    = ""
         self.input_token_cost_usd = 0.0
         self.output_token_cost_usd   = 0.0
@@ -457,18 +455,19 @@ class RuntimeConfig:
         self.cache_anthropic_auto = getenv_bool("CACHE_ANTHROPIC_AUTO", False)
         self.cache_anthropic_ttl  = getenv_cache_ttl("CACHE_ANTHROPIC_TTL", "1h")
 
-        # Image generation. A secondary service: none of this touches the active text
-        # provider or model, and the image model is never bound through providers.apply_model.
+        # Image generation.
+        # A secondary service: none of this touches the active text provider or model.
+        # The image model is never bound through providers.apply_model.
         self.image_enabled      = getenv_bool("IMAGE_GENERATION_ENABLED", False)
-        # Whether <IMAGE_REQUEST_TAG> blocks in user messages are honored. Turning this off
-        # leaves the direct /v1/images/generations endpoint working.
+        # Whether <IMAGE_REQUEST_TAG> blocks in user messages are honored.
+        # Turning this off leaves the direct /v1/images/generations endpoint working.
         self.image_chat_enabled = getenv_bool("IMAGE_CHAT_ENABLED", True)
         self.image_provider     = os.getenv("IMAGE_PROVIDER", "").strip().lower()
         self.image_model        = os.getenv("IMAGE_MODEL", "").strip()
         self.image_output_dir   = os.getenv("IMAGE_OUTPUT_DIR", "generated_images").strip() or "generated_images"
 
-        # Defaults applied to every request, direct or chat-triggered, that does not
-        # override them. 'auto' lets the provider decide.
+        # Defaults applied to every request, direct or chat-triggered, that does not override them.
+        # 'auto' lets the provider decide.
         self.image_default_size       = os.getenv("IMAGE_DEFAULT_SIZE", "1024x1024").strip().lower()
         self.image_default_quality    = getenv_choice("IMAGE_DEFAULT_QUALITY"   , "medium", IMAGE_QUALITIES)
         self.image_default_format     = getenv_choice("IMAGE_DEFAULT_FORMAT"    , "png"   , IMAGE_FORMATS)
@@ -483,47 +482,49 @@ class RuntimeConfig:
             print(f"WARNING: IMAGE_DEFAULT_N ({self.image_default_n}) exceeds IMAGE_MAX_N ({self.image_max_n}). Clamping.")
             self.image_default_n = self.image_max_n
 
-        # The tag a user message carries an image request in. Assistant output is never
-        # scanned, so this is the only trigger there is.
+        # The tag a user message carries an image request in.
+        # Assistant output is never scanned, so this is the only trigger there is.
         self.image_request_tag = os.getenv("IMAGE_REQUEST_TAG", "image_generation").strip() or "image_generation"
 
-        # The image model list is fetched separately from the conversational one, because
+        # The image model list is fetched separately from the chat one.
         # <NAME>_MODELS_REGEX exists precisely to keep image models out of that list.
         self.image_models_regex = os.getenv("IMAGE_MODELS_REGEX", "image").strip()
 
         self.image_cost_reporting   = getenv_bool("IMAGE_COST_REPORTING"  , True)
         self.image_manifest_enabled = getenv_bool("IMAGE_MANIFEST_ENABLED", True)
-        # Prompts are chat content. Writing them into a sidecar that outlives the session is
-        # a separate decision from printing them to a debug console, so it gets its own switch.
+        # Prompts are chat content.
+        # A sidecar that outlives the session is a separate decision from a console print.
+        # It gets its own switch.
         self.image_manifest_prompts = getenv_bool("IMAGE_MANIFEST_PROMPTS", True)
 
         self.image_batch_window     = os.getenv("IMAGE_BATCH_COMPLETION_WINDOW", "24h").strip() or "24h"
-        # What a batch is billed at relative to immediate generation. The provider reports
-        # the same token counts either way, so nothing in the usage payload reveals the
-        # discount; it has to be configured. Defaults to 1.0 rather than to any provider's
-        # published rate -- over-reporting a budget is the safe direction to be wrong in.
+        # What a batch is billed at relative to immediate generation.
+        # The provider reports the same counts either way, so the payload never shows the discount.
+        # It has to be configured.
+        # Defaults to 1.0 rather than a published rate; over-reporting is the safe way to be wrong.
         self.image_batch_multiplier = max(0.0, getenv_float("IMAGE_BATCH_COST_MULTIPLIER", 1.0))
 
-        # Background batch retrieval. A batch completes on the provider's schedule rather
-        # than the proxy's, so without this its images sit finished but never collected
-        # until somebody runs the CLI. The floor keeps a misconfigured interval from
-        # turning the poller into a request loop.
+        # Background batch retrieval.
+        # A batch completes on the provider's schedule, not the proxy's.
+        # Without this its images sit finished but uncollected until somebody runs the CLI.
+        # The floor keeps a misconfigured interval from turning the poller into a request loop.
         self.image_batch_auto_poll    = getenv_bool("IMAGE_BATCH_AUTO_POLL", True)
         self.image_batch_poll_seconds = max(10.0, getenv_float("IMAGE_BATCH_POLL_SECONDS", 300.0))
 
-        # Image editing. Reference images are read off this machine and uploaded to the
-        # provider, which makes every path here a read primitive -- hence the allowlist.
-        # Gateway failures (Cloudflare 520s in front of the provider) are common enough to
-        # make a single-attempt image call unreliable. Only failures that produced no image
-        # are retried, so this never pays for the same picture twice.
+        # Image editing.
+        # Reference images are read off this machine, so every path is a read primitive.
+        # Hence the allowlist.
+        # Gateway failures (Cloudflare 520s) make a single-attempt call unreliable.
+        # Only failures that produced no image retry, so this never pays for a picture twice.
         self.image_retry_attempts         = max(1, getenv_int("IMAGE_RETRY_ATTEMPTS", 3))
         self.image_retry_backoff_seconds  = max(0.0, getenv_float("IMAGE_RETRY_BACKOFF_SECONDS", 5.0))
 
-        # What the HTTP image routes return. The chat path never goes through them, so
-        # every caller here is an external app, and the default is what an OpenAI client
-        # expects. 'path' trims the reply to metadata for local tooling that only wants the
-        # saved file; the saved path is included either way, and the file is written
-        # regardless. A request may override this per call with response_format.
+        # What the HTTP image routes return.
+        # The chat path never goes through them, so every caller is an external app.
+        # The default is what an OpenAI client expects.
+        # 'path' trims the reply to metadata for tooling that only wants the saved file.
+        # The path is included either way, and the file is written regardless.
+        # A request may override this per call with response_format.
         self.image_response_format = getenv_choice("IMAGE_RESPONSE_FORMAT", "b64_json", IMAGE_RESPONSE_FORMATS)
 
         self.image_edit_enabled      = getenv_bool("IMAGE_EDIT_ENABLED", True)
@@ -532,14 +533,14 @@ class RuntimeConfig:
         # Edits usually want the source geometry kept, which is what 'auto' asks for.
         self.image_edit_default_size = os.getenv("IMAGE_EDIT_DEFAULT_SIZE", "auto").strip().lower() or "auto"
 
-        # Whether a path written in a chat block may be read at all. Off by default: this
-        # proxy is built to sit behind a public tunnel, and a prompt-supplied path is an
-        # arbitrary-file-read-and-exfiltrate primitive for anyone who reaches it. The CLI
-        # slots need none of this, since paths there come from whoever runs the console.
-        # The ceiling Flask buffers a request body up to. Uploaded edits are the only thing
-        # here that can be large, and without a cap any POST is read into memory whole --
-        # an exhaustion vector on a service meant to sit behind a public tunnel. Derived
-        # from the edit limits plus slack for the form itself, unless set explicitly.
+        # Whether a path written in a chat block may be read at all.
+        # Off by default, because this proxy is built to sit behind a public tunnel.
+        # A prompt-supplied path is an arbitrary-file-read primitive for anyone who reaches it.
+        # The CLI slots need none of this, since paths there come from whoever runs the console.
+        # The ceiling Flask buffers a request body up to.
+        # Uploaded edits are the only large thing here; without a cap a POST is read whole.
+        # That is an exhaustion vector on a service facing a public tunnel.
+        # Derived from the edit limits plus slack for the form itself, unless set explicitly.
         self.request_max_bytes = max(
             1024*1024,
             getenv_int("REQUEST_MAX_BYTES", self.image_edit_max_images*self.image_edit_max_bytes + 1024*1024),
@@ -564,8 +565,8 @@ class RuntimeConfig:
             except Exception as exc:
                 print(f"WARNING: IMAGE_PRICE_TABLE is not valid json5 ({exc}). Ignoring.")
 
-        # Resolved prices for the selected image model. Populated by
-        # v1_images.apply_image_model(); inert until then.
+        # Resolved prices for the selected image model.
+        # Populated by v1_images.apply_image_model(); inert until then.
         self.image_cost_family       = ""
         self.image_text_input_cost   = 0.0
         self.image_image_input_cost  = 0.0
@@ -816,10 +817,10 @@ def session_cost_snapshot() -> Dict[str, Any]:
         return session_cost_totals_locked()
 
 
-# Image session cost tracking. Deliberately separate from the text totals above: an
-# image is not an output token, and folding its cost into SESSION_TTL_OUTPUT_COST_USD
-# would make the average-cost-per-token report meaningless. Immediate and Batch API
-# spending are tracked apart because they are billed at different rates.
+# Image session cost tracking.
+# Deliberately separate from the text totals above, because an image is not an output token.
+# Folding its cost into SESSION_TTL_OUTPUT_COST_USD would make the per-token report meaningless.
+# Immediate and Batch API spending are tracked apart because they are billed at different rates.
 SESSION_IMAGE_IMMEDIATE_COST_USD = 0.0
 SESSION_IMAGE_BATCH_COST_USD     = 0.0
 SESSION_IMAGE_COUNT              = 0
@@ -879,11 +880,11 @@ def get_bearer_token() -> str:
 
 def check_proxy_key() -> None:
     """
-    The proxy-key half of resolve_api_key, for routes that touch only this proxy's own recorded
-    state and so never resolve a provider key.
+    The proxy-key half of resolve_api_key.
+    It serves routes that touch only recorded state and never resolve a provider key.
 
-    Enforced only when a PROXY_KEY exists, so a passthrough setup that works for generation is not
-    refused here. A client configured to generate is therefore configured for these too.
+    Enforced only when a PROXY_KEY exists, so a working passthrough setup is not refused here.
+    A client configured to generate is therefore configured for these too.
     """
     if cfg.require_proxy_key and cfg.proxy_key and get_bearer_token() != cfg.proxy_key:
         abort(401, description="Invalid proxy key.")
@@ -913,10 +914,10 @@ def resolve_api_key(configured_key: str, key_name: str) -> str:
     raise RuntimeError("unreachable")
 
 
-# Backend error rendering. Every backend raises errors carrying the same two things:
-# a status code and a JSON body with an 'error' object -- the Anthropic SDK does it
-# natively, and providers.ProviderError is built to match. So these are shared rather
-# than Anthropic-only, despite having started out that way.
+# Backend error rendering.
+# Every backend raises errors carrying a status code and a JSON body with an 'error' object.
+# The Anthropic SDK does it natively, and providers.ProviderError is built to match.
+# So these are shared rather than Anthropic-only, despite having started out that way.
 def error_body(exc: Exception) -> Optional[Dict[str, Any]]:
     body = getattr(exc, "body", None)
     if isinstance(body, dict):
@@ -952,17 +953,17 @@ def print_error(exc: Exception) -> None:
     Prints an error to the console in red.
 
     An upstream refusal arrives with a JSON body, which is printed above the message.
-    Anything else is a fault in this proxy rather than an answer from a provider, and
-    says so plainly: the two mean very different things to whoever is reading the
-    terminal. The full traceback for those goes to the error log, not here.
+    Anything else is a fault in this proxy, not an answer from a provider, and says so plainly.
+    The two mean very different things to whoever is reading the terminal.
+    The full traceback for those goes to the error log, not here.
     """
     ANSI_RED   : str = "\033[31m"
     ANSI_RESET : str = "\033[0m"
 
     body     = error_body(exc)
     fallback = str(exc) or exc.__class__.__name__
-    # The Anthropic SDK does not always populate a body, so anything it raises counts
-    # as an API error regardless; every other backend carries one (providers.ProviderError).
+    # The SDK does not always populate a body, so anything it raises counts as an API error.
+    # Every other backend carries one (providers.ProviderError).
     from_api = body is not None or exc.__class__.__module__.split(".", 1)[0] == "anthropic"
 
     if not from_api:
@@ -989,8 +990,8 @@ def content_to_plain_text(content: Any) -> str:
     The proxy primarily expects text-only OpenAI-style messages.
 
     If a client sends a list of text parts, this joins text parts.
-    Non-text parts are serialized. This is intentionally conservative;
-    it does not implement OpenAI-image-to-Anthropic-image conversion.
+    Non-text parts are serialized.
+    Intentionally conservative: no OpenAI-image-to-Anthropic-image conversion is attempted.
     """
     if content is None:
         return ""
@@ -1050,8 +1051,8 @@ def make_prefill_instruction(prefix_text: str) -> str:
     """
     Creates the instruction-mode version of ASSISTANT_PREFILL.
 
-    This avoids assistant prefill by telling the model, inside the
-    last user message, to continue as though the prefix was already present.
+    This avoids assistant prefill.
+    The last user message tells the model to continue as if the prefix were there.
     """
     return (
         "\n<OOC>\n"
@@ -1071,7 +1072,8 @@ def append_prefill_instruction_to_last_user_message(formatted: List[Dict[str, An
             formatted[i]["content"] = append_text_to_content(formatted[i].get("content", ""), instruction)
             return
 
-    # Defensive fallback. The current formatter always creates an initial user message, but keep this here in case that changes later.
+    # Defensive fallback.
+    # The formatter always creates an initial user message; keep this in case that changes.
     formatted.append({"role": "user", "content": instruction})
 
 
@@ -1117,8 +1119,8 @@ def print_usage(counts: Dict[str, Any]) -> None:
 
 def usage_to_openai_dict(counts: Dict[str, Any]) -> Dict[str, int]:
     """
-    Maps normalized counts to the usage object returned to the client, so it sees one
-    consistent shape regardless of which backend served the request.
+    Maps normalized counts to the usage object returned to the client.
+    The client sees one shape whichever backend served the request.
     """
     return {
         "prompt_tokens"               : counts["prompt"],
@@ -1141,20 +1143,20 @@ def fmt_usd(amount: float) -> str:
 
 def track_image_usage(counts: Dict[str, Any], images: int, batch: bool, model: str) -> float:
     """
-    Costs one image request and folds it into the image session totals. Returns the
-    request cost so the caller can report it back to the client.
+    Costs one image request and folds it into the image session totals.
+    Returns the request cost so the caller can report it back to the client.
 
-    'counts' carries text_input, image_input, output and an 'estimated' flag. The
-    providers seen so far return an exact usage object, so estimation is the fallback
-    path for those that do not (see v1_images.estimate_image_cost).
+    'counts' carries text_input, image_input, output and an 'estimated' flag.
+    Providers seen so far return an exact usage object.
+    Estimation is the fallback for those that do not (see v1_images.estimate_image_cost).
     """
     text_input_tok  = max(0, int(counts.get("text_input" , 0) or 0))
     image_input_tok = max(0, int(counts.get("image_input", 0) or 0))
     output_tok      = max(0, int(counts.get("output"     , 0) or 0))
     estimated       = bool(counts.get("estimated", False))
 
-    # A batch reports the same token counts as an immediate request but is invoiced at a
-    # different rate, so the discount is applied here rather than hidden in the prices.
+    # A batch reports the same counts as an immediate request but is invoiced at a different rate.
+    # The discount is applied here rather than hidden in the prices.
     multiplier = cfg.image_batch_multiplier if batch else 1.0
 
     if estimated:
@@ -1213,10 +1215,10 @@ def track_usage(tokens: Dict[str, Any]) -> None:
     Backends are responsible for mapping their provider's usage payload to this
     shape (for providers without cache writes, the write counts are simply 0).
 
-    The optional 'reasoning' key splits the output tokens into thinking and visible
-    text, both billed at the output rate. Leave it out (or None) when the provider
-    does not report the count -- Anthropic and Aion reason without ever saying how
-    much, and printing a zero there would be a lie rather than a measurement.
+    The optional 'reasoning' key splits output tokens into thinking and visible text.
+    Both bill at the output rate.
+    Leave it out (or None) when the provider does not report the count.
+    Anthropic and Aion reason without saying how much; a zero would be a lie, not a measurement.
     """
     def cache_lbl(net_cost_usd: float) -> str:
         if net_cost_usd < 0: return f"{fmt_usd(abs(net_cost_usd))} saved"

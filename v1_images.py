@@ -1,9 +1,10 @@
 """
 Low-level adapter for /v1/images/*.
 
-Generation, editing and batches share provider resolution, validation, storage,
-manifests and accounting; only the upstream transport differs. This module never mutates
-the active chat backend/model. Chat-side triggering lives in image_orchestrator.py.
+Generation, editing and batches share resolution, validation, storage, manifests and accounting.
+Only the upstream transport differs.
+This module never mutates the active chat backend/model.
+Chat-side triggering lives in image_orchestrator.py.
 """
 
 import base64
@@ -69,39 +70,41 @@ IMAGE_MAGIC = (
 WEBP_RIFF   = b"RIFF"
 WEBP_TAG    = b"WEBP"
 
-# Extension per output_format. 'jpeg' is the API's spelling; '.jpg' is the file's.
+# Extension per output_format.
+# 'jpeg' is the API's spelling; '.jpg' is the file's.
 FORMAT_EXTENSIONS = {"png": ".png", "jpeg": ".jpg", "webp": ".webp"}
 
 # Allowed keys in manifest lineage entries.
 SOURCE_FILE_KEYS = {"file_id", "path", "file"}
 
-# Allowed keys in the job stamp: which group and which attempt produced an image. Recorded in the
-# manifest so a folder of pictures can say what line of work it came out of; never sent upstream.
+# Allowed keys in the job stamp: which group and which attempt produced an image.
+# Recorded in the manifest so a folder can say what work it came from; never sent upstream.
 JOB_GROUP_KEYS = {"id", "name"}
 JOB_KEYS       = {"id", "parent", "comment", "run"}
 
-# A mask region: the working-pixel size the rectangles are measured in, and the rectangles. Held
-# to a sane length because it is recorded verbatim, and a manifest is read far more often than
-# it is written.
+# A mask region: the working-pixel size the rectangles are measured in, and the rectangles.
+# Held to a sane length: it is recorded verbatim, and manifests are read more than written.
 MASK_RECT_KEYS = {"x", "y", "w", "h", "mode"}
 MASK_RECT_MAX  = 512
 
-# What a client may correct in a record already written, and nothing else. The split is between
-# testimony and measurement: what a request *asked for* is something the person who made it can
-# know better than this proxy, while what the file is -- its name, its id, its bytes, the usage
-# the provider reported -- is measured here and is not the caller's to revise.
+# What a client may correct in a record already written, and nothing else.
+# The split is between testimony and measurement.
+# What a request *asked for* is something its author knows better than this proxy.
+# What the file is (name, id, bytes, usage) is measured here, not the caller's to revise.
 PATCH_STRING_KEYS = {"prompt", "provider", "model", "created_at", "operation", "source", "batch_id"}
 PATCH_PARAM_KEYS  = {"size", "quality", "output_format", "background", "n"}
 PATCH_OTHER_KEYS  = {"image_id", "file", "job_group", "job", "mask", "request_parameters",
                      "source_files", "estimated_cost_usd", "cost_is_estimate"}
-# A note on an attempt, not an essay. Long enough for a sentence about what was being tried.
+# A note on an attempt, not an essay.
+# Long enough for a sentence about what was being tried.
 JOB_VALUE_MAX  = 500
 
 SIZE_RE     = re.compile(r"^(\d{1,5})\s*[x×]\s*(\d{1,5})$")
 # `data:<mediatype>;base64,` -- the mediatype is advisory, since the bytes are sniffed.
 DATA_URL_RE = re.compile(r"^data:([^,;]*)((?:;[^,]*)?),", re.IGNORECASE)
-# A filename override is a *name*, never a path: no separators, no traversal, no
-# leading dot, nothing outside this set. The extension is imposed from output_format.
+# A filename override is a *name*, never a path.
+# No separators, no traversal, no leading dot, nothing outside this set.
+# The extension is imposed from output_format.
 FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 FILENAME_MAX_STEM = 120
 
@@ -115,14 +118,15 @@ MANIFEST_FILE    = "img_generation.json"
 SLOTS_FILE       = "img_slots.json"
 # The mask shares the slots file under a key no slot number can collide with.
 MASK_KEY         = "mask"
-# Where a mask that arrived as bytes is kept. A sub-folder rather than the output
-# directory itself, so masks do not crowd the listing of what was actually generated.
+# Where a mask that arrived as bytes is kept.
+# A sub-folder rather than the output directory, so masks do not crowd what was generated.
 MASK_SUBDIR      = "masks"
 
 # Guards the slot file the same way BATCH_LOCK guards the batch state.
 SLOT_LOCK = threading.RLock()
 
-# Statuses a batch never moves out of. Anything else is still worth polling.
+# Statuses a batch never moves out of.
+# Anything else is still worth polling.
 BATCH_TERMINAL_STATUSES = {"completed", "failed", "expired", "cancelled"}
 
 # Batch state is read-modify-written by the CLI and the poller; keep retrieval idempotent.
@@ -195,16 +199,17 @@ class ImageRequest:
         # Local references and provider-side references are mutually exclusive.
         self.images   = images or []
         self.mask     = mask
-        # What the mask was drawn as. Recorded beside the picture it rasterised to and never sent
-        # upstream; the provider edits the PNG, and this is the form anyone can read back.
+        # What the mask was drawn as.
+        # Recorded beside the picture it rasterised to and never sent upstream.
+        # The provider edits the PNG; this is the form anyone can read back.
         self.mask_region = mask_region or {}
         self.file_ids = file_ids or []
 
         # Empty means manifest_source_files() can derive lineage from local references.
         self.source_files = source_files or []
 
-        # Which group and which attempt this belongs to, as the caller stated it. Copied into the
-        # manifest verbatim and never sent upstream; this proxy does not interpret either.
+        # Which group and which attempt this belongs to, as the caller stated it.
+        # Copied into the manifest verbatim, never sent upstream, and never interpreted here.
         self.job_group = job_group or {}
         self.job       = job or {}
 
@@ -263,8 +268,8 @@ def image_provider() -> Dict[str, Any]:
     """
     Provider entry for image requests.
 
-    IMAGE_PROVIDER may reuse a declared text provider or name a standalone <NAME>_*
-    block. Standalone entries use api='chat' only for Bearer-auth header shape.
+    IMAGE_PROVIDER may reuse a declared text provider or name a standalone <NAME>_* block.
+    Standalone entries use api='chat' only for Bearer-auth header shape.
     """
     name = cfg.image_provider
     if not name:
@@ -292,8 +297,9 @@ def image_provider() -> Dict[str, Any]:
 
 def image_headers(provider: Dict[str, Any]) -> Dict[str, str]:
     """
-    Auth for an image request. HTTP requests follow the chat proxy-key rules; CLI calls
-    use the configured provider key because there is no Flask request context.
+    Auth for an image request.
+    HTTP requests follow the chat proxy-key rules.
+    CLI calls use the configured provider key, having no Flask request context.
     """
     if has_request_context():
         key = resolve_api_key(provider["api_key"], provider["api_key_name"])
@@ -307,7 +313,8 @@ def image_headers(provider: Dict[str, Any]) -> Dict[str, str]:
 
 def apply_image_model(model_id: str) -> None:
     """
-    Bind only image-model pricing. Chat backend, model and text prices are untouched.
+    Bind only image-model pricing.
+    Chat backend, model and text prices are untouched.
     """
     prefix   = re.sub(r"[^A-Z0-9]", "_", (cfg.image_provider or "").upper())
     families = cfg.parse_image_cost_families(prefix)
@@ -416,8 +423,8 @@ def validate_bool(field_name: str, raw: Any) -> bool:
 
 def sanitize_filename_stem(raw: Any) -> str:
     """
-    A caller-supplied filename reduced to a portable stem. Directories, traversal,
-    unusual characters, device names and trailing dots are rejected rather than rewritten.
+    A caller-supplied filename reduced to a portable stem.
+    Directories, traversal, odd characters, device names and trailing dots are rejected.
     """
     name = str(raw).strip()
     if not name:
@@ -477,8 +484,8 @@ def write_slots(slots: Dict[str, str]) -> None:
 
 def set_slot(number: int, path: str) -> ReferenceImage:
     """
-    Points a slot at a file, validating it now so a mistake is reported at the console
-    rather than three turns later inside a chat reply.
+    Points a slot at a file, validating it now.
+    A mistake is reported at the console, not three turns later inside a chat reply.
     """
     if number < 1:
         raise ImageRequestError("slot numbers start at 1.")
@@ -507,8 +514,8 @@ def clear_slot(number: Optional[int]) -> int:
 
 def numbered_slots(slots: Dict[str, str]) -> List[int]:
     """
-    Just the reference slots, in order. The mask lives in the same file under a
-    non-numeric key, so every walk over the slots has to go through here.
+    Just the reference slots, in order.
+    The mask lives in the same file under a non-numeric key, so slot walks come through here.
     """
     numbers = []
     for key in slots:
@@ -551,8 +558,8 @@ def filled_slots() -> List[ReferenceImage]:
 # Reference images
 def sniff_image(head: bytes) -> Optional[Tuple[str, str]]:
     """
-    (format, mime) from a file's leading bytes, or None when it is not an image this
-    endpoint accepts. Content decides; the extension is never consulted.
+    (format, mime) from a file's leading bytes, or None when this endpoint will not take it.
+    Content decides; the extension is never consulted.
     """
     for magic, fmt, mime in IMAGE_MAGIC:
         if head.startswith(magic):
@@ -566,10 +573,10 @@ def read_png_geometry(head: bytes) -> Tuple[int, int, bool]:
     """
     (width, height, has_alpha) from a PNG's IHDR chunk.
 
-    Colour types 4 and 6 carry an alpha channel; 3 (palette) can fake one with a tRNS
-    chunk, which is why that is checked too. Enough to tell a usable mask from the JPEG
-    that the provider's docs call the most common cause of edit failures, without taking
-    on an imaging dependency for one header.
+    Colour types 4 and 6 carry an alpha channel.
+    Type 3 (palette) can fake one with a tRNS chunk, so that is checked too.
+    Enough to tell a usable mask from the JPEG the provider's docs blame for most edit failures.
+    No imaging dependency is taken on for one header.
     """
     if len(head) < 26 or head[12:16] != b"IHDR":
         return 0, 0, False
@@ -582,9 +589,9 @@ def read_png_geometry(head: bytes) -> Tuple[int, int, bool]:
 
 def path_is_allowed(resolved: str) -> bool:
     """
-    Whether a prompt-supplied path may be read. Containment is tested after realpath, so
-    a symlink sitting inside an allowed root but pointing outside it is refused -- the
-    link, not its target, is what an attacker gets to place.
+    Whether a prompt-supplied path may be read.
+    Containment is tested after realpath, so a symlink pointing out of an allowed root is refused.
+    The link, not its target, is what an attacker gets to place.
     """
     if not cfg.image_edit_roots:
         return False
@@ -601,8 +608,8 @@ def describe_image(head: bytes, size: int, label: str) -> Tuple[str, str, int, i
     """
     (format, mime, width, height, has_alpha) for a candidate image, or a rejection.
 
-    The shared half of validation: everything that depends only on the bytes, so an
-    uploaded image and one read off disk are judged by exactly the same rules.
+    The shared half of validation: everything depending only on the bytes.
+    An uploaded image and one read off disk are judged by the same rules.
     """
     if size <= 0:
         raise ImageRequestError(f"{label} is empty.")
@@ -624,9 +631,9 @@ def load_uploaded_reference(name: str, data: bytes) -> ReferenceImage:
     """
     One reference image from bytes posted with the request.
 
-    Needs no filesystem access at all, so none of the path machinery applies: there is
-    nothing to traverse, no allowlist to consult, and no way to reach a file the caller
-    was not already holding. The content checks are the same ones a path gets.
+    Needs no filesystem access, so none of the path machinery applies.
+    Nothing to traverse, no allowlist, and no way to reach a file the caller was not holding.
+    The content checks are the same ones a path gets.
     """
     label = f"uploaded file {name!r}" if name else "uploaded file"
     fmt, mime, width, height, has_alpha = describe_image(data[:4096], len(data), label)
@@ -640,13 +647,13 @@ def load_data_url(spec: str) -> ReferenceImage:
     """
     One reference from an inline `data:` URL.
 
-    Base64 only: the percent-encoded alternative would have to be decoded before it could
-    be sized, and nothing that holds an image inline emits it. Otherwise this is an upload
-    by another route -- bytes the caller was already holding, reaching no filesystem -- so
-    it is judged by exactly the checks an upload gets.
+    Base64 only.
+    The percent-encoded alternative needs decoding before sizing, and nothing inline emits it.
+    Otherwise this is an upload by another route: bytes already held, touching no filesystem.
+    It gets exactly the checks an upload gets.
 
-    It exists because a client can hold a picture without holding a file: a mask drawn in
-    an editor has no path to name, and a batch accepts no multipart upload at all.
+    It exists because a client can hold a picture without holding a file.
+    A mask drawn in an editor has no path to name, and a batch takes no multipart upload.
     """
     match = DATA_URL_RE.match(spec)
     if match is None:
@@ -655,8 +662,8 @@ def load_data_url(spec: str) -> ReferenceImage:
         raise ImageRequestError("only base64 data URLs are accepted as an image reference.")
 
     payload = spec[match.end():]
-    # Sized before decoding: four base64 characters carry three bytes, so an oversized
-    # payload is refused without ever being materialised.
+    # Sized before decoding.
+    # Four base64 characters carry three bytes, so an oversized payload never materialises.
     estimated = len(payload)//4*3
     if estimated > cfg.image_edit_max_bytes:
         raise ImageRequestError(
@@ -679,12 +686,11 @@ def load_reference(spec: Any, from_prompt: bool, slot: int = 0) -> ReferenceImag
     """
     One validated reference image, from a slot number, a data URL or a filesystem path.
 
-    Rejects rather than skips, in this order: the path must resolve, be a regular file,
-    be readable, be an image by its magic bytes, and fit the size cap. A caller that
-    named something unusable should be told so, not quietly handed a shorter list.
+    Rejects rather than skips, in order.
+    The path must resolve, be a regular readable file, be an image by magic bytes, and fit the cap.
+    A caller that named something unusable should be told so, not quietly handed a shorter list.
     """
-    # An upload arrives already validated, since its bytes never came from the filesystem
-    # and there is nothing left to resolve.
+    # An upload arrives validated: its bytes never touched the filesystem, so nothing resolves.
     if isinstance(spec, ReferenceImage):
         return spec
 
@@ -700,8 +706,8 @@ def load_reference(spec: Any, from_prompt: bool, slot: int = 0) -> ReferenceImag
 
     text = spec.strip()
 
-    # Checked before the path machinery because a data URL reaches no filesystem: there is
-    # nothing to resolve, no allowlist to consult, and no prompt-path setting to honour.
+    # Checked before the path machinery because a data URL reaches no filesystem.
+    # Nothing to resolve, no allowlist to consult, no prompt-path setting to honour.
     if text[:5].lower() == "data:":
         return load_data_url(text)
 
@@ -721,8 +727,7 @@ def load_reference(spec: Any, from_prompt: bool, slot: int = 0) -> ReferenceImag
         raise ImageRequestError(f"could not resolve {spec!r}: {exc}")
 
     if from_prompt and not path_is_allowed(resolved):
-        # Deliberately does not say whether the file exists: to an untrusted caller that
-        # difference is a directory oracle.
+        # Deliberately silent on whether the file exists; to an untrusted caller that is an oracle.
         raise ImageRequestError(f"{spec!r} is outside every directory listed in IMAGE_EDIT_ROOTS.")
 
     if not os.path.exists(resolved)    : raise ImageRequestError(f"{spec!r} does not exist.")
@@ -754,9 +759,9 @@ def load_references(specs: Any, from_prompt: bool) -> List[ReferenceImage]:
 
 def validate_mask(mask: ReferenceImage, images: List[ReferenceImage]) -> None:
     """
-    A mask has to be a PNG carrying an alpha channel; transparent pixels are the region
-    the model may repaint. With several references the provider applies it to the first,
-    so that is the one its geometry is checked against.
+    A mask must be a PNG with an alpha channel.
+    Transparent pixels are what the model may repaint.
+    With several references the provider uses the first, so geometry is checked against that.
     """
     if mask.format != "png":
         raise ImageRequestError(f"the mask must be a PNG (alpha is what marks the editable region), got {mask.format}.")
@@ -771,17 +776,16 @@ def validate_mask(mask: ReferenceImage, images: List[ReferenceImage]) -> None:
 
 def resolve_mask(fields: Dict[str, Any], from_prompt: bool, images: List[ReferenceImage]) -> Optional[ReferenceImage]:
     """
-    The mask this request runs with: the one it named, none because it said so, or the one
-    left set from the console.
+    The mask this request runs with.
+    The one it named, none because it said so, or the console's.
 
-    The console-set mask is a convenience for the CLI, but it is also a trap for every
-    other caller -- it would otherwise apply to requests that never asked for it and have
-    no way to say no. So `mask: false` (or "none"/"off") is a value in its own right,
-    distinct from leaving the key out, which still inherits.
+    The console-set mask is a CLI convenience and a trap for every other caller.
+    It would otherwise apply to requests that never asked for it and cannot say no.
+    So `mask: false` (or "none"/"off") is its own value, unlike omitting the key, which inherits.
 
-    With a batch there are no local references to measure against; validate_mask already
-    guards its geometry check on having one, so it falls back to the format and alpha
-    rules, which are the only ones that can be checked from here anyway.
+    A batch has no local references to measure against.
+    validate_mask guards its geometry check on having one, so format and alpha rules apply.
+    Those are the only ones checkable from here.
     """
     given = fields.get("mask") if "mask" in fields else None
     if isinstance(given, str):
@@ -802,9 +806,9 @@ def resolve_mask(fields: Dict[str, Any], from_prompt: bool, images: List[Referen
 
 def validate_file_ids(specs: Any) -> List[str]:
     """
-    Provider-side reference ids for a batched edit. Accepts file ids and URLs, since
-    input_reference takes either, and nothing else -- a local path here would silently
-    never be uploaded.
+    Provider-side reference ids for a batched edit.
+    Accepts file ids and URLs, which input_reference takes, and nothing else.
+    A local path here would silently never be uploaded.
     """
     if not isinstance(specs, list):
         specs = [specs]
@@ -825,18 +829,17 @@ def validate_file_ids(specs: Any) -> List[str]:
 
 def validate_source_files(specs: Any) -> List[Dict[str, str]]:
     """
-    Caller-declared lineage: the file on this machine each reference of this request came
-    from. Recorded in the manifest and never sent to the provider.
+    Caller-declared lineage: the file on this machine each reference of this request came from.
+    Recorded in the manifest and never sent to the provider.
 
-    It exists because a batched edit names its references by provider file id, and those
-    ids expire and are deleted -- the copy on this machine is what survives, so the
-    manifest has to name it. The id is recorded too, but only as the handle the job
-    happened to use.
+    It exists because a batched edit names references by provider file id, and those ids expire.
+    The copy on this machine is what survives, so the manifest names it.
+    The id is recorded too, but only as the handle the job happened to use.
 
-    An entry is either an object with any of file_id / path / file, or a bare string,
-    which is read as a path when it looks like one and as a name otherwise. A path that
-    does not resolve is recorded as given rather than rejected: the file may have been
-    moved since, and a stale link is worth more than no link at all.
+    An entry is an object with any of file_id / path / file, or a bare string.
+    A string reads as a path when it looks like one, and as a name otherwise.
+    A path that does not resolve is recorded as given, not rejected.
+    The file may have moved, and a stale link beats no link.
     """
     if not isinstance(specs, list):
         specs = [specs]
@@ -853,8 +856,8 @@ def validate_source_files(specs: Any) -> List[Dict[str, str]]:
         elif isinstance(spec, str):
             value   = spec.strip()
             file_id = ""
-            # A separator is the only thing distinguishing "D:/img/a.png" from "a.png",
-            # and treating a bare name as a path would invent a location it never had.
+            # A separator is all that distinguishes "D:/img/a.png" from "a.png".
+            # Treating a bare name as a path would invent a location it never had.
             raw     = value if (os.sep in value or "/" in value) else ""
             name    = "" if raw else value
         else:
@@ -888,12 +891,13 @@ def validate_mask_region(raw: Any) -> Dict[str, Any]:
     """
     The rectangles a mask was drawn as, as the client states them.
 
-    Recorded verbatim and never sent upstream: what the provider edits is the PNG, and this is
-    what the PNG *meant* -- the form that can be read back, corrected and asked for again. The
-    proxy does not rasterise it, compare it against the mask, or act on it in any way.
+    Recorded verbatim and never sent upstream.
+    The provider edits the PNG; this is what the PNG *meant*.
+    It can be read back, corrected and asked for again.
+    The proxy does not rasterise it, compare it against the mask, or act on it in any way.
 
-    Accepts a JSON string as well as an object, because a multipart edit has no way to carry
-    structure -- the same reason source_files and the job stamps are read that way there.
+    Accepts a JSON string as well as an object, since a multipart edit cannot carry structure.
+    It is the same reason source_files and the job stamps are read that way.
     """
     if isinstance(raw, str):
         text = raw.strip()
@@ -953,8 +957,8 @@ def validate_annotation(raw: Any, field_name: str, allowed: set) -> Dict[str, st
     """
     One job stamp: a flat map of short strings under known keys.
 
-    Accepts a JSON string as well as an object, because a multipart edit has no way to carry
-    structure -- the same reason source_files is read that way there.
+    Accepts a JSON string as well as an object, since a multipart edit cannot carry structure.
+    It is the same reason source_files is read that way there.
     """
     if isinstance(raw, str):
         text = raw.strip()
@@ -1002,8 +1006,8 @@ def resolve_edit_inputs(fields: Dict[str, Any], source: str, batch: bool) -> Tup
         images + batch: true        rejected -- local files cannot be batched
         images + file_ids           rejected -- mutually exclusive
 
-    The mask is orthogonal to all of that and resolved by resolve_mask: named, refused
-    with `mask: false`, or inherited from the console when the key is left out.
+    The mask is orthogonal to all of that and resolved by resolve_mask.
+    It is named, refused with `mask: false`, or inherited from the console when omitted.
     """
     has_images   = "images"   in fields and fields["images"] not in (None, [], "")
     has_file_ids = "file_ids" in fields and fields["file_ids"] not in (None, [], "")
@@ -1031,9 +1035,9 @@ def resolve_edit_inputs(fields: Dict[str, Any], source: str, batch: bool) -> Tup
     if has_file_ids:
         if not batch:
             raise ImageRequestError("file_ids is for Batch API edits only. Add batch: true, or use images for an immediate edit.")
-        # A batch accepts no multipart upload, but the JSON body takes a mask by reference
-        # exactly as it takes the images -- so the bytes ride along as a data URL. Verified
-        # against the provider: a batch line carrying one validates and runs.
+        # A batch takes no multipart upload, but its JSON body takes a mask like the images.
+        # So the bytes ride along as a data URL.
+        # Verified against the provider: a batch line carrying one validates and runs.
         return [], resolve_mask(fields, from_prompt, []), validate_file_ids(fields["file_ids"])
 
     if batch:
@@ -1088,8 +1092,8 @@ def build_request(overrides: Optional[Dict[str, Any]] = None, source: str = "dir
     images, mask, file_ids = resolve_edit_inputs(fields, source, batch)
     is_edit = bool(images or file_ids)
 
-    # An edit normally means "change this picture", so it defaults to the source geometry
-    # rather than to the generation default, which would silently reframe it.
+    # An edit normally means "change this picture", so it defaults to the source geometry.
+    # The generation default would silently reframe it.
     default_size  = cfg.image_edit_default_size if is_edit else cfg.image_default_size
     size          = validate_size  (fields.get("size", default_size))
     quality       = validate_choice("quality"      , fields.get("quality"      , cfg.image_default_quality)   , IMAGE_QUALITIES)
@@ -1108,25 +1112,25 @@ def build_request(overrides: Optional[Dict[str, Any]] = None, source: str = "dir
     source_files = validate_source_files(fields["source_files"]) if fields.get("source_files") else []
 
     mask_region = validate_mask_region(fields["mask_region"]) if fields.get("mask_region") else {}
-    # A region describes a mask, so one arriving without it describes nothing. Worth reporting
-    # rather than recording: it means the caller sent the two halves of a mask down different paths.
+    # A region describes a mask, so one arriving without it describes nothing.
+    # Worth reporting, not recording: the caller sent the two halves of a mask down different paths.
     if mask_region and mask is None:
         raise ImageRequestError("mask_region was given without a mask; it describes one, and records nothing on its own.")
 
     job_group = validate_annotation(fields["job_group"], "job_group", JOB_GROUP_KEYS) if fields.get("job_group") else {}
     job       = validate_annotation(fields["job"]      , "job"      , JOB_KEYS      ) if fields.get("job")       else {}
-    # The attempt's id is what joins the images of one request to each other and to a group. A
-    # group named without one describes nothing that can be found again, so it is a mistake worth
-    # reporting rather than a stamp worth writing.
+    # The attempt's id is what joins the images of one request to each other and to a group.
+    # A group named without one describes nothing findable.
+    # That is a mistake worth reporting, not a stamp worth writing.
     if job and not job.get("id"):
         raise ImageRequestError("job.id is required when a job is given.")
     if job_group and not job:
         raise ImageRequestError("job_group needs a job; a group with no attempt in it records nothing joinable.")
 
-    # Positional pairing, so a caller listing the same references in both fields does not
-    # have to repeat each id inside the lineage entry it already lines up with. Only done
-    # when the counts match and no entry named an id itself, since either of those means
-    # the caller had a pairing of its own in mind.
+    # Positional pairing.
+    # A caller listing the same references in both fields need not repeat each id in the lineage.
+    # Only when the counts match and no entry named an id.
+    # Either case means the caller had its own pairing in mind.
     if file_ids and len(source_files) == len(file_ids) and not any(entry.get("file_id") for entry in source_files):
         for entry, file_id in zip(source_files, file_ids):
             entry["file_id"] = file_id
@@ -1153,12 +1157,10 @@ def build_request(overrides: Optional[Dict[str, Any]] = None, source: str = "dir
 
 def reference_param(reference: ReferenceImage) -> Dict[str, str]:
     """
-    One local reference as the JSON body wants it: the provider's image reference object,
-    carrying the bytes inline.
+    One local reference as the JSON body wants it: the provider's reference object, bytes inline.
 
-    Read whole rather than streamed, unlike the multipart form, because a JSON body has to
-    be materialised in full before it can be sent -- and because the only thing that takes
-    this route is a mask, which is a flat two-colour PNG.
+    Read whole rather than streamed: a JSON body must be materialised before sending.
+    The only thing taking this route is a mask, a flat two-colour PNG.
     """
     payload = reference.data
     if payload is None:
@@ -1169,8 +1171,9 @@ def reference_param(reference: ReferenceImage) -> Dict[str, str]:
 
 def build_body(req: ImageRequest) -> Dict[str, Any]:
     """
-    The provider request. 'auto' is left out rather than sent, so the provider applies
-    its own default instead of being told a literal it may not accept.
+    The provider request.
+    'auto' is left out rather than sent.
+    The provider then applies its own default instead of being told a literal it may reject.
     """
     body: Dict[str, Any] = {
         "model"         : cfg.image_model,
@@ -1182,23 +1185,23 @@ def build_body(req: ImageRequest) -> Dict[str, Any]:
     if req.size    != "auto" : body["size"]    = req.size
     if req.quality != "auto" : body["quality"] = req.quality
 
-    # A batched edit carries its references inline, since the Batch API accepts no
-    # multipart upload. Verified against the provider: the field is 'images', it is always
-    # an array even for a single reference, and each entry must be an object -- a bare id
-    # string is rejected with "expected an object", and 'input_reference' with "Missing
-    # required parameter: 'images'". Several references work and bill exactly as they do
-    # on the immediate endpoint (two 1024x1024 references measured 2048 image input
-    # tokens). An image_url entry is accepted, but the provider must then fetch it, and a
-    # host that refuses non-browser requests fails the line on the download rather than on
-    # anything the proxy sent.
+    # A batched edit carries its references inline, since the Batch API accepts no multipart upload.
+    # Verified against the provider.
+    # The field is 'images', always an array, and every entry must be an object.
+    # A bare id string is rejected with "expected an object".
+    # 'input_reference' gets "Missing required parameter: 'images'".
+    # Several references work and bill as on the immediate endpoint.
+    # Two 1024x1024 references measured 2048 image input tokens.
+    # An image_url entry is accepted, but the provider must fetch it.
+    # A host refusing non-browser requests fails on the download, not on what the proxy sent.
     if req.file_ids:
         body["images"] = [
             {"image_url": value} if value.startswith("http") else {"file_id": value}
             for value in req.file_ids
         ]
 
-    # Same reference shape as an entry of 'images', which is what lets a batch carry a
-    # mask at all: there is no upload to make, so the bytes go inline as a data URL.
+    # The same reference shape as an entry of 'images', which is what lets a batch carry a mask.
+    # There is no upload to make, so the bytes go inline as a data URL.
     if req.mask is not None:
         body["mask"] = reference_param(req.mask)
 
@@ -1209,13 +1212,12 @@ def build_edit_form(req: ImageRequest) -> Tuple[Dict[str, str], List[Tuple[str, 
     """
     The multipart form for an immediate edit.
 
-    Reference images go in as 'image[]' -- repeated, which is what the provider expects
-    for several -- and every scalar becomes a form field, because multipart carries no
-    types. Files are handed over as open handles so httpx streams them instead of the
-    proxy holding every reference image in memory at once.
+    Reference images go in as repeated 'image[]', which is what the provider expects for several.
+    Every scalar becomes a form field, because multipart carries no types.
+    Files go over as open handles, so httpx streams them rather than buffering them all.
 
-    'input_fidelity' is never sent: gpt-image-2 always processes inputs at high fidelity
-    and rejects the parameter outright.
+    'input_fidelity' is never sent.
+    gpt-image-2 always works at high fidelity and rejects the parameter.
     """
     data: Dict[str, str] = {
         "model"         : cfg.image_model,
@@ -1257,17 +1259,16 @@ def confine(directory: str, candidate: str) -> str:
     """
     `candidate` back again if it really is inside `directory`, and a rejection if it is not.
 
-    Storage is the last place able to catch a name that somehow survived sanitisation: everything
-    above validates a *stem*, and this validates the path it turned into. A path escaping here
-    would be the model, or a client, writing wherever it liked.
+    Storage is the last place to catch a name that survived sanitisation.
+    Everything above validates a *stem*; this validates the path it turned into.
+    A path escaping here would be the model, or a client, writing wherever it liked.
     """
     root     = os.path.realpath(directory)
     resolved = os.path.realpath(candidate)
     try:
         contained = os.path.commonpath([root, resolved]) == root
     except ValueError:
-        # Different drives on Windows have no common path at all, which is as far
-        # outside the output directory as it gets.
+        # Different Windows drives share no path at all, the furthest outside possible.
         contained = False
     if not contained:
         raise ImageRequestError(f"refusing to write outside {cfg.image_output_dir}.")
@@ -1277,24 +1278,26 @@ def confine(directory: str, candidate: str) -> str:
 
 def taken_names(directory: str) -> set:
     """
-    Every name `directory` holds, lowercased -- so a name is judged taken case-insensitively,
-    which is stricter than Linux requires and exactly what Windows enforces. Deciding it by
-    os.path.exists would make the same directory behave differently on the two -- 'Cat.png'
-    beside 'cat.png' on one, silently indexed on the other -- and the manifest is meant to
-    describe a directory that can be copied between them unchanged. Call with STORAGE_LOCK held.
+    Every name `directory` holds, lowercased, so a name is taken case-insensitively.
+    That is stricter than Linux needs and exactly what Windows enforces.
+    Deciding it by os.path.exists would make one directory behave differently on each.
+    'Cat.png' would sit beside 'cat.png' on one and be silently indexed on the other.
+    The manifest is meant to describe a directory that copies between them unchanged.
+    Call with STORAGE_LOCK held.
     """
     try:
         return {entry.lower() for entry in os.listdir(directory)}
     except OSError:
-        # A directory we cannot list is one we are about to fail to write into anyway; let
-        # that failure happen at the write, where it says something useful.
+        # A directory we cannot list is one we will fail to write into anyway.
+        # Let that failure happen at the write, where it says something useful.
         return set()
 
 
 def allocate_path(directory: str, stem: str, extension: str) -> str:
     """
-    A free path under `directory`. An existing file is never overwritten: a linear index
-    is appended until the name is free. Call with STORAGE_LOCK held.
+    A free path under `directory`.
+    An existing file is never overwritten: a linear index is appended until the name is free.
+    Call with STORAGE_LOCK held.
     """
     taken = taken_names(directory)
 
@@ -1313,9 +1316,9 @@ def default_stem(image_id: str) -> str:
 
 def save_image_bytes(req: ImageRequest, data: bytes, image_id: str) -> SavedImage:
     """
-    Writes one decoded image, atomically: the bytes land in a temporary file in the
-    destination directory and are then renamed into place, so a reader never sees a
-    half-written image and a failed write leaves no partial file behind.
+    Writes one decoded image, atomically.
+    The bytes land in a temporary file in the destination directory and are renamed into place.
+    A reader never sees a half-written image, and a failed write leaves nothing behind.
     """
     directory = output_dir_path()
     extension = FORMAT_EXTENSIONS[req.output_format]
@@ -1335,10 +1338,9 @@ def save_image_bytes(req: ImageRequest, data: bytes, image_id: str) -> SavedImag
             except OSError: pass
             raise
 
-    # Reported relative to the working directory, which is the short form worth reading in
-    # a console. On Windows two drives share no common prefix at all and relpath raises
-    # rather than returning something absolute, so the absolute path stands in -- an output
-    # directory on another drive is a configuration, not an error.
+    # Reported relative to the working directory, the short form worth reading in a console.
+    # On Windows two drives share no prefix, and relpath raises rather than going absolute.
+    # The absolute path stands in; an output directory elsewhere is a configuration, not an error.
     try: reported = os.path.relpath(path, os.getcwd())
     except ValueError:
         reported = path
@@ -1348,17 +1350,18 @@ def save_image_bytes(req: ImageRequest, data: bytes, image_id: str) -> SavedImag
 
 def persist_mask(req: ImageRequest, directory: str, stem: str) -> str:
     """
-    Where the manifest should say this request's mask is, writing it out first if it only
-    ever existed as bytes.
+    Where the manifest should say this request's mask is.
+    It is written out first if it only ever existed as bytes.
 
-    A mask named by path already has somewhere to point at and is left where it is. One
-    that arrived as an upload or a data URL has nowhere, and `upload:mask.png` records a
-    name with nothing behind it -- so it is written beside the images it shaped, under
-    `masks/`, and the manifest names that copy. One file per request, whatever `n` was:
-    the mask belongs to the request, not to any one image it produced.
+    A mask named by path already has somewhere to point at and is left where it is.
+    One that arrived as an upload or data URL has nowhere, and `upload:mask.png` names nothing.
+    So it is written beside the images it shaped, under `masks/`, and the manifest names that copy.
+    One file per request, whatever `n` was.
+    The mask belongs to the request, not to one image.
 
-    Never fatal. The images are already on disk by the time this runs, and losing the
-    record of a mask is not worth losing the record of the pictures.
+    Never fatal.
+    The images are on disk by the time this runs.
+    Losing a mask record is not worth losing the record of the pictures.
     """
     mask = req.mask
     if mask is None:
@@ -1416,7 +1419,8 @@ def manifest_path(path: str, directory: str) -> str:
 
 def manifest_source_files(req: ImageRequest) -> List[Dict[str, str]]:
     """
-    Lineage for one request. Declared source_files win; otherwise derive from references.
+    Lineage for one request.
+    Declared source_files win; otherwise derive from references.
     """
     directory = output_dir_path()
 
@@ -1437,8 +1441,8 @@ def manifest_source_files(req: ImageRequest) -> List[Dict[str, str]]:
 
 def append_manifest(req: ImageRequest, saved: List[SavedImage], cost_usd: float, usage: Dict[str, Any], estimated: bool, batch_id: str = "") -> None:
     """
-    Append one record per image. A corrupt manifest is replaced rather than aborting
-    after the image has already been saved.
+    Append one record per image.
+    A corrupt manifest is replaced rather than aborting after the image has already been saved.
     """
     if not cfg.image_manifest_enabled or not saved:
         return
@@ -1447,12 +1451,13 @@ def append_manifest(req: ImageRequest, saved: List[SavedImage], cost_usd: float,
     path      = os.path.join(directory, MANIFEST_FILE)
     created   = time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
-    # Once for the request, before the loop: every record of a batch of n points at the
-    # same mask file, and writing it n times would be n different files saying one thing.
+    # Once for the request, before the loop.
+    # Every record of a batch of n names the same mask file.
+    # Writing it n times would be n files saying one thing.
     mask_file   = persist_mask(req, directory, req.filename or default_stem(saved[0].image_id))
-    # What the mask was, rather than merely where its picture went. The region is the durable half
-    # -- it can be read back, corrected and asked for again, while the path only ever named a file
-    # that a move or a rename could leave pointing at nothing.
+    # What the mask was, rather than merely where its picture went.
+    # The region is the durable half: it can be read back, corrected and asked for again.
+    # The path only ever named a file that a move or rename could leave pointing nowhere.
     mask_record = dict(req.mask_region)
     if mask_file:
         mask_record["file"] = mask_file
@@ -1528,11 +1533,12 @@ def append_manifest(req: ImageRequest, saved: List[SavedImage], cost_usd: float,
 
 def read_manifest(path: str) -> List[Any]:
     """
-    The manifest as a list, for a route about to rewrite it. Call with STORAGE_LOCK held.
+    The manifest as a list, for a route about to rewrite it.
+    Call with STORAGE_LOCK held.
 
-    Unreadable is an error here rather than the warning append_manifest settles for: appending
-    has an image already on disk and must not lose it to a corrupt manifest, while a route that
-    rewrites has nothing to salvage and no business overwriting what it could not read.
+    Unreadable is an error here, not the warning append_manifest settles for.
+    Appending has an image on disk and must not lose it to a corrupt manifest.
+    A route that rewrites has nothing to salvage and no business overwriting what it could not read.
     """
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -1546,8 +1552,9 @@ def read_manifest(path: str) -> List[Any]:
 
 def write_manifest(path: str, records: List[Any]) -> None:
     """
-    The manifest written whole through a temporary file, as appending is: a failure must leave
-    the manifest that was there rather than half of a new one. Call with STORAGE_LOCK held.
+    The manifest is written whole through a temporary file, as appending is.
+    A failure must leave the old manifest rather than half of a new one.
+    Call with STORAGE_LOCK held.
     """
     tmp_path = f"{path}.{uuid.uuid4().hex[:8]}.part"
     try:
@@ -1563,9 +1570,10 @@ def write_manifest(path: str, records: List[Any]) -> None:
 
 def find_record(records: List[Any], image_id: str, file: str) -> Optional[Dict[str, Any]]:
     """
-    The record a client is naming: by the proxy's own id, or by filename for one written before
-    ids were recorded. An id is unique; a filename is only as unique as the directory holding it,
-    so it is the fallback rather than the join.
+    The record a client is naming.
+    By the proxy's id, or by filename for one written before ids existed.
+    An id is unique; a filename is only as unique as its directory.
+    So it is the fallback, not the join.
     """
     for record in records:
         if not isinstance(record, dict):
@@ -1581,8 +1589,7 @@ def find_record(records: List[Any], image_id: str, file: str) -> Optional[Dict[s
 
 def patch_manifest(updates: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Correct records already in the manifest: what the request asked for, and which attempt it
-    belongs to.
+    Correct records already in the manifest: what was asked for, and which attempt it belongs to.
     """
     if not cfg.image_manifest_enabled:
         raise ImageRequestError("manifests are disabled on this proxy (IMAGE_MANIFEST_ENABLED=false).")
@@ -1633,8 +1640,8 @@ def patch_manifest(updates: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not image_id and not file:
             raise ImageRequestError(f"updates[{index}] must name a record by image_id or file.")
 
-        # Present-and-null is "clear it"; absent is "leave it as it is". The two are different
-        # instructions, so which keys were given has to survive validation.
+        # Present-and-null is "clear it"; absent is "leave it as it is".
+        # The two are different instructions, so which keys were given has to survive validation.
         entry: Dict[str, Any] = {"image_id": image_id, "file": file}
 
         for key in sorted(PATCH_STRING_KEYS):
@@ -1687,8 +1694,8 @@ def patch_manifest(updates: List[Dict[str, Any]]) -> Dict[str, Any]:
                 missing.append(entry["image_id"] or entry["file"])
                 continue
 
-            # Compared over the whole record rather than key by key: several kinds of field are
-            # being written now, and "did this actually change anything" is one question, not nine.
+            # Compared over the whole record rather than key by key.
+            # Several kinds of field are written now, and "did anything change" is one question.
             before = json.dumps(found, sort_keys=True, default=str)
 
             for key in sorted(PATCH_STRING_KEYS):
@@ -1707,8 +1714,8 @@ def patch_manifest(updates: List[Dict[str, Any]]) -> Dict[str, Any]:
                 else:
                     found.pop(key, None)
 
-            # The region merges over what the record already said, so correcting the rectangles
-            # keeps the picture this proxy rasterised -- which it cannot render again.
+            # The region merges over the record, so a rectangle fix keeps the rasterised picture.
+            # It cannot render that again.
             if "mask" in entry:
                 if entry["mask"]:
                     was = found.get("mask") if isinstance(found.get("mask"), dict) else {}
@@ -1716,8 +1723,9 @@ def patch_manifest(updates: List[Dict[str, Any]]) -> Dict[str, Any]:
                 else:
                     found.pop("mask", None)
 
-            # Merged for the reason the mask is: a proxy records parameters this route does not
-            # model, and a moderation setting must not be lost to a correction of the size beside it.
+            # Merged for the reason the mask is.
+            # A proxy records parameters this route does not model.
+            # A moderation setting must not be lost to a size correction beside it.
             if "request_parameters" in entry:
                 if entry["request_parameters"] is None:
                     found.pop("request_parameters", None)
@@ -1759,13 +1767,12 @@ def rename_in_records(records: List[Any], directory: str, was: str, now: str) ->
     """
     Every mention of one file rewritten to its new name, and how many records had to change.
 
-    The record *of* it, and every record naming it as a source, as a source image or as a mask --
-    an edit's lineage points at a file on this disk precisely because a provider id expires and a
-    path does not, so a rename that only fixed the record of the file itself would quietly break
-    the history of everything made from it.
+    The record *of* it, and every record naming it as a source image or a mask.
+    An edit's lineage names a file on this disk because a provider id expires and a path does not.
+    A rename fixing only that record would quietly break the history of everything made from it.
 
-    The mirror of `renameInRecords` in mini-img's src/manifest.ts, which does exactly this for the
-    manifests that app owns. Records are rewritten in place; the caller writes the list back.
+    The mirror of `renameInRecords` in mini-img's src/manifest.ts, for the manifests that app owns.
+    Records are rewritten in place; the caller writes the list back.
     """
     def here(value: str) -> str:
         return os.path.normcase(os.path.abspath(os.path.join(directory, value)))
@@ -1796,8 +1803,8 @@ def rename_in_records(records: List[Any], directory: str, was: str, now: str) ->
             for entry in sources:
                 if isinstance(entry, dict) and is_target(entry.get("path")):
                     entry["path"] = recorded
-                    # `file` follows only where it was recorded: absent means the reference went
-                    # up as bytes, and never had a name here to keep up to date.
+                    # `file` follows only where it was recorded.
+                    # Absent means the reference went up as bytes and never had a name here.
                     if entry.get("file"):
                         entry["file"] = now
                     touched = True
@@ -1824,15 +1831,15 @@ def rename_image(image_id: str, file: str, filename: str) -> Dict[str, Any]:
     """
     Rename one image this proxy wrote, and follow the new name through the manifest.
 
-    Deliberately not part of PATCH /v1/images/manifest, which refuses `file` on the grounds that a
-    record's filename is measurement rather than testimony -- it describes the file this proxy
-    wrote. That still holds: a rename does not correct the measurement, it changes the thing being
-    measured, and only the process holding STORAGE_LOCK can move the file and rewrite its record
-    without racing a job landing beside it.
+    Deliberately not part of PATCH /v1/images/manifest, which refuses `file`.
+    A record's filename is measurement, not testimony: it describes the file this proxy wrote.
+    That still holds.
+    A rename changes the thing measured rather than correcting the measurement.
+    Only the holder of STORAGE_LOCK can move the file and rewrite its record without a race.
 
-    The extension is imposed rather than chosen, as it is on the way in: the bytes decide the
-    format, and a rename from .png to .webp would leave the manifest describing a file that is
-    not what it says it is.
+    The extension is imposed rather than chosen, as on the way in.
+    The bytes decide the format.
+    A rename from .png to .webp would leave the manifest describing something else.
     """
     if not cfg.image_manifest_enabled:
         raise ImageRequestError("manifests are disabled on this proxy (IMAGE_MANIFEST_ENABLED=false).")
@@ -1877,8 +1884,8 @@ def rename_image(image_id: str, file: str, filename: str) -> Dict[str, Any]:
         if not os.path.exists(old_path):
             raise ImageRequestError(f"{was} is recorded but is no longer in the output directory.")
 
-        # A change of case alone is the file being renamed to itself, which Windows performs
-        # happily and which `taken_names` would otherwise read as a collision with itself.
+        # A change of case alone renames the file to itself, which Windows performs happily.
+        # `taken_names` would otherwise read that as a collision with itself.
         itself = os.path.normcase(old_path) == os.path.normcase(new_path)
         if not itself and name.lower() in taken_names(directory):
             raise ImageRequestError(f"{name} is already taken in the output directory.")
@@ -1911,8 +1918,8 @@ def parse_usage(usage: Any) -> Dict[str, Any]:
     image_input = max(0, int(input_details.get("image_tokens", 0) or 0))
     total_input = max(0, int(usage.get("input_tokens", 0) or 0))
 
-    # Without the split, everything counts as text input: text-to-image sends no
-    # reference images, so that is the correct bucket rather than a guess.
+    # Without the split everything counts as text input.
+    # Text-to-image sends no reference images, so that is the right bucket, not a guess.
     if not text_input and not image_input:
         text_input = total_input
 
@@ -1926,8 +1933,9 @@ def parse_usage(usage: Any) -> Dict[str, Any]:
 
 def estimate_image_cost(model: str, quality: str, size: str, n: int) -> float:
     """
-    Fallback per-image pricing for providers that return no usage object, from
-    IMAGE_PRICE_TABLE: {"model-regex": {quality: {size: usd}}}. Either key may be "*".
+    Fallback per-image pricing for providers returning no usage object, from IMAGE_PRICE_TABLE.
+    The shape is {"model-regex": {quality: {size: usd}}}.
+    Either key may be "*".
     Returns 0.0 when nothing matches, which is reported as free rather than invented.
     """
     table = cfg.image_price_table
@@ -1991,9 +1999,9 @@ def post_generation(provider: Dict[str, Any], request: ImageRequest) -> Any:
 
 def post_edit(provider: Dict[str, Any], request: ImageRequest) -> Any:
     """
-    Image-to-image: a multipart form to /images/edits. The only structural difference
-    from generation is the transport, which is why it is isolated to this function --
-    decoding, saving, the manifest and the cost accounting are shared downstream.
+    Image-to-image: a multipart form to /images/edits.
+    The only structural difference from generation is the transport, so it is isolated here.
+    Decoding, saving, the manifest and cost accounting are shared downstream.
     """
     data, files = build_edit_form(request)
 
@@ -2019,9 +2027,10 @@ def post_edit(provider: Dict[str, Any], request: ImageRequest) -> Any:
         close_form_files(files)
 
 
-# Gateway-class failures: the request never reached or never completed at the origin, so
-# no image was produced and nothing was billed. Retrying those is safe. A 4xx, or a 5xx
-# the model itself produced, is not in here -- repeating a refusal just pays for it twice.
+# Gateway-class failures.
+# The request never reached or completed at the origin, so no image was produced and nothing billed.
+# Retrying those is safe.
+# A 4xx, or a 5xx the model produced, is not here; repeating a refusal pays for it twice.
 RETRYABLE_STATUSES  = {502, 503, 504, 520, 521, 522, 523, 524}
 RETRYABLE_TRANSPORT = (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError, httpx.WriteError)
 
@@ -2030,8 +2039,8 @@ def post_with_retry(send, provider: Dict[str, Any], request: ImageRequest) -> An
     """
     Runs one image call, retrying gateway failures.
 
-    The callable is re-invoked rather than the response replayed, because an edit's
-    multipart handles are read to EOF on the first attempt and a retry needs fresh ones.
+    The callable is re-invoked rather than the response replayed.
+    An edit's multipart handles are read to EOF on the first attempt, so a retry needs fresh ones.
     """
     attempts = max(1, cfg.image_retry_attempts)
     delay    = max(0.0, cfg.image_retry_backoff_seconds)
@@ -2062,8 +2071,7 @@ def post_with_retry(send, provider: Dict[str, Any], request: ImageRequest) -> An
 
 def generate_image(request: ImageRequest) -> ImageResult:
     """
-    Run one immediate request -- a generation, or an edit when it carries references --
-    and save every file it returns.
+    Run one immediate request, a generation or an edit with references, and save what it returns.
     """
     if request.batch:
         raise ImageRequestError("this request is marked batch=true; use submit_image_batch instead.")
@@ -2104,7 +2112,8 @@ def generate_image(request: ImageRequest) -> ImageResult:
     )
 
 
-# Batch API. Submission and retrieval are separate because chat turns cannot wait on it.
+# Batch API.
+# Submission and retrieval are separate because chat turns cannot wait on it.
 def batch_state_path() -> str:
     """Reading state must not create an unused output directory."""
     return os.path.join(os.path.abspath(cfg.image_output_dir), BATCH_STATE_FILE)
@@ -2199,8 +2208,8 @@ def request_to_state(req: ImageRequest) -> Dict[str, Any]:
         "source"        : req.source,
         "file_ids"      : list(req.file_ids),
         "source_files"  : [dict(entry) for entry in req.source_files],
-        # Carried so a batch retrieved days later is stamped as this proxy writes its record,
-        # whether or not the client that submitted it is still running.
+        # Carried so a batch retrieved days later is stamped as this proxy writes its record.
+        # The client that submitted it need not still be running.
         "mask_region"   : dict(req.mask_region),
         "job_group"     : dict(req.job_group),
         "job"           : dict(req.job),
@@ -2223,8 +2232,8 @@ def state_to_request(entry: Dict[str, Any]) -> ImageRequest:
             {str(key): str(value) for key, value in item.items() if key in SOURCE_FILE_KEYS}
             for item in (entry.get("source_files") or []) if isinstance(item, dict)
         ],
-        # Re-validated rather than trusted: this comes off disk, where a hand-edited state file is
-        # as likely as one we wrote.
+        # Re-validated rather than trusted.
+        # This comes off disk, where a hand-edited state file is as likely as ours.
         mask_region   = validate_mask_region(entry.get("mask_region")) if entry.get("mask_region") else {},
         job_group     = {str(key): str(value) for key, value in (entry.get("job_group") or {}).items() if key in JOB_GROUP_KEYS},
         job           = {str(key): str(value) for key, value in (entry.get("job")       or {}).items() if key in JOB_KEYS},
@@ -2355,15 +2364,13 @@ def retrieve_image_batch(batch_id: str) -> ImageBatchResult:
     """
     Read batch status and save completed image results when available.
 
-    Saving is done once and recorded: re-running this on an already-retrieved batch
-    reports it rather than writing a second copy of every image and billing the session
-    for them again.
+    Saving is done once and recorded.
+    Re-running this on a retrieved batch reports it rather than duplicating and billing again.
     """
     provider = image_provider()
 
-    # The whole read-check-save-mark sequence is one critical section: the poller and the
-    # CLI can both land on the same batch, and doing this twice would write a second copy
-    # of every image and bill the session for it.
+    # The whole read-check-save-mark sequence is one critical section.
+    # The poller and the CLI can land on the same batch; doing it twice duplicates every image.
     with BATCH_LOCK:
         state = read_batch_state()
         entry = state.get(batch_id) or {}
@@ -2389,12 +2396,11 @@ def retrieve_image_batch(batch_id: str) -> ImageBatchResult:
             # Still validating, running or finalizing: there is nothing to read yet.
             return result
 
-        # From here the batch is settled below whatever it produced, which is not always an
-        # output file. A batch whose every request was rejected still reports 'completed',
-        # with only an error file to its name; a cancelled or expired one can carry results
-        # for the requests that finished before it stopped. Both files are read the same
-        # way -- the error lines carry the provider's reason for each failure, which is the
-        # only place the user can learn why nothing came back.
+        # From here the batch settles below whatever it produced, not always an output file.
+        # A batch with every request rejected still reports 'completed', with only an error file.
+        # A cancelled or expired one can carry results for whatever finished before it stopped.
+        # Both files are read the same way.
+        # The error lines carry the provider's reason for each failure, the only place it is said.
         output_file_id = str(data.get("output_file_id") or "")
         error_file_id  = str(data.get("error_file_id") or "")
 
@@ -2405,8 +2411,8 @@ def retrieve_image_batch(batch_id: str) -> ImageBatchResult:
         total_counts   = {"text_input": 0, "image_input": 0, "output": 0, "reported": False, "estimated_cost_usd": 0.0}
         images_saved   = 0
 
-        # A fetch that fails here raises rather than settling the batch on a half-read
-        # result: the poller retries it next pass, where losing the images would be final.
+        # A fetch that fails here raises rather than settling the batch on a half-read result.
+        # The poller retries next pass, where losing the images would be final.
         result_lines: List[str] = []
         for file_id in (output_file_id, error_file_id):
             if file_id:
@@ -2453,10 +2459,9 @@ def retrieve_image_batch(batch_id: str) -> ImageBatchResult:
                 total_counts[key] += counts[key]
             total_counts["reported"] = total_counts["reported"] or counts["reported"]
 
-            # Accumulated per line, against this line's own request, because a batch may
-            # mix sizes and qualities and need not come back whole: pricing the images
-            # that did arrive off one arbitrary request bills the wrong rate as soon as
-            # that request is not representative -- or was itself one of the rejected ones.
+            # Accumulated per line against that line's own request.
+            # A batch may mix sizes and qualities, and need not come back whole.
+            # Pricing off one arbitrary request bills the wrong rate once it is unrepresentative.
             if not counts["reported"]:
                 total_counts["estimated_cost_usd"] += estimate_image_cost(cfg.image_model, req.quality, req.size, len(saved))
 
@@ -2465,10 +2470,10 @@ def retrieve_image_batch(batch_id: str) -> ImageBatchResult:
             images_saved += len(saved)
 
         if images_saved:
-            # Billed once for the whole batch, at the batch rate, rather than per output
-            # line: the session report distinguishes batch from immediate spending. Only
-            # the lines that came back are counted, so a batch the provider fulfilled in
-            # part costs what it delivered rather than what it was asked for.
+            # Billed once for the whole batch at the batch rate, not per output line.
+            # The session report distinguishes batch from immediate spending.
+            # Only the lines that came back are counted.
+            # A partly fulfilled batch costs what it delivered, not what it was asked for.
             total_counts["estimated"] = not total_counts["reported"]
             result.cost_usd = track_image_usage(total_counts, images=images_saved, batch=True, model=cfg.image_model)
 
@@ -2476,8 +2481,7 @@ def retrieve_image_batch(batch_id: str) -> ImageBatchResult:
         entry["retrieved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         entry["final_status"] = status
         entry["images"]       = [image.path for image in result.images]
-        # Kept so a batch that produced nothing can still say why long after the poller
-        # printed it once and moved on.
+        # Kept so a batch that produced nothing can still say why, long after the poller moved on.
         entry["errors"]       = list(result.errors)
         state[batch_id]       = entry
         write_batch_state(state)
@@ -2503,10 +2507,10 @@ def list_batches() -> List[Dict[str, Any]]:
     """
     Every batch submitted from this output directory, newest first.
 
-    Reports the state file rather than asking the provider about each batch in turn: a
-    listing is a cheap call a client makes often, and one that fanned out to the provider
-    would not be. An unsettled batch therefore reports 'pending' -- its live status comes
-    from retrieving it, which is what GET /v1/images/batches/<n> does.
+    Reports the state file rather than asking the provider about each batch.
+    A listing is a cheap call clients make often, and one fanning out to the provider would not be.
+    An unsettled batch therefore reports 'pending'.
+    Its live status comes from retrieving it, which GET /v1/images/batches/<n> does.
     """
     with BATCH_LOCK:
         state = read_batch_state()
@@ -2525,16 +2529,16 @@ def list_batches() -> List[Dict[str, Any]]:
             "submitted_at"  : entry.get("submitted_at") or "",
             "retrieved"     : retrieved,
             "retrieved_at"  : entry.get("retrieved_at") or "",
-            # 'pending' is this proxy's word, not the provider's: nothing here has asked
-            # the provider, so claiming one of its statuses would be inventing it.
+            # 'pending' is this proxy's word, not the provider's.
+            # Nothing here asked it, so claiming one of its statuses would be inventing it.
             "status"        : str(entry.get("final_status") or ("settled" if retrieved else "pending")),
             "images"        : list(entry.get("images") or []),
             "errors"        : list(entry.get("errors") or []),
             "requests"      : [
                 {
                     "custom_id"     : custom_id,
-                    # The name the user gave the job, which is what they will look for in
-                    # the folder -- more use in a listing than either id.
+                    # The name the user gave the job, which is what they look for in the folder.
+                    # More use in a listing than either id.
                     "filename"      : item.get("filename", ""),
                     "prompt"        : item.get("prompt", ""),
                     "size"          : item.get("size", ""),
@@ -2553,11 +2557,11 @@ def list_batches() -> List[Dict[str, Any]]:
 
 def poll_batches_once() -> List[ImageBatchResult]:
     """
-    Checks every unsettled batch once and retrieves the finished ones. Returns only the
-    batches that actually settled, so a caller has nothing to report on a quiet pass.
+    Checks every unsettled batch once and retrieves the finished ones.
+    Returns only the batches that settled, so a quiet pass gives the caller nothing to report.
 
-    One batch failing must not stop the others from being checked, so each is caught
-    separately -- a provider hiccup on one id is not a reason to strand the rest.
+    One batch failing must not stop the others being checked, so each is caught separately.
+    A provider hiccup on one id is no reason to strand the rest.
     """
     settled: List[ImageBatchResult] = []
 
@@ -2592,9 +2596,8 @@ def batch_poll_loop() -> None:
     """
     Retrieves completed batches in the background.
 
-    A batch finishes on the provider's schedule, which is rarely the moment anyone is
-    looking at the CLI. Without this its images stay on the provider until somebody
-    remembers to ask, and the completion window can expire first.
+    A batch finishes on the provider's schedule, rarely when anyone is watching the CLI.
+    Without this its images sit on the provider until asked for, and the window can expire.
     """
     while True:
         time.sleep(cfg.image_batch_poll_seconds)
@@ -2610,10 +2613,11 @@ def batch_poll_loop() -> None:
             print(f"WARNING: image batch poll failed: {exc}")
 
 
-# One poller per process. 'reload' can turn auto-polling on after startup, so this is
-# called again from there; without the flag that would leave two threads racing for the
-# same batches. The thread itself re-reads the settings every pass, so a poller already
-# running picks up a new interval (or a disabled switch) without being restarted.
+# One poller per process.
+# 'reload' can turn auto-polling on after startup, so this is called again from there.
+# Without the flag that would leave two threads racing for the same batches.
+# The thread re-reads the settings every pass.
+# A running poller picks up a new interval, or a disabled switch, without a restart.
 POLLER_STARTED = False
 
 def start_batch_poller() -> None:
@@ -2633,8 +2637,9 @@ def start_batch_poller() -> None:
     print(f"Image batches are retrieved automatically every {cfg.image_batch_poll_seconds:.0f}s ({waiting} waiting).")
 
 
-# Image model list. Fetched separately from the conversational one: <NAME>_MODELS_REGEX
-# exists to keep image models out of that list, so they have to be found on their own.
+# Image model list.
+# Fetched separately from the conversational one.
+# <NAME>_MODELS_REGEX exists to keep image models out of that list, so they are found on their own.
 IMAGE_MODELS : List[Dict[str, Any]] = []
 IMAGE_MODEL_LOCK                    = threading.Lock()
 
@@ -2691,8 +2696,9 @@ def print_image_model_list() -> None:
 
 def select_image_model_by_number(index: int) -> bool:
     """
-    Selects an image model. Deliberately does not touch cfg.backend, cfg.model or the
-    text price fields -- the conversation carries on with whatever it was using.
+    Selects an image model.
+    Deliberately does not touch cfg.backend, cfg.model or the text price fields.
+    The conversation carries on with whatever it was using.
     """
     with IMAGE_MODEL_LOCK:
         if not IMAGE_MODELS:

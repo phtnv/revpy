@@ -1,9 +1,9 @@
 """
 The /v1/messages backend: Anthropic's own protocol, spoken through the Anthropic SDK.
 
-This is where the proxy's Anthropic-only features live -- explicit cache markers with
-a TTL each, signed thinking-block preservation, and assistant prefill. None of them
-have an equivalent on the other two endpoints, so nothing here is shared with them.
+This is where the proxy's Anthropic-only features live.
+Explicit cache markers with a TTL each, signed thinking-block preservation, and assistant prefill.
+None of them have an equivalent on the other two endpoints, so nothing here is shared with them.
 Providers are registered, listed, selected and priced in providers.py like any other.
 """
 
@@ -32,7 +32,7 @@ from common import (
 
 def resolve_thinking() -> None:
     """
-    Anthropic thinking resolution: capability checks against the selected model record and the Anthropic parameter constraints.
+    Anthropic thinking resolution: capability checks against the model record and its constraints.
     """
     if not cfg.thinking_enabled:
         return
@@ -91,19 +91,20 @@ def print_think_status() -> None:
 
 def after_model_switch() -> None:
     """
-    Post-switch hook for this backend. Runs after providers.apply_model has pointed cfg at the new model.
+    Post-switch hook for this backend.
+    Runs after providers.apply_model has pointed cfg at the new model.
 
-    Prefill is validated here rather than in resolve_thinking() because the rules turn
-    on the model version, so the check has to run whether or not thinking is enabled.
-    Do not call cfg.set_prefill() here: that would overwrite ASSISTANT_PREFILL with the
-    mode string (for example "none", "assistant", or "instruction").
+    Prefill is validated here, not resolve_thinking(), because the rules turn on the model version.
+    The check therefore runs whether or not thinking is enabled.
+    Do not call cfg.set_prefill() here: it would overwrite ASSISTANT_PREFILL with the mode string.
+    That is "none", "assistant" or "instruction".
     """
     cfg.set_prefill_mode(cfg.assistant_prefill_mode)
     resolve_thinking()
 
 
-# The SDK appends /v1/messages to its base_url itself, while a provider is configured
-# with the /v1 root like every other one, so the suffix has to come back off.
+# The SDK appends /v1/messages to its base_url itself.
+# A provider is configured with the /v1 root like every other one, so the suffix comes back off.
 V1_SUFFIX_RE = re.compile(r"/v1/?$")
 
 
@@ -119,7 +120,8 @@ def make_cache_control(ttl: str) -> Dict[str, str]:
     """
     Builds Anthropic cache_control metadata for a specific marker TTL.
 
-    5-minute cache is the API default. 1-hour cache is more expensive but useful for longer pauses.
+    5-minute cache is the API default.
+    1-hour cache is more expensive but useful for longer pauses.
     """
     cache_control = {"type": "ephemeral"}
     if ttl == "1h":
@@ -131,8 +133,8 @@ def add_cache_control_to_content(content: Any, ttl: str) -> Any:
     """
     Adds explicit Anthropic cache_control to the last non-empty text block.
 
-    Anthropic prompt caching is enabled by adding cache_control either at the request level or on content blocks.
-    This script uses explicit block-level caching to avoid caching the assistant prefill as the final block.
+    Anthropic prompt caching is enabled with cache_control, at request level or on content blocks.
+    Block-level caching keeps the assistant prefill out of the final cached block.
     """
     if not cfg.cache_en:
         return content
@@ -260,7 +262,8 @@ def format_system(system_segments: List[str], system_summary_text: str = "") -> 
     Turns pre-split system prompt segments into top-level Anthropic system blocks.
 
     The model-agnostic lorebook splitting happens in server.split_system_text().
-    This only decides the Anthropic representation: one text block per segment, with the explicit system cache marker applied to each non-empty block.
+    This only decides the Anthropic representation: one text block per segment.
+    The explicit system cache marker goes on each non-empty block.
     """
     summary_text = system_summary_text.strip()
 
@@ -282,20 +285,20 @@ def format_messages(mlist: List[Dict[str, Any]], lorebook_at_end_text: str = "")
     """
     Converts OpenAI-style chat messages to Anthropic Messages format.
 
-    Consecutive same-role user/assistant messages are merged because Anthropic expects alternating user/assistant turns.
-    Internal mid-conversation system messages are inserted only for Claude 4.8+ when LOREBOOK_AT_END moves the split lorebook out of the top-level system prompt.
+    Consecutive same-role messages are merged; Anthropic expects alternating user/assistant turns.
+    Internal mid-conversation system messages are inserted only for Claude 4.8+.
+    That happens when LOREBOOK_AT_END moves the split lorebook out of the system prompt.
 
     Manual caching marks the configured first-N-message prefix.
-    Automatic caching marks an end-relative conversation point after any lorebook relocation and before optional prefill,
-    so moved lorebook content is treated like any other end-of-conversation item.
+    Automatic caching marks an end-relative point, after lorebook relocation and before prefill.
+    Moved lorebook content is then treated like any other end-of-conversation item.
     """
 
     formatted: List[Dict[str, Any]] = []
     old_role: Optional[str] = None
 
-    # Maps each incoming OpenAI-style chat message index to the Anthropic message index
-    # that contains it after same-role merging. Cache markers are applied after the final
-    # message shape is known instead of checking targets on every loop iteration.
+    # Maps each incoming chat message index to the Anthropic index holding it after merging.
+    # Markers are applied once the final shape is known, not by testing targets every iteration.
     incoming_to_formatted_index: List[int] = []
 
     for msg in mlist:
@@ -355,7 +358,7 @@ def format_messages(mlist: List[Dict[str, Any]], lorebook_at_end_text: str = "")
 
     # Optional Claude prefill.
     # assistant mode preserves the original assistant-message/prefill behavior.
-    # instruction mode avoids assistant prefill and appends an OOC instruction to the last user message instead.
+    # instruction mode skips assistant prefill and appends an OOC line to the last user message.
     if cfg.assistant_prefill.strip() and cfg.assistant_prefill_mode != "none":
         if cfg.assistant_prefill_mode == "instruction":
             append_prefill_instruction_to_last_user_message(formatted, cfg.assistant_prefill)
@@ -391,7 +394,8 @@ def anthropic_blocks_to_dicts(message: Any) -> List[Dict[str, Any]]:
 def fallback_cache_write_ttl() -> str:
     """
     Older SDK usage payloads may not split cache creation by 5m/1h.
-    If any active marker is configured for 1h, assume 1h for unknown write tokens to avoid under-counting cost.
+    If any active marker is set to 1h, assume 1h for unknown write tokens.
+    That avoids under-counting cost.
     """
     if not cfg.cache_en:
         return "5m"
@@ -406,10 +410,10 @@ def parse_usage(usage: Any) -> Dict[str, Any]:
     """
     Pulls the token counts the proxy tracks out of an Anthropic usage payload.
 
-    Anthropic reports input_tokens net of caching -- cache reads and cache writes are
-    counted separately rather than included -- so the normalized 'prompt' total has to
-    be summed back up. Anthropic never reports a reasoning count, so 'reasoning' stays
-    None rather than claiming zero for thinking that demonstrably happened.
+    Anthropic reports input_tokens net of caching.
+    Cache reads and writes count separately, so the normalized 'prompt' total is summed back up.
+    Anthropic never reports a reasoning count.
+    'reasoning' stays None rather than claiming zero for thinking that demonstrably happened.
     """
     cache_creation       = getattr(usage, "cache_creation", {}) or {}
     ephemeral_1h         = int(getattr(cache_creation, "ephemeral_1h_input_tokens", 0) or 0)
@@ -420,7 +424,7 @@ def parse_usage(usage: Any) -> Dict[str, Any]:
     cache_creation_input = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
 
     # Older SDK responses may expose only cache_creation_input_tokens without the 5m/1h split.
-    # Mixed-TTL requests cannot be reconstructed from that legacy shape, so use a conservative fallback.
+    # Mixed-TTL requests cannot be rebuilt from that legacy shape, so fall back conservatively.
     known_cache_write = ephemeral_1h + ephemeral_5m
     if cache_creation_input > known_cache_write:
         unknown_cache_write = cache_creation_input - known_cache_write
@@ -446,8 +450,8 @@ def parse_usage(usage: Any) -> Dict[str, Any]:
 
 def build_body(prepared: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Builds the Anthropic Messages API request from a prepared chat request
-    (see server.prepare_chat_request for the dict shape).
+    Builds the Anthropic Messages API request from a prepared chat request.
+    See server.prepare_chat_request for the dict shape.
     """
     provider           = cfg.providers[cfg.backend]
     formatted_system   = format_system(prepared["system_segments"], prepared["system_summary_text"])
@@ -477,9 +481,9 @@ def build_body(prepared: Dict[str, Any]) -> Dict[str, Any]:
         kwargs["system"] = formatted_system
     kwargs["messages"] = formatted_messages
 
-    # The SDK rejects unknown keyword arguments, so <NAME>_EXTRA_BODY cannot simply be
-    # merged into the body the way the OpenAI-style backends do it. It is still merged
-    # last upstream, so it can override anything the proxy sends.
+    # The SDK rejects unknown keyword arguments.
+    # So <NAME>_EXTRA_BODY cannot be merged into the body the way the OpenAI-style backends do.
+    # It is still merged last upstream, so it can override anything the proxy sends.
     if provider["extra_body"]:
         kwargs["extra_body"] = provider["extra_body"]
 
