@@ -1,12 +1,11 @@
 """
-The /chat/completions backend: the OpenAI-style endpoint every compatible provider
-implements. GLM, Kimi and Aion are served from here.
+The /chat/completions backend: the OpenAI-style endpoint every compatible provider implements.
+GLM, Kimi, MiMo and Aion are served from here.
 
-OpenAI's own models are better served over /responses (see v1_responses), the only
-endpoint that returns their reasoning text, so nothing here carries OpenAI model
-knowledge beyond the name of the token-limit field. Declaring an OpenAI-compatible
-gateway here works regardless -- you lose the reasoning, and <NAME>_EXTRA_BODY and
-<NAME>_MAX_TOKENS_PARAM are the escape hatches for whatever else it wants.
+OpenAI's own models are better served over /responses (see v1_responses), which returns reasoning.
+So nothing here carries OpenAI model knowledge beyond the name of the token-limit field.
+An OpenAI-compatible gateway declared here still works -- you just lose the reasoning.
+<NAME>_EXTRA_BODY and <NAME>_MAX_TOKENS_PARAM are the escape hatches for whatever else it wants.
 """
 
 import httpx
@@ -38,31 +37,27 @@ from providers import (
 
 
 # Provider thinking dialects.
-# Each dialect maps the shared proxy thinking settings (on/off + effort) onto one
-# provider's request parameters. A dialect returns None for model ids it does not
-# recognize; models with no dialect fall back to the provider's EXTRA_BODY.
+# Each maps the shared proxy thinking settings (on/off + effort) onto one provider's parameters.
+# A dialect returns None for model ids it does not recognize.
+# Models with no dialect fall back to the provider's EXTRA_BODY.
 AION_MODEL_ID_RE = re.compile(r"^(?:aion-labs/)?aion-(\d+(?:\.\d+)?)")
 
-# Aion accepts only low|medium|high for reasoning_effort; fold the five shared
-# proxy efforts onto that scale (xhigh and max round down to high).
+# Aion accepts only low|medium|high for reasoning_effort.
+# Fold the five shared proxy efforts onto that scale (xhigh and max round down to high).
 AION_EFFORT_MAP = {"low": "low", "medium": "medium", "high": "high", "xhigh": "high", "max": "high"}
 
 def aion_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[Dict[str, Any]]:
     """
     Maps the shared thinking settings onto the Aion (AionLabs) request dialect.
-    Returns None when model_id is not a numbered aion model (aion-rp-* does not
-    reason at all; EXTRA_BODY is the escape hatch there).
+    Returns None when model_id is not a numbered aion model; aion-rp-* does not reason at all.
 
-    Aion's only thinking parameter is reasoning_effort (none|low|medium|high,
-    default medium), and aion-2.0 is the sole model that takes it. Every other
-    model rejects the parameter outright with HTTP 400 and reasons
-    unconditionally, so they get an empty dialect: recognized, nothing to send.
-    Effort was dropped after 2.0 rather than added, hence the exact version test
-    -- guessing wrong here is a failed request, not a silently ignored field.
+    Aion's only thinking parameter is reasoning_effort (none|low|medium|high, default medium).
+    aion-2.0 is the sole model that takes it; the rest reject it with HTTP 400 and always reason.
+    Those get an empty dialect: recognized, nothing to send.
+    Effort was dropped after 2.0 rather than added, hence the exact version test.
 
-    Aion also has reasoning_split (default true on reasoning models), which
-    already puts the thoughts in the separate 'reasoning' field this proxy
-    reads, so it is left at its default.
+    reasoning_split defaults to true, putting the thoughts in the separate 'reasoning' field.
+    That is the field this proxy reads, so it is left alone.
     """
     match = AION_MODEL_ID_RE.match(model_id)
     if match is None:
@@ -78,11 +73,11 @@ GLM_MODEL_ID_RE = re.compile(r"^glm-(\d+(?:\.\d+)?)")
 
 def glm_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[Dict[str, Any]]:
     """
-    Maps the shared thinking settings onto the GLM request dialect. Returns None
-    when model_id is not a GLM model (no passthrough; EXTRA_BODY is the escape
-    hatch there). GLM models think by default, so 'thinking' is always sent
-    explicitly. reasoning_effort exists from glm-5.2 on (assumed to stay for
-    later models); older GLM models only get the on/off switch.
+    Maps the shared thinking settings onto the GLM request dialect.
+    Returns None when model_id is not a GLM model; EXTRA_BODY is the escape hatch there.
+    GLM models think by default, so 'thinking' is always sent explicitly.
+    reasoning_effort exists from glm-5.2 on, and is assumed to stay for later models.
+    Older GLM models get only the on/off switch.
     """
     match = GLM_MODEL_ID_RE.match(model_id)
     if match is None:
@@ -98,21 +93,20 @@ def glm_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: 
 
 KIMI_MODEL_ID_RE = re.compile(r"^kimi-k(\d+(?:\.\d+)?)")
 
-# kimi-k3 accepts only low|high|max for reasoning_effort; fold the five shared
-# proxy efforts onto that scale (medium rounds down, xhigh rounds up).
+# kimi-k3 accepts only low|high|max for reasoning_effort.
+# Fold the five shared proxy efforts onto that scale (medium rounds down, xhigh rounds up).
 KIMI_EFFORT_MAP = {"low": "low", "medium": "low", "high": "high", "xhigh": "max", "max": "max"}
 
 def kimi_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[Dict[str, Any]]:
     """
     Maps the shared thinking settings onto the Kimi (Moonshot) request dialect.
-    Returns None when model_id is not a kimi-k* model (kimi-latest/moonshot-v1
-    have no thinking dialect; EXTRA_BODY is the escape hatch there).
+    Returns None when model_id is not a kimi-k* model; kimi-latest/moonshot-v1 have no dialect.
     Control is model-dependent:
         kimi-k3+        thinking always on; depth via reasoning_effort (low|high|max, default max)
         kimi-k2.7-*     thinking always on; thinking.type "enabled" is mandatory
         kimi-k2.5/k2.6  thinking on by default; only an on/off switch, no effort control
-    A disable request on an always-on model sends the closest thing the API
-    offers: minimal reasoning_effort on k3+, plain enabled on k2.7.
+    A disable request on an always-on model sends the closest thing the API offers.
+    That is a minimal reasoning_effort on k3+, plain enabled on k2.7.
     """
     match = KIMI_MODEL_ID_RE.match(model_id)
     if match is None:
@@ -127,15 +121,33 @@ def kimi_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort:
     return {"thinking": {"type": "disabled"}}
 
 
-THINKING_DIALECTS = (aion_thinking_params, glm_thinking_params, kimi_thinking_params)
+MIMO_MODEL_ID_RE = re.compile(r"^mimo-v(?!.*(?:asr|tts))")
+
+def mimo_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[Dict[str, Any]]:
+    """
+    Maps the shared thinking settings onto the MiMo (Xiaomi) request dialect.
+    Returns None for anything but a mimo chat model; asr and tts live on their own endpoints.
+
+    The only knob is the thinking block (enabled|disabled), on by default, so it is sent explicitly.
+    There is no depth control -- reasoning_effort and thinking_budget are both rejected.
+
+    Thinking also pins temperature to 1.0 and top_p to 0.95, overriding them rather than refusing.
+    SEND_TEMPERATURE and SEND_TOP_P are left alone; they just have no effect while it is on.
+    """
+    if MIMO_MODEL_ID_RE.match(model_id) is None:
+        return None
+    return {"thinking": {"type": "enabled" if thinking_enabled else "disabled"}}
+
+
+THINKING_DIALECTS = (aion_thinking_params, glm_thinking_params, kimi_thinking_params, mimo_thinking_params)
 
 
 def provider_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[Dict[str, Any]]:
     """
-    Provider-dialect thinking passthrough. Returns the params of the first dialect
-    that recognizes model_id, or None when no dialect matches (no passthrough;
-    EXTRA_BODY is the escape hatch). An empty dict means the model is recognized
-    but offers no thinking controls at all.
+    Provider-dialect thinking passthrough.
+    Returns the params of the first dialect that recognizes model_id, or None when none matches.
+    None means no passthrough, and EXTRA_BODY is the escape hatch.
+    An empty dict means the model is recognized but offers no thinking controls at all.
     """
     for dialect in THINKING_DIALECTS:
         params = dialect(model_id, thinking_enabled, thinking_effort)
@@ -146,10 +158,9 @@ def provider_thinking_params(model_id: str, thinking_enabled: bool, thinking_eff
 
 def thinking_can_be_disabled(model_id: str) -> bool:
     """
-    Whether the model's dialect can actually stop it from reasoning. Each dialect
-    spells "off" in its own way: a disabled thinking block (GLM), or an off effort
-    level (Aion). Models that keep reasoning regardless (kimi-k3) get the weakest
-    setting the API offers instead of a real off switch.
+    Whether the model's dialect can actually stop it from reasoning.
+    Each spells "off" differently: a disabled thinking block (GLM, MiMo) or an off effort (Aion).
+    Models that keep reasoning regardless (kimi-k3) get the weakest setting the API offers.
     """
     off = provider_thinking_params(model_id, False, cfg.thinking_effort) or {}
     return deep_get(off, "thinking.type") == "disabled" or off.get("reasoning_effort") in OFF_EFFORTS
@@ -158,8 +169,7 @@ def thinking_can_be_disabled(model_id: str) -> bool:
 def resolve_thinking() -> None:
     """
     Reports how the shared thinking settings map onto the selected model's dialect.
-    Unlike the Anthropic backend there is no capability metadata to check and none
-    of its parameter constraints apply, so nothing is adjusted here.
+    Unlike the Anthropic backend there is no capability metadata to check, so nothing is adjusted.
     """
     params = provider_thinking_params(cfg.model, cfg.thinking_enabled, cfg.thinking_effort)
     if params is None:
@@ -182,16 +192,15 @@ def resolve_thinking() -> None:
 def after_model_switch() -> None:
     """
     Post-switch hook for this backend (v1_messages and v1_responses have their own).
-    There is nothing to validate against the model here, so this only reports how the
-    thinking settings land on it.
+    There is nothing to validate against the model here, so this only reports how it lands.
     """
     resolve_thinking()
 
 
 def print_think_status() -> None:
     """
-    CLI 'think' status for this endpoint
-    (v1_messages.print_think_status and v1_responses.print_think_status are the counterparts).
+    CLI 'think' status for this endpoint.
+    v1_messages.print_think_status and v1_responses.print_think_status are the counterparts.
     """
     probe = provider_thinking_params(cfg.model, True, cfg.thinking_effort)
     if probe is None:
@@ -217,11 +226,10 @@ def print_think_status() -> None:
 
 def max_tokens_param_name(provider: Dict[str, Any], model_id: str) -> str:
     """
-    The request field carrying the output token limit. Providers on this endpoint
-    expect max_tokens. The exception is an OpenAI-compatible gateway serving OpenAI's
-    own catalogue: gpt-5+ and the o-series reject max_tokens and demand
-    max_completion_tokens. That is not a supported configuration, but guessing right
-    costs one regex and guessing wrong is an HTTP 400 with nothing to explain it.
+    The request field carrying the output token limit.
+    Providers on this endpoint expect max_tokens.
+    The exception is OpenAI's own catalogue: gpt-5+ and the o-series want max_completion_tokens.
+    That is not a supported setup, but guessing wrong is an HTTP 400 with nothing to explain it.
     """
     configured = provider.get("max_tokens_param", "auto")
     if configured != "auto":
@@ -231,9 +239,8 @@ def max_tokens_param_name(provider: Dict[str, Any], model_id: str) -> str:
 
 def apply_sampling(body: Dict[str, Any]) -> None:
     """
-    Adds temperature/top_p in place. Every provider on this endpoint accepts them;
-    the models that refuse sampling outright are OpenAI's reasoning models, which
-    are served by v1_responses.
+    Adds temperature/top_p in place.
+    Every provider here accepts them; the models that refuse sampling are served by v1_responses.
     """
     if cfg.send_temperature : body["temperature"] = cfg.temperature
     if cfg.send_top_p       : body["top_p"      ] = cfg.top_p
@@ -252,16 +259,16 @@ def build_body(prepared: Dict[str, Any]) -> Dict[str, Any]:
         "model"    : cfg.model,
         "messages" : messages,
 
-        # See max_tokens_param_name(). On the models that want the new name, the
-        # budget also covers the invisible reasoning tokens, so a small limit can be
-        # spent entirely on thinking (see warn_truncated_by_reasoning).
+        # See max_tokens_param_name().
+        # On the models that want the new name the budget also covers invisible reasoning tokens.
+        # A small limit can then be spent entirely on thinking (see warn_truncated_by_reasoning).
         max_tokens_param_name(provider, cfg.model): prepared["max_tokens"],
     }
 
     apply_sampling(body)
 
-    # Aion, GLM and Kimi models get the shared thinking settings in their provider
-    # dialect. EXTRA_BODY is merged afterwards, so an explicit override still wins.
+    # Aion, GLM, Kimi and MiMo models get the shared thinking settings in their provider dialect.
+    # EXTRA_BODY is merged afterwards, so an explicit override still wins.
     thinking_params = provider_thinking_params(cfg.model, cfg.thinking_enabled, cfg.thinking_effort)
     if thinking_params is not None:
         body.update(thinking_params)
@@ -287,8 +294,7 @@ def parse_usage(usage: Any) -> Dict[str, Any]:
     completion_details = completion_details if isinstance(completion_details, dict) else {}
 
     cached_tokens = max(0, int(prompt_details.get("cached_tokens", 0) or 0))
-    # Providers that charge a premium for cache writes report them; those without a
-    # write fee simply never send this field.
+    # Providers that charge a premium for cache writes report them; the rest never send it.
     write_tokens = max(0, int(prompt_details.get("cache_write_tokens", 0) or 0))
     # Clamp both so an unexpected payload can never make uncached input go negative.
     cached_tokens = min(cached_tokens, prompt_tokens)
@@ -299,8 +305,8 @@ def parse_usage(usage: Any) -> Dict[str, Any]:
         "completion" : completion_tokens,
         "total"      : max(0, int(usage.get("total_tokens", prompt_tokens + completion_tokens) or 0)),
         "cached"     : cached_tokens,
-        # One cache rate and no TTL choice here, so every write is a 5m write
-        # (providers.apply_model prices both buckets identically).
+        # One cache rate and no TTL choice here, so every write is a 5m write.
+        # providers.apply_model prices both buckets identically.
         "write_1h"   : 0,
         "write_5m"   : write_tokens,
         "uncached"   : prompt_tokens - cached_tokens - write_tokens,
@@ -338,7 +344,7 @@ def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
     finish_reason = str(choices[0].get("finish_reason") or "stop")
 
     output_text    = str(message.get("content") or "")
-    # DeepSeek-style APIs (GLM, ...) use reasoning_content; OpenRouter-style ones (Aion, ...) use reasoning.
+    # DeepSeek-style APIs (GLM) use reasoning_content; OpenRouter-style ones (Aion) use reasoning.
     reasoning_text = str(message.get("reasoning_content") or message.get("reasoning") or "")
 
     warn_truncated_by_reasoning(finish_reason, output_text, counts)
@@ -357,11 +363,11 @@ def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
 
 def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
     """
-    Runs one streaming /chat/completions request, yielding the same backend-neutral
-    events as v1_messages.generate_stream. Provider SSE chunks are relayed nearly verbatim.
+    Runs one streaming /chat/completions request, yielding the same events as v1_messages does.
+    Provider SSE chunks are relayed nearly verbatim.
 
-    Note: not every provider sends usage in the stream. Providers that support the
-    option can enable it via EXTRA_BODY, e.g. {"stream_options": {"include_usage": true}}.
+    Note: not every provider sends usage in the stream.
+    EXTRA_BODY can enable it where supported: {"stream_options": {"include_usage": true}}.
     Without usage the request is tracked as zero cost.
     """
     provider = cfg.providers[cfg.backend]
@@ -407,8 +413,7 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
                     continue
                 choice = choices[0]
 
-                # Kimi sends the final-chunk usage inside the choice instead of at the
-                # top level of the chunk (where stream_options puts it).
+                # Kimi sends the final-chunk usage inside the choice, not at the chunk top level.
                 if isinstance(choice.get("usage"), dict):
                     usage = choice["usage"]
 
