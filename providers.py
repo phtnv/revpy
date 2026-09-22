@@ -170,6 +170,11 @@ def fetch_provider_models(name: str, provider: Dict[str, Any], timeout_s: float)
             model_id = str(entry["id"])
             if models_regex is not None and not models_regex.search(model_id):
                 continue
+            # DeepInfra tags every record; one not tagged 'chat' is an image, speech or embedding model.
+            metadata = entry.get("metadata")
+            tags     = metadata.get("tags") if isinstance(metadata, dict) else None
+            if isinstance(tags, list) and "chat" not in tags:
+                continue
             got.append({**entry, "id": model_id, "provider": name})
     return got
 
@@ -293,20 +298,36 @@ def print_model_info(index: int) -> None:
 
 def model_record_prices(entry: Dict[str, Any]) -> Dict[str, float]:
     """
-    Prices from the model record, in OpenRouter's shape: 'pricing' holding USD per token, as strings.
-    Atlas Cloud publishes these, and its billing matches them exactly.
+    Prices from the model record, in USD per million tokens. Two shapes are read:
+        OpenRouter's (Atlas Cloud)  'pricing': prompt, completion, input_cache_read; USD per token
+        DeepInfra's                 'metadata.pricing': input_tokens, output_tokens,
+                                    cache_read_tokens; USD per million, before 'metadata.discount'
+    Both providers bill exactly these, measured against their own reported costs.
     Returns {} when the record has none, so the provider-level prices apply.
     A configured cost family still wins over these; see apply_model().
     """
-    pricing = entry.get("pricing")
-    if not isinstance(pricing, dict):
-        return {}
+    metadata = entry.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
     try:
-        input_  = float(pricing["prompt"])*1_000_000
-        output  = float(pricing["completion"])*1_000_000
+        if isinstance(entry.get("pricing"), dict):
+            pricing = entry["pricing"]
+            scale   = 1_000_000.0
+            keys    = ("prompt", "completion", "input_cache_read", "input_cache_write")
+        elif isinstance(metadata.get("pricing"), dict):
+            pricing = metadata["pricing"]
+            # The discount applies to every rate, cache reads included.
+            scale   = 1.0 - float(metadata.get("discount") or 0.0)
+            keys    = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+        else:
+            return {}
+
+        input_key, output_key, read_key, write_key = keys
+        input_  = float(pricing[input_key])*scale
+        output  = float(pricing[output_key])*scale
         # Without a cache price, cached tokens bill as input; without a write price, so do writes.
-        read    = float(pricing.get("input_cache_read") or pricing["prompt"])*1_000_000
-        write   = float(pricing.get("input_cache_write") or pricing["prompt"])*1_000_000
+        read    = float(pricing.get(read_key) or pricing[input_key])*scale
+        write   = float(pricing.get(write_key) or pricing[input_key])*scale
     except (KeyError, TypeError, ValueError):
         return {}
 

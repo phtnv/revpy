@@ -288,7 +288,7 @@ The same `t 0` / `t 1` / `t effort <level>` commands drive the OpenAI-style prov
 
 An effort above what a model offers folds down to its highest, so `max` becomes `xhigh` almost everywhere. When a model cannot be told to stop reasoning, `t 0` sends the weakest level it does offer instead, and the CLI says so.
 
-Atlas Cloud has a dialect of its own; see [Atlas Cloud](#atlas-cloud). Models with no dialect (DeepSeek, ...) ignore the CLI thinking settings entirely; use `<NAME>_EXTRA_BODY` for those. `EXTRA_BODY` is merged after the dialect, so it also overrides it if you want to force a specific parameter.
+Atlas Cloud (`zai-org/glm-5.3`) and DeepInfra (`zai-org/GLM-5.3`) serve these vendors' models under their own rules, so each has a dialect of its own, recognized by its model ids and measured per model: `reasoning_effort`, with `none` to stop where the model allows it. Both publish their prices in their model lists, and DeepInfra reports each request's cost, so neither needs prices configured. Models with no dialect (DeepSeek, ...) ignore the CLI thinking settings entirely; use `<NAME>_EXTRA_BODY` for those. `EXTRA_BODY` is merged after the dialect, so it also overrides it if you want to force a specific parameter.
 
 Thinking preservation is an Anthropic-protocol feature. On these backends the thoughts are simply wrapped in a `<think>` block for Janitor, and are not sent back.
 

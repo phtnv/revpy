@@ -998,6 +998,48 @@ def test_model_record_prices() -> bool:
                                prices({"id": "xiaomi/mimo-v2.5-pro", "provider": "atlas", "pricing": ATLAS_PRICING}))
     passed &= check_case_equal("no record", {"family": "atlas", "input": 1.0, "output": 2.0, "read": 0.0, "write": 0.0},
                                prices({"id": "other/model", "provider": "atlas"}))
+    # DeepInfra: USD per million, before a discount that applies to the cache rate too.
+    deepinfra = {"id": "XiaomiMiMo/MiMo-V2.5-Pro", "provider": "atlas",
+                 "metadata": {"pricing": {"input_tokens": 1.0, "output_tokens": 3.0, "cache_read_tokens": 0.2}, "discount": 0.61}}
+    passed &= check_case_equal("deepinfra", {"family": "atlas:model", "input": 0.39, "output": 1.17, "read": 0.078, "write": 0.39},
+                               prices(deepinfra))
+
+    # DeepInfra reports its cost as estimated_cost, and it is the tracked total.
+    counts = chat_api.parse_usage({"prompt_tokens": 266, "completion_tokens": 9, "estimated_cost": 4.4382e-05,
+                                   "prompt_tokens_details": {"cached_tokens": 224}})
+    passed &= check_case_equal("estimated_cost", {"cost": 4.4382e-05}, {"cost": counts["reported_cost"]})
+
+    # A zero beside reasoning text is unreported, not zero.
+    zero = {"reasoning": 0}
+    chat_api.distrust_zero_reasoning(zero, "I think...")
+    none = {"reasoning": 0}
+    chat_api.distrust_zero_reasoning(none, "")
+    passed &= check_case_equal("zero reasoning", {"with text": None, "without": 0}, {"with text": zero["reasoning"], "without": none["reasoning"]})
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_chat_model_tags() -> bool:
+    """A record tagged without 'chat' (DeepInfra's image, speech, embedding models) is left out."""
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing model list: records not tagged chat are dropped... ", end="")
+
+    entries = {"data": [
+        {"id": "XiaomiMiMo/MiMo-V2.5-Pro", "metadata": {"tags": ["chat", "reasoning"]}},
+        {"id": "Qwen/Qwen-Image-Edit"    , "metadata": {"tags": ["image-gen"]}},
+        {"id": "untagged/model"},
+    ]}
+    real_httpx = providers.httpx
+    providers.httpx = SimpleNamespace(get=lambda url, **kwargs: FakeResponse(entries))
+    try:
+        got = providers.fetch_provider_models("infra", make_provider(), 5.0)
+    finally:
+        providers.httpx = real_httpx
+
+    passed = check_case_equal("tags", {"ids": ["XiaomiMiMo/MiMo-V2.5-Pro", "untagged/model"]}, {"ids": [e["id"] for e in got]})
 
     if passed : print(f"{GREEN}PASS{RESET}")
     else      : print(f"{RED}FAIL{RESET}")
@@ -1044,8 +1086,9 @@ def test_model_list_filter() -> bool:
 ATLAS_THINKING_CASES = [
     ("standard, on"          , "deepseek-ai/deepseek-v4-pro", True , "medium", {"reasoning_effort": "medium"}, True),
     ("standard, off"         , "qwen/qwen3.8-max"           , False, "high"  , {"reasoning_effort": "none"}  , True),
-    ("glm-5.3 thinks high up", "zai-org/glm-5.3-flash"      , True , "low"   , {"reasoning_effort": "xhigh"} , True),
-    ("glm-5.3 stops at low"  , "zai-org/glm-5.3"            , False, "max"   , {"reasoning_effort": "low"}   , True),
+    ("glm-5.3 skips medium"  , "zai-org/glm-5.3-flash"      , True , "medium", {"reasoning_effort": "low"}   , False),
+    ("glm-5.3 cannot stop"   , "zai-org/glm-5.3"            , False, "max"   , {"reasoning_effort": "low"}   , False),
+    ("glm-5.2 behaves"       , "zai-org/glm-5.2"            , False, "high"  , {"reasoning_effort": "none"}  , True),
     ("qwen3.7-plus folds"    , "qwen/qwen3.7-plus"          , True , "max"   , {"reasoning_effort": "xhigh"} , True),
     ("kimi-k3 cannot stop"   , "moonshotai/kimi-k3"         , False, "high"  , {"reasoning_effort": "low"}   , False),
     ("mimo takes nothing"    , "xiaomi/mimo-v2.5-pro"       , True , "high"  , {}                            , False),
@@ -1053,16 +1096,27 @@ ATLAS_THINKING_CASES = [
 ]
 
 
+# DeepInfra spells the same vendors differently, and handles them differently.
+DEEPINFRA_THINKING_CASES = [
+    ("mimo, on"             , "XiaomiMiMo/MiMo-V2.5-Pro"   , True , "max"   , {"reasoning_effort": "high"}  , True),
+    ("glm-5.3 stops at none", "zai-org/GLM-5.3"            , False, "high"  , {"reasoning_effort": "none"}  , True),
+    ("kimi-k3 stops"        , "moonshotai/Kimi-K3"         , False, "high"  , {"reasoning_effort": "none"}  , True),
+    ("qwen3.8-max cannot"   , "Qwen/Qwen3.8-Max"           , False, "high"  , {"reasoning_effort": "low"}   , False),
+    ("qwen3.8-27b behaves"  , "Qwen/Qwen3.8-27B"           , True , "low"   , {"reasoning_effort": "low"}   , True),
+    ("unlisted"             , "meta-llama/Llama-3.3-70B-Instruct-Turbo", True, "high", None                  , False),
+]
+
+
 def test_atlas_thinking() -> bool:
     global tests_ttl
     tests_ttl += 1
-    print("Testing Atlas Cloud thinking dialect... ", end="")
+    print("Testing Atlas Cloud and DeepInfra thinking dialects... ", end="")
 
     cfg = make_config()
     cfg.providers = {"atlas": make_provider()}
     cfg.backend   = "atlas"
     passed        = True
-    for label, model_id, enabled, effort, expected, can_stop in ATLAS_THINKING_CASES:
+    for label, model_id, enabled, effort, expected, can_stop in ATLAS_THINKING_CASES + DEEPINFRA_THINKING_CASES:
         cfg.thinking_effort = effort
         passed &= check_case_equal(label, {"params": expected, "can stop": can_stop}, {
             "params"   : chat_api.provider_thinking_params(model_id, enabled, effort),
@@ -3539,6 +3593,7 @@ if __name__ == "__main__":
     tests_passed += test_claude_version()
     tests_passed += test_model_record_prices()
     tests_passed += test_model_list_filter()
+    tests_passed += test_chat_model_tags()
     tests_passed += test_atlas_thinking()
 
     tests_passed += test_nano_gpt_catalogue()

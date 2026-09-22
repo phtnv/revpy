@@ -143,16 +143,15 @@ def mimo_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort:
     return {"thinking": {"type": "enabled" if thinking_enabled else "disabled"}}
 
 
-# Atlas Cloud takes reasoning_effort for every model, but not the vendors' own controls.
-# Its ids carry a vendor prefix ('zai-org/glm-5.3'), which keeps them apart from the vendors' own.
-# What each level does varies by model, so this table is measured, not documented (2026-09-22).
+# Atlas Cloud and DeepInfra take reasoning_effort for every model, not the vendors' own controls.
+# What each level does varies by model, so these tables are measured, not documented (2026-09-22).
 # Each row: model id pattern, the levels that make it think (weakest first), the level that stops it.
 # "" means nothing stops it. Unlisted models get nothing; EXTRA_BODY is the escape hatch there.
+# Their ids carry a vendor prefix, which keeps them apart from the vendors' own ids and each other:
+# Atlas Cloud writes 'zai-org/glm-5.3', DeepInfra 'zai-org/GLM-5.3'.
 ATLAS_THINKING = (
-    # 'low' and 'high' both stop it; 'medium', 'none' and a disabled thinking block are refused.
-    (re.compile(r"^zai-org/glm-5\.3")       , ("xhigh", "max")                           , "low"),
-    # 'low' does not think either.
-    (re.compile(r"^zai-org/glm-5\.2")       , ("medium", "high", "xhigh", "max")         , "none"),
+    # Always think: 'none' and 'medium' are refused, every other level thinks.
+    (re.compile(r"^zai-org/glm-5\.3")       , ("low", "high", "xhigh", "max")            , ""),
     # 'low', 'medium' and 'max' are refused.
     (re.compile(r"^qwen/qwen3\.7-plus")     , ("high", "xhigh")                          , "none"),
     # Always think; minimax-m3 refuses 'none'.
@@ -161,20 +160,39 @@ ATLAS_THINKING = (
     # Always thinks, whatever it is sent.
     (re.compile(r"^xiaomi/mimo-v")          , ()                                         , ""),
     # The rest behave: 'none' stops them, any level makes them think.
-    (re.compile(r"^(?:deepseek-ai/deepseek-v4|qwen/qwen3\.8|moonshotai/kimi-k2\.6|meituan-longcat/)"),
+    (re.compile(r"^(?:deepseek-ai/deepseek-v4|qwen/qwen3\.8|zai-org/glm-5\.2|moonshotai/kimi-k2\.6|meituan-longcat/)"),
                                               THINK_EFFORT_ORDER                         , "none"),
 )
 
-def atlas_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[Dict[str, Any]]:
-    """Maps the shared thinking settings onto Atlas Cloud, per ATLAS_THINKING."""
-    for pattern, ladder, off in ATLAS_THINKING:
+# DeepInfra documents none|low|medium|high; stronger levels fold down to 'high'.
+DEEPINFRA_EFFORTS = ("low", "medium", "high")
+
+DEEPINFRA_THINKING = (
+    # Always think, whatever they are sent.
+    (re.compile(r"^(?:Qwen/Qwen3\.[78]-Max|stepfun-ai/Step-|meta-models/Muse-)"), DEEPINFRA_EFFORTS, ""),
+    # The rest behave: 'none' stops them, any level makes them think.
+    # DeepSeek and Hy3 do not think unless asked; the others do by default.
+    (re.compile(r"^(?:XiaomiMiMo/MiMo-|zai-org/GLM-5|moonshotai/Kimi-K|deepseek-ai/DeepSeek-V(?:3\.2|4)"
+                r"|Qwen/Qwen3\.(?:5|8)-|MiniMaxAI/MiniMax-M|tencent/Hy3|thinkingmachines/Inkling)"),
+                                                                                  DEEPINFRA_EFFORTS, "none"),
+)
+
+def table_thinking_params(table: Tuple[Any, ...], model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[Dict[str, Any]]:
+    """Maps the shared thinking settings onto one of the measured tables above."""
+    for pattern, ladder, off in table:
         if pattern.match(model_id):
             return effort_params(ladder, off, thinking_enabled, thinking_effort)
     return None
 
+def atlas_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[Dict[str, Any]]:
+    return table_thinking_params(ATLAS_THINKING, model_id, thinking_enabled, thinking_effort)
+
+def deepinfra_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[Dict[str, Any]]:
+    return table_thinking_params(DEEPINFRA_THINKING, model_id, thinking_enabled, thinking_effort)
+
 
 THINKING_DIALECTS = (aion_thinking_params, glm_thinking_params, kimi_thinking_params, mimo_thinking_params,
-                     atlas_thinking_params)
+                     atlas_thinking_params, deepinfra_thinking_params)
 
 
 def provider_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[Dict[str, Any]]:
@@ -343,8 +361,8 @@ def parse_usage(usage: Any) -> Dict[str, Any]:
     cached_tokens = min(cached_tokens, prompt_tokens)
     write_tokens  = min(write_tokens, prompt_tokens - cached_tokens)
 
-    # NanoGPT reports what it billed; None when a provider does not.
-    raw_cost      = usage.get("cost")
+    # NanoGPT and DeepInfra report what they billed; None when a provider does not.
+    raw_cost      = usage.get("cost", usage.get("estimated_cost"))
     reported_cost = None if raw_cost is None else max(0.0, float(raw_cost))
 
     return {
@@ -360,6 +378,16 @@ def parse_usage(usage: Any) -> Dict[str, Any]:
         "reasoning"     : reported_reasoning(completion_details),
         "reported_cost" : reported_cost,
     }
+
+
+def distrust_zero_reasoning(counts: Dict[str, Any], reasoning_text: str) -> None:
+    """
+    Some hosts report 0 reasoning tokens while returning reasoning (Kimi-K3, MiMo on some).
+    A zero beside reasoning text is not a measurement, so it is taken as unreported.
+    The usage report then shows plain output tokens rather than a split that is wrong.
+    """
+    if counts["reasoning"] == 0 and reasoning_text.strip():
+        counts["reasoning"] = None
 
 
 # Generation
@@ -393,9 +421,6 @@ def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
 
     data = response.json()
 
-    counts = parse_usage(data.get("usage"))
-    print_usage(counts)
-
     choices       = data.get("choices") or [{}]
     message       = choices[0].get("message") or {}
     finish_reason = str(choices[0].get("finish_reason") or "stop")
@@ -403,6 +428,10 @@ def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
     output_text    = str(message.get("content") or "")
     # DeepSeek-style APIs (GLM) use reasoning_content; OpenRouter-style ones (Aion) use reasoning.
     reasoning_text = str(message.get("reasoning_content") or message.get("reasoning") or "")
+
+    counts = parse_usage(data.get("usage"))
+    distrust_zero_reasoning(counts, reasoning_text)
+    print_usage(counts)
 
     warn_truncated_by_reasoning(finish_reason, output_text, counts)
 
@@ -511,6 +540,7 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
 
     counts        = parse_usage(usage)
     snapshot_text = "".join(response_parts)
+    distrust_zero_reasoning(counts, "".join(reasoning_parts))
     print_usage(counts)
     warn_truncated_by_reasoning(finish_reason, snapshot_text, counts)
 
