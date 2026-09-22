@@ -20,6 +20,7 @@ from typing            import Any, Dict, Iterator, List, Optional, Tuple
 from common import (
     cfg,
     deep_get,
+    print_error,
     print_payload,
     print_usage,
     trim_to_end_sentence,
@@ -27,6 +28,7 @@ from common import (
 )
 from providers import (
     OFF_EFFORTS,
+    ProviderError,
     build_message_list,
     error_from_response,
     is_openai_model,
@@ -328,6 +330,13 @@ def parse_usage(usage: Any) -> Dict[str, Any]:
 
 
 # Generation
+def failed(error: ProviderError) -> ProviderError:
+    """Notes a failed request against a pinned NanoGPT provider, then hands the error back."""
+    if nano_gpt.is_active():
+        nano_gpt.note_error(error)
+    return error
+
+
 def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
     """
     Runs one non-streaming /chat/completions request.
@@ -345,7 +354,9 @@ def generate_non_stream(prepared: Dict[str, Any]) -> Dict[str, Any]:
         timeout=request_timeout(),
     )
     if response.status_code != 200:
-        raise error_from_response(cfg.backend, response)
+        raise failed(error_from_response(cfg.backend, response))
+    if nano_gpt.is_active():
+        nano_gpt.note_alive()
 
     data = response.json()
 
@@ -407,7 +418,9 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
         ) as response:
             if response.status_code != 200:
                 response.read()
-                raise error_from_response(cfg.backend, response)
+                raise failed(error_from_response(cfg.backend, response))
+            if nano_gpt.is_active():
+                nano_gpt.note_alive()
 
             for line in response.iter_lines():
                 if not line.startswith("data:"):
@@ -420,6 +433,21 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
                 except Exception: continue
                 if not isinstance(chunk, dict):
                     continue
+
+                # A stream that fails midway ends with an error frame, not an HTTP status.
+                # NanoGPT sends one; without this the reply would just stop, as if finished.
+                # The text so far is kept and the error appended to it, so the reply shows both.
+                # The finish reason stays as it was; the frame's own 'error' is not an OpenAI value.
+                error_obj = chunk.get("error")
+                if isinstance(error_obj, dict):
+                    message = str(error_obj.get("message") or "no reason given")
+                    status  = int(error_obj.get("status") or 500)
+                    print_error(failed(ProviderError(status, {"error": error_obj}, f"{cfg.backend}: {message}")))
+
+                    note = f"\n\n[Stream failed: {message}]"
+                    response_parts.append(note)
+                    yield ("text", note)
+                    break
 
                 if chunk.get("usage") : usage      = chunk["usage"]
                 if chunk.get("id")    : message_id = str(chunk["id"])

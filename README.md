@@ -163,11 +163,16 @@ nano list mimo pro     Search the catalogue. Every term must match; punctuation 
 nano list              The whole catalogue.
 nano 544               Select model 544. Lists its providers, with prices, speed and caching.
 nano provider 3        Pin provider 3. 'nano provider 0' lets NanoGPT route the model.
+nano provider test     Ask every provider of the model whether it is alive (alias: nano p test).
 nano                   The selected model, provider and prices.
 nano refresh           Fetch and save the catalogue now, and the selected model's providers.
 ```
 
 A pinned provider is strict: if it is down the request fails, and you pick another. The proxy never routes around your choice. Each model remembers the provider you pinned for it until the proxy restarts.
+
+The provider table marks each provider ✅ or ❌ as last seen, from `nano provider test` or from your own requests to a pinned provider. The marks are information only; nothing stops you from selecting a ❌ provider or sending to it. Only an unavailable provider is marked ❌ (error codes `provider_unavailable`, `service_unavailable`, also when a stream fails midway, and `no_fallback_available`). Filtering, context-length or rate-limit errors leave the mark alone. A stream that fails midway keeps the text it got so far and ends with a `[Stream failed: …]` note, so the reply shows both; this holds for every `/chat/completions` provider. With Auto nothing is marked, since NanoGPT does not say which provider served the request.
+
+The test is not free. An unavailable provider bills nothing, but a live one bills a one-token request, and the model's template pads even that to a few hundred prompt tokens — about $0.0001–0.0003 per provider for `mimo-v2.5-pro`. There is no cheaper way to prove a provider alive. The total is printed after the test and is not added to the session cost.
 
 With Auto, `c 1` asks NanoGPT for a provider that caches and to keep to it; `c 0` leaves the choice to NanoGPT. A pinned provider caches on its own if it can, whatever `c` says.
 

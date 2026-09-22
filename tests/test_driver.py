@@ -1123,6 +1123,102 @@ def test_nano_gpt_catalogue_file() -> bool:
     return passed
 
 
+NANO_UNAVAILABLE = {"error": {"message": "The requested service is temporarily unavailable.",
+                              "type": "service_unavailable", "code": "provider_unavailable"}}
+NANO_FILTERED    = {"error": {"message": "Blocked.", "type": "invalid_request_error", "code": "content_policy_violation"}}
+
+
+def test_nano_gpt_health() -> bool:
+    """Only an unavailable provider is marked dead; requests and probes both update the marks."""
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing NanoGPT provider health: probes, requests, stream errors... ", end="")
+
+    cfg    = make_nano_config()
+    passed = True
+    nano_gpt.HEALTH = {}
+    health = lambda route: nano_gpt.HEALTH.get((NANO_MIMO, route))
+
+    # Requests: nothing is noted under Auto, and a filtered request says nothing about the provider.
+    nano_gpt.note_alive()
+    auto_noted = dict(nano_gpt.HEALTH)
+    nano_gpt.ROUTES[NANO_MIMO] = "deepinfra"
+    nano_gpt.note_error(providers.ProviderError(400, NANO_FILTERED, "filtered"))
+    filtered = health("deepinfra")
+    nano_gpt.note_error(providers.ProviderError(503, NANO_UNAVAILABLE, "down"))
+    down = health("deepinfra")
+    nano_gpt.note_alive()
+    up = health("deepinfra")
+    passed &= check_case_equal("requests", {"auto": {}, "filtered": None, "down": False, "up": True},
+                               {"auto": auto_noted, "filtered": filtered, "down": down, "up": up})
+
+    # Probes: one short request per provider, each hard-pinned.
+    listing = {**NANO_LISTING, "providers": NANO_LISTING["providers"] + [{"provider": "busy", "pricing": {}}]}
+    nano_gpt.LISTINGS = {NANO_MIMO: listing}
+    nano_gpt.HEALTH   = {(NANO_MIMO, "busy"): True}
+    answers = {
+        "gmicloud"  : (503, NANO_UNAVAILABLE),
+        "deepinfra" : (200, {"choices": [{"message": {"content": "H"}}], "usage": {"cost": 0.0001}}),
+        "busy"      : (429, {"error": {"message": "Slow down.", "type": "rate_limit_error", "code": "rate_limit_exceeded"}}),
+    }
+    bodies: dict[str, Any] = {}
+
+    def post(url: str, json: dict[str, Any], **kwargs: Any) -> Any:
+        route = json["provider"]["only"][0]
+        bodies[route] = json
+        status, payload = answers[route]
+        response = FakeResponse(payload)
+        response.status_code = status
+        return response
+
+    real_httpx = nano_gpt.httpx
+    nano_gpt.httpx = SimpleNamespace(post=post, TimeoutException=httpx.TimeoutException)
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            nano_gpt.test_providers()
+    finally:
+        nano_gpt.httpx = real_httpx
+
+    passed &= check_case_equal("probe body", {
+        "model": NANO_MIMO, "messages": [{"role": "user", "content": "."}], "max_tokens": 1,
+        "provider": {"only": ["deepinfra"], "allow_fallbacks": False}, "reasoning_effort": "none",
+    }, bodies.get("deepinfra") or {})
+    # A rate limit leaves the last known status alone.
+    passed &= check_case_equal("probes", {"gmicloud": False, "deepinfra": True, "busy": True, "billed": True},
+                               {"gmicloud": health("gmicloud"), "deepinfra": health("deepinfra"), "busy": health("busy"),
+                                "billed": "$0.000100" in out.getvalue()})
+
+    # A stream that fails midway keeps its text, appends the error, and marks its provider.
+    nano_gpt.ROUTES[NANO_MIMO] = "deepinfra"
+    nano_gpt.HEALTH = {}
+    lines = sse({"choices": [{"delta": {"content": "Hel"}}]},
+                {"choices": [{"delta": {}, "finish_reason": "error"}],
+                 "error": {"status": 503, "message": "Service temporarily unavailable.", "code": "service_unavailable"}})
+    prepared = {"messages": [{"role": "user", "content": "Hello."}], "system_segments": [],
+                "system_summary_text": "", "lorebook_at_end_text": "", "max_tokens": 256}
+    real_httpx = chat_api.httpx
+    chat_api.httpx = fake_httpx([lines], [], [])
+    cfg.require_proxy_key = False
+    streamed = ""
+    final: dict[str, Any] = {}
+    try:
+        with server.app.test_request_context(), contextlib.redirect_stdout(io.StringIO()):
+            for kind, data in chat_api.generate_stream(prepared):
+                if kind == "text"  : streamed += data
+                if kind == "final" : final = data
+    finally:
+        chat_api.httpx = real_httpx
+    text = "Hel\n\n[Stream failed: Service temporarily unavailable.]"
+    passed &= check_case_equal("stream error", {"streamed": text, "snapshot": text, "stop": "stop", "deepinfra": False},
+                               {"streamed": streamed, "snapshot": final.get("snapshot_text"),
+                                "stop": final.get("stop_reason"), "deepinfra": health("deepinfra")})
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
 def test_nano_gpt_request() -> bool:
     """Thinking goes out as reasoning_effort; routing is a hard pin, or cache-aware auto."""
     global tests_ttl
@@ -3298,6 +3394,7 @@ if __name__ == "__main__":
     tests_passed += test_nano_gpt_request()
     tests_passed += test_nano_gpt_selection()
     tests_passed += test_nano_gpt_reported_cost()
+    tests_passed += test_nano_gpt_health()
     make_config()
 
     tests_passed += test_image_extraction()

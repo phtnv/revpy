@@ -18,16 +18,19 @@ import re
 import threading
 import time
 
-from typing       import Any, Dict, List, Optional
-from urllib.parse import quote
+from concurrent.futures import ThreadPoolExecutor
+from typing             import Any, Dict, List, Optional, Tuple
+from urllib.parse       import quote
 
 from common import (
     THINK_EFFORT_ORDER,
     cfg,
     extract_claude_version,
+    fmt_usd,
 )
 from providers import (
     OFF_EFFORTS,
+    ProviderError,
     auth_headers,
     error_from_response,
     fold_effort,
@@ -47,6 +50,24 @@ LISTINGS  : Dict[str, Dict[str, Any]] = {}
 # Kept per model, so returning to a model returns to its provider.
 ROUTES    : Dict[str, str] = {}
 LOCK = threading.Lock()
+
+# Whether each provider was last seen alive, per (model id, provider). Absent is unknown.
+# Information only: nothing is ever blocked or rerouted on it.
+HEALTH : Dict[Tuple[str, str], bool] = {}
+
+# Error codes meaning the pinned provider could not serve the request.
+# Every other error (filtering, context length, rate limits) says nothing about the provider.
+DEAD_CODES = {
+    # 503, typed service_unavailable or provider_error.
+    "provider_unavailable",
+    # The error frame NanoGPT sends when a stream fails midway.
+    "service_unavailable",
+    # No allowed provider was available.
+    "no_fallback_available",
+}
+
+# A live provider can take a while to answer even a one-token request (xiaomi, ~15s).
+PROBE_TIMEOUT_SECONDS = 60.0
 
 THINKING_SUFFIX = ":thinking"
 # Providers named per row of 'nano list'; the rest are elided.
@@ -453,13 +474,13 @@ def print_providers() -> None:
     rows  = listing_rows(cfg.model)
     route = ROUTES.get(cfg.model, "")
 
-    print(f"Provider: {route or 'Auto'}. Prices per million tokens.")
-    print(f"       {'provider':<14}  {'input':>9}  {'output':>9}  {'cache rd':>9}  {'quant':<8}  {'t/s':>5}  {'ttft':>6}  {'cache':<5}  {'privacy':<12}  region")
+    print(f"Provider: {route or 'Auto'}. Prices per million tokens. ✅/❌ as last seen.")
+    print(f"          {'provider':<14}  {'input':>9}  {'output':>9}  {'cache rd':>9}  {'quant':<8}  {'t/s':>5}  {'ttft':>6}  {'cache':<5}  {'privacy':<12}  region")
 
     number_width = len(str(len(rows)))
     number       = "0".rjust(number_width)
     number_cell  = f"[{number}]" if not route else f" {number} "
-    print(f"  {number_cell}  {'Auto':<14}  {price_cells(route_price(cfg.model, ''))}")
+    print(f"  {number_cell}     {'Auto':<14}  {price_cells(route_price(cfg.model, ''))}")
 
     for index, row in enumerate(rows, start=1):
         number      = str(index).rjust(number_width)
@@ -470,10 +491,11 @@ def print_providers() -> None:
         caching     = "yes" if row.get("supportsPromptCaching") else "no"
         privacy     = str((row.get("privacy") or {}).get("classification") or "-")
         region      = str((row.get("region") or {}).get("code") or "-")
-        available   = "" if row.get("available", True) else "  unavailable"
+        available   = "" if row.get("available", True) else "  listed unavailable"
+        mark        = health_mark(cfg.model, row["provider"])
 
         prices = price_cells(row.get("pricing") or {})
-        print(f"  {number_cell}  {row['provider']:<14}  {prices}  {quant:<8}  {tps:>5}  {ttft:>6}  {caching:<5}  {privacy:<12}  {region}{available}")
+        print(f"  {number_cell}  {mark} {row['provider']:<14}  {prices}  {quant:<8}  {tps:>5}  {ttft:>6}  {caching:<5}  {privacy:<12}  {region}{available}")
 
     if not rows:
         print("  NanoGPT offers no provider selection for this model; it is always routed automatically.")
@@ -490,7 +512,12 @@ def select_provider(index: int) -> None:
 
     rows = listing_rows(cfg.model)
     if index < 0 or index > len(rows):
-        print(f"Provider number out of range [0:{len(rows)}].")
+        print(f"Provider number out of range [0:{len(rows)}] for {cfg.model}.")
+        # 'nano p 544' is an easy slip for 'nano 544'.
+        with LOCK:
+            model_count = len(CATALOGUE)
+        if index <= model_count:
+            print(f"To select model {index}, use 'nano {index}'.")
         return
 
     route = rows[index - 1]["provider"] if index else ""
@@ -500,6 +527,106 @@ def select_provider(index: int) -> None:
     ROUTES[cfg.model] = route
     apply_prices(cfg.model, route)
     print(f"Selected provider {route or 'Auto'} for {cfg.model}.")
+
+
+# Health
+def health_mark(model_id: str, route: str) -> str:
+    """Two columns wide either way, so the table stays aligned."""
+    alive = HEALTH.get((model_id, route))
+    if alive is None:
+        return "  "
+    return "✅" if alive else "❌"
+
+
+def error_code(error: ProviderError) -> str:
+    error_obj = error.body.get("error")
+    return str(error_obj.get("code") or "") if isinstance(error_obj, dict) else ""
+
+
+def note_alive() -> None:
+    """
+    A request to the pinned provider succeeded.
+    With Auto nothing is noted; NanoGPT does not say which provider served it.
+    """
+    route = ROUTES.get(cfg.model, "")
+    if route:
+        HEALTH[(cfg.model, route)] = True
+
+
+def note_error(error: ProviderError) -> None:
+    """A request to the pinned provider failed. Only an unavailable provider is marked dead."""
+    route = ROUTES.get(cfg.model, "")
+    if route and error_code(error) in DEAD_CODES:
+        HEALTH[(cfg.model, route)] = False
+
+
+def probe_provider(route: str) -> Tuple[str, float]:
+    """
+    Sends one request to one provider of the selected model.
+    Returns what happened, and what NanoGPT billed for it.
+
+    A live provider always bills the prompt, which the model's template pads to ~255 tokens.
+    One output token at the weakest thinking is the rest; some providers ignore the limit.
+    Nothing cheaper proves a provider alive, and an unavailable one bills nothing.
+    """
+    name     = provider_name()
+    provider = cfg.providers[name]
+    body: Dict[str, Any] = {
+        "model"      : cfg.model,
+        "messages"   : [{"role": "user", "content": "."}],
+        "max_tokens" : 1,
+        "provider"   : {"only": [route], "allow_fallbacks": False},
+    }
+    body.update(thinking_params(cfg.model, False, cfg.thinking_effort) or {})
+
+    started = time.time()
+    try:
+        response = httpx.post(
+            f"{provider['base_url']}/chat/completions",
+            json=body,
+            headers=request_headers_for(provider),
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+    except httpx.TimeoutException:
+        return f"no answer in {PROBE_TIMEOUT_SECONDS:.0f}s, status unchanged", 0.0
+    except Exception as exc:
+        return f"{exc}, status unchanged", 0.0
+    elapsed = time.time() - started
+
+    if response.status_code == 200:
+        HEALTH[(cfg.model, route)] = True
+        usage = response.json().get("usage") or {}
+        return f"alive, {elapsed:.1f}s", float(usage.get("cost") or 0.0)
+
+    error = error_from_response(name, response)
+    code  = error_code(error)
+    if code in DEAD_CODES:
+        HEALTH[(cfg.model, route)] = False
+        return f"unavailable ({code})", 0.0
+    return f"HTTP {response.status_code} {code or str(error)}, status unchanged", 0.0
+
+
+def test_providers() -> None:
+    """
+    Probes every provider of the selected model at once, then shows the table with the results.
+    Each live provider bills its request; the total is printed but not added to the session.
+    """
+    if not is_active():
+        print_nothing_selected()
+        return
+    routes = [row["provider"] for row in listing_rows(cfg.model)]
+    if not routes:
+        print("NanoGPT offers no provider selection for this model; there is nothing to test.")
+        return
+
+    print(f"Testing {len(routes)} provider(s) of {cfg.model}. Each one that answers bills a short request.")
+    with ThreadPoolExecutor(max_workers=len(routes)) as pool:
+        results = list(pool.map(probe_provider, routes))
+
+    for route, (outcome, _) in zip(routes, results):
+        print(f"  {health_mark(cfg.model, route)}  {route:<14}  {outcome}")
+    print(f"The test billed {fmt_usd(sum(cost for _, cost in results))}.")
+    print_providers()
 
 
 def refresh() -> bool:

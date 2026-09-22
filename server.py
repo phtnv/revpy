@@ -178,6 +178,8 @@ CLI_CMD_NANO_INFO = """\
     nano provider          List the providers of the selected model.
       Alias: p
     nano provider <uint>   Select a provider. 0 lets NanoGPT route the model.
+    nano provider test     Send a short request to every provider and mark it ✅ alive or ❌ unavailable.
+                           Live providers bill it. The marks are information only.
     nano refresh           Request the catalogue and the selected model's providers again.
       Alias: r
     nano help              Display this message.
@@ -567,6 +569,9 @@ def handle_nano_command(parts: List[str]) -> None:
     if arg1 in {"p", "provider", "providers"}:
         if len(parts) < 3:
             nano_gpt.print_providers()
+            return
+        if parts[2].lower() in {"t", "test"}:
+            nano_gpt.test_providers()
             return
         try: index = int(parts[2])
         except Exception: pass
