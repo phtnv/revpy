@@ -161,6 +161,8 @@ def cli_refresh_models() -> None:
 CLI_CMD_MODEL_INFO = """\
   model command. Alias: models, m.
     model              List all available models.
+    model <filter>     List only the models of the named providers, or whose id contains a term.
+                       Separate terms with '|' or spaces: 'model atlas|xiaomi|gpt'.
     model <uint>       Select a model from list.
     model info         Display information on the currently selected model.
     model info <uint>  Display information on the specified model.
@@ -748,7 +750,7 @@ def admin_cli_loop() -> None:
 
             if cmd in {"m", "model", "models"}:
                 if parts_l < 2:
-                    providers.print_model_list()
+                    providers.print_model_list([])
                     continue
 
                 arg1 = parts[1].lower()
@@ -764,20 +766,19 @@ def admin_cli_loop() -> None:
                     if arg1 in {"r", "refresh"}:
                         cli_refresh_models()
                         continue
-                    print(CLI_CMD_MODEL_INFO)
-                    continue
 
-                if parts_l < 3:
-                    print(CLI_CMD_MODEL_INFO)
-                    continue
-                arg2 = parts[2].lower()
-                if arg1 in {"i", "info"}:
-                    try: model_id = int(arg2)
+                if arg1 in {"i", "info"} and parts_l == 3:
+                    try: model_id = int(parts[2])
                     except Exception: pass
                     else:
                         providers.print_model_info(model_id)
                         continue
-                print(CLI_CMD_MODEL_INFO)
+                if arg1 in {"?", "help"}:
+                    print(CLI_CMD_MODEL_INFO)
+                    continue
+
+                # Anything else filters the list: 'm atlas', 'm atlas|xiaomi|gpt'.
+                providers.print_model_list([term for term in re.split(r"[|\s]+", line.split(maxsplit=1)[1]) if term])
                 continue
 
             if cmd in {"i", "img", "image", "images"}:

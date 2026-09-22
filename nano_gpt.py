@@ -32,8 +32,8 @@ from providers import (
     OFF_EFFORTS,
     ProviderError,
     auth_headers,
+    effort_params,
     error_from_response,
-    fold_effort,
 )
 
 
@@ -689,14 +689,7 @@ def thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: str)
     ladder  = tuple(effort for effort in THINK_EFFORT_ORDER if effort in efforts)
     off     = next((effort for effort in OFF_EFFORTS if effort in efforts), "")
 
-    if thinking_enabled and ladder:
-        return {"reasoning_effort": fold_effort(thinking_effort, ladder)}
-    if not thinking_enabled and off:
-        return {"reasoning_effort": off}
-    # Asked to stop, but the model cannot; send the weakest level it has.
-    if ladder:
-        return {"reasoning_effort": ladder[0]}
-    return {}
+    return effort_params(ladder, off, thinking_enabled, thinking_effort)
 
 
 def route_params(model_id: str) -> Dict[str, Any]:

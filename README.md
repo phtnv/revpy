@@ -140,6 +140,8 @@ At startup the proxy fetches the model list of every configured provider, in the
 
 In CLI type `m` to see the available model list (along with the currently selected model).
 
+A long list can be filtered: `m atlas` lists only the `atlas` provider's models, and `m atlas|xiaomi|gpt` lists several at once. A term naming a provider takes that provider's models; any other term is looked for in the model id. Numbers stay those of the full list, so `m <number>` works straight from a filtered one.
+
 Type `m <number>` to select a specific model from the list. The model you set in Janitor's UI has no effect. Selecting a model from another provider switches the active backend with it, including the endpoint the proxy calls and the prices it bills at.
 
 CLI model selection is runtime-only. To make a model the default after restart, edit `MODEL=` in `.env`. Write it as `provider/model-id`: that form names its own provider, so it still resolves when the provider's model list is unavailable.
@@ -168,19 +170,9 @@ nano                   The selected model, provider and prices.
 nano refresh           Fetch and save the catalogue now, and the selected model's providers.
 ```
 
-A pinned provider is strict: if it is down the request fails, and you pick another. The proxy never routes around your choice. Each model remembers the provider you pinned for it until the proxy restarts.
-
-The provider table marks each provider ✅ or ❌ as last seen, from `nano provider test` or from your own requests to a pinned provider. The marks are information only; nothing stops you from selecting a ❌ provider or sending to it. Only an unavailable provider is marked ❌ (error codes `provider_unavailable`, `service_unavailable`, also when a stream fails midway, and `no_fallback_available`). Filtering, context-length or rate-limit errors leave the mark alone. A stream that fails midway keeps the text it got so far and ends with a `[Stream failed: …]` note, so the reply shows both; this holds for every `/chat/completions` provider. With Auto nothing is marked, since NanoGPT does not say which provider served the request.
-
-The test is not free. An unavailable provider bills nothing, but a live one bills a one-token request, and the model's template pads even that to a few hundred prompt tokens — about $0.0001–0.0003 per provider for `mimo-v2.5-pro`. There is no cheaper way to prove a provider alive. The total is printed after the test and is not added to the session cost.
-
-With Auto, `c 1` asks NanoGPT for a provider that caches and to keep to it; `c 0` leaves the choice to NanoGPT. A pinned provider caches on its own if it can, whatever `c` says.
-
 Many models come twice, as `model` and `model:thinking`. Where the plain model takes every effort level its twin does, only the plain one is listed, and thinking is switched with `t` like everywhere else: it is sent as `reasoning_effort`, folded onto the levels the model lists. Models that only turn thinking on or off take any effort as on. Some providers ignore it (atlascloud always thinks on `mimo-v2.5-pro`).
 
-Prices come from NanoGPT, so none are configured. Each response also reports what NanoGPT actually billed, and that is the cost tracked. The cost computed from the fetched prices is shown only when it differs by more than 5% — a hint to `nano refresh`.
-
-To start on a NanoGPT model, `MODEL=nano/xiaomi/mimo-v2.5-pro` works too, routed automatically.
+Prices come from NanoGPT, so none are configured.
 
 ## Caching
 Everything in this section is an Anthropic-protocol feature and applies to providers declared in `V1_MESSAGES_PROVIDERS`. For everyone else see [Caching on OpenAI-style backends](#caching-on-openai-style-backends). For a detailed guide how caching works, you can read Anthropic's [official docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
@@ -296,7 +288,7 @@ The same `t 0` / `t 1` / `t effort <level>` commands drive the OpenAI-style prov
 
 An effort above what a model offers folds down to its highest, so `max` becomes `xhigh` almost everywhere. When a model cannot be told to stop reasoning, `t 0` sends the weakest level it does offer instead, and the CLI says so.
 
-Models with no dialect (DeepSeek, ...) ignore the CLI thinking settings entirely; use `<NAME>_EXTRA_BODY` for those. `EXTRA_BODY` is merged after the dialect, so it also overrides it if you want to force a specific parameter.
+Atlas Cloud has a dialect of its own; see [Atlas Cloud](#atlas-cloud). Models with no dialect (DeepSeek, ...) ignore the CLI thinking settings entirely; use `<NAME>_EXTRA_BODY` for those. `EXTRA_BODY` is merged after the dialect, so it also overrides it if you want to force a specific parameter.
 
 Thinking preservation is an Anthropic-protocol feature. On these backends the thoughts are simply wrapped in a `<think>` block for Janitor, and are not sent back.
 

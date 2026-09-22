@@ -18,8 +18,8 @@ from packaging.version import Version
 from typing            import Any, Dict, Iterator, List, Optional, Tuple
 
 from common import (
+    THINK_EFFORT_ORDER,
     cfg,
-    deep_get,
     print_error,
     print_payload,
     print_usage,
@@ -27,9 +27,9 @@ from common import (
     usage_to_openai_dict,
 )
 from providers import (
-    OFF_EFFORTS,
     ProviderError,
     build_message_list,
+    effort_params,
     error_from_response,
     is_openai_model,
     reported_reasoning,
@@ -143,7 +143,38 @@ def mimo_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort:
     return {"thinking": {"type": "enabled" if thinking_enabled else "disabled"}}
 
 
-THINKING_DIALECTS = (aion_thinking_params, glm_thinking_params, kimi_thinking_params, mimo_thinking_params)
+# Atlas Cloud takes reasoning_effort for every model, but not the vendors' own controls.
+# Its ids carry a vendor prefix ('zai-org/glm-5.3'), which keeps them apart from the vendors' own.
+# What each level does varies by model, so this table is measured, not documented (2026-09-22).
+# Each row: model id pattern, the levels that make it think (weakest first), the level that stops it.
+# "" means nothing stops it. Unlisted models get nothing; EXTRA_BODY is the escape hatch there.
+ATLAS_THINKING = (
+    # 'low' and 'high' both stop it; 'medium', 'none' and a disabled thinking block are refused.
+    (re.compile(r"^zai-org/glm-5\.3")       , ("xhigh", "max")                           , "low"),
+    # 'low' does not think either.
+    (re.compile(r"^zai-org/glm-5\.2")       , ("medium", "high", "xhigh", "max")         , "none"),
+    # 'low', 'medium' and 'max' are refused.
+    (re.compile(r"^qwen/qwen3\.7-plus")     , ("high", "xhigh")                          , "none"),
+    # Always think; minimax-m3 refuses 'none'.
+    (re.compile(r"^moonshotai/kimi-k3")     , THINK_EFFORT_ORDER                         , ""),
+    (re.compile(r"^minimaxai/minimax-m3")   , THINK_EFFORT_ORDER                         , ""),
+    # Always thinks, whatever it is sent.
+    (re.compile(r"^xiaomi/mimo-v")          , ()                                         , ""),
+    # The rest behave: 'none' stops them, any level makes them think.
+    (re.compile(r"^(?:deepseek-ai/deepseek-v4|qwen/qwen3\.8|moonshotai/kimi-k2\.6|meituan-longcat/)"),
+                                              THINK_EFFORT_ORDER                         , "none"),
+)
+
+def atlas_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[Dict[str, Any]]:
+    """Maps the shared thinking settings onto Atlas Cloud, per ATLAS_THINKING."""
+    for pattern, ladder, off in ATLAS_THINKING:
+        if pattern.match(model_id):
+            return effort_params(ladder, off, thinking_enabled, thinking_effort)
+    return None
+
+
+THINKING_DIALECTS = (aion_thinking_params, glm_thinking_params, kimi_thinking_params, mimo_thinking_params,
+                     atlas_thinking_params)
 
 
 def provider_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[Dict[str, Any]]:
@@ -166,11 +197,13 @@ def provider_thinking_params(model_id: str, thinking_enabled: bool, thinking_eff
 def thinking_can_be_disabled(model_id: str) -> bool:
     """
     Whether the model's dialect can actually stop it from reasoning.
-    Each spells "off" differently: a disabled thinking block (GLM, MiMo) or an off effort (Aion).
+    Each spells "off" differently: a disabled thinking block (GLM, MiMo), an off effort (Aion),
+    even an ordinary level (glm-5.3 on Atlas Cloud stops at 'low').
+    So it can when "off" sends something other than the weakest "on" does.
     Models that keep reasoning regardless (kimi-k3) get the weakest setting the API offers.
     """
-    off = provider_thinking_params(model_id, False, cfg.thinking_effort) or {}
-    return deep_get(off, "thinking.type") == "disabled" or off.get("reasoning_effort") in OFF_EFFORTS
+    off = provider_thinking_params(model_id, False, cfg.thinking_effort)
+    return off != provider_thinking_params(model_id, True, THINK_EFFORT_ORDER[0])
 
 
 def resolve_thinking() -> None:

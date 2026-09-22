@@ -46,6 +46,23 @@ def fold_effort(effort: str, ladder: Tuple[str, ...]) -> str:
     return ladder[0]
 
 
+def effort_params(ladder: Tuple[str, ...], off: str, thinking_enabled: bool, thinking_effort: str) -> Dict[str, Any]:
+    """
+    Thinking as a single reasoning_effort, for providers that take nothing else.
+    'ladder' holds the levels that make the model think, weakest first.
+    'off' is the level that stops it, or "" when nothing does.
+    On/off models have a one-level ladder, so any effort enables them.
+    """
+    if thinking_enabled and ladder:
+        return {"reasoning_effort": fold_effort(thinking_effort, ladder)}
+    if not thinking_enabled and off:
+        return {"reasoning_effort": off}
+    # Asked to stop, but the model cannot; send the weakest level it has.
+    if ladder:
+        return {"reasoning_effort": ladder[0]}
+    return {}
+
+
 # Effort levels that mean "do not reason", weakest first.
 # Not thinking depths, so folding skips them; they only answer a disable request.
 # OpenAI spells its floor 'minimal' on gpt-5; Aion and later OpenAI models use 'none'.
@@ -195,9 +212,12 @@ def refresh_models(timeout_s: float) -> None:
         MODELS = models
 
 
-def print_model_list() -> None:
+def print_model_list(terms: List[str]) -> None:
     """
     Prints the aggregated model list of every configured provider.
+    With terms, only the models matching any of them: a provider name takes that provider's
+    models, anything else is looked for in the model id and display name.
+    Numbers stay those of the whole list, so a filtered one can still be selected from.
     """
     with MODEL_LOCK:
         models = list(MODELS)
@@ -211,18 +231,29 @@ def print_model_list() -> None:
         print_no_models_available()
         return
 
+    names  = [term.lower() for term in terms if term.lower() in cfg.providers]
+    needle = [term.lower() for term in terms if term.lower() not in cfg.providers]
+
     number_width = len(str(len(models)))
+    shown        = 0
 
     for index, entry in enumerate(models, start=1):
+        # Anthropic's model list carries a display name; the OpenAI-style ones do not.
+        display_name = str(entry.get("display_name") or "")
+        haystack     = f"{entry['id']} {display_name}".lower()
+        if terms and entry["provider"] not in names and not any(term in haystack for term in needle):
+            continue
+        shown += 1
+
         selected    = (cfg.backend == entry["provider"]) and (cfg.model == entry["id"])
         number      = str(index).rjust(number_width)
         number_cell = f"[{number}]" if selected else f" {number} "
-
-        # Anthropic's model list carries a display name; the OpenAI-style ones do not.
-        display_name = str(entry.get("display_name") or "")
-        suffix       = f"  {display_name}" if display_name else ""
+        suffix      = f"  {display_name}" if display_name else ""
 
         print(f"{number_cell}  {entry['id']:<42}  {entry['provider']:<10}{suffix}".rstrip())
+
+    if not shown:
+        print(f"No model matches '{'|'.join(terms)}'.")
 
 
 def print_no_models_available() -> None:
@@ -260,6 +291,34 @@ def print_model_info(index: int) -> None:
     print(json.dumps(entry, indent=2, ensure_ascii=False, default=str))
 
 
+def model_record_prices(entry: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Prices from the model record, in OpenRouter's shape: 'pricing' holding USD per token, as strings.
+    Atlas Cloud publishes these, and its billing matches them exactly.
+    Returns {} when the record has none, so the provider-level prices apply.
+    A configured cost family still wins over these; see apply_model().
+    """
+    pricing = entry.get("pricing")
+    if not isinstance(pricing, dict):
+        return {}
+    try:
+        input_  = float(pricing["prompt"])*1_000_000
+        output  = float(pricing["completion"])*1_000_000
+        # Without a cache price, cached tokens bill as input; without a write price, so do writes.
+        read    = float(pricing.get("input_cache_read") or pricing["prompt"])*1_000_000
+        write   = float(pricing.get("input_cache_write") or pricing["prompt"])*1_000_000
+    except (KeyError, TypeError, ValueError):
+        return {}
+
+    return {
+        "input_cost"          : input_,
+        "output_cost"         : output,
+        "cache_read_cost"     : read,
+        "cache_write_5m_cost" : write,
+        "cache_write_1h_cost" : write,
+    }
+
+
 def apply_model(entry: Dict[str, Any]) -> None:
     """
     Points cfg at a model, its provider and its costs.
@@ -292,6 +351,13 @@ def apply_model(entry: Dict[str, Any]) -> None:
             cost_source = family
             cost_family = f"{entry['provider']}:{family['name']}"
             break
+
+    # No family, but the provider may price its models itself.
+    if cost_source is provider:
+        record_prices = model_record_prices(entry)
+        if record_prices:
+            cost_source = record_prices
+            cost_family = f"{entry['provider']}:model"
 
     print(f"Using cost family '{cost_family}'.")
     cfg.model_cost_family       = cost_family

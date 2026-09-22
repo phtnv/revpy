@@ -1276,9 +1276,10 @@ def confine(directory: str, candidate: str) -> str:
     return candidate
 
 
-def taken_names(directory: str) -> set:
+def taken_names(directory: str, besides: str = "") -> set:
     """
     Every name `directory` holds, lowercased, so a name is taken case-insensitively.
+    `besides` leaves out one entry by its exact name: a file being renamed does not block itself.
     That is stricter than Linux needs and exactly what Windows enforces.
     Deciding it by os.path.exists would make one directory behave differently on each.
     'Cat.png' would sit beside 'cat.png' on one and be silently indexed on the other.
@@ -1286,7 +1287,7 @@ def taken_names(directory: str) -> set:
     Call with STORAGE_LOCK held.
     """
     try:
-        return {entry.lower() for entry in os.listdir(directory)}
+        return {entry.lower() for entry in os.listdir(directory) if entry != besides}
     except OSError:
         # A directory we cannot list is one we will fail to write into anyway.
         # Let that failure happen at the write, where it says something useful.
@@ -1884,10 +1885,10 @@ def rename_image(image_id: str, file: str, filename: str) -> Dict[str, Any]:
         if not os.path.exists(old_path):
             raise ImageRequestError(f"{was} is recorded but is no longer in the output directory.")
 
-        # A change of case alone renames the file to itself, which Windows performs happily.
-        # `taken_names` would otherwise read that as a collision with itself.
-        itself = os.path.normcase(old_path) == os.path.normcase(new_path)
-        if not itself and name.lower() in taken_names(directory):
+        # A change of case alone renames the file to itself, so the file itself is left out.
+        # os.path.normcase would only see that on Windows; on Linux it changes nothing.
+        # Another file differing only in case still blocks it, as it would on Windows.
+        if name.lower() in taken_names(directory, besides=was):
             raise ImageRequestError(f"{name} is already taken in the output directory.")
 
         os.replace(old_path, new_path)

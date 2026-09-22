@@ -162,7 +162,9 @@ def resolve_image_costs(costs: Dict[str, Any]) -> Dict[str, float]:
 
 
 def extract_claude_version(value: Any) -> Version:
-    """Extract a Claude major.minor version from a display name or model id."""
+    """
+    Extract a Claude major.minor version from a display name or model id.
+    """
     text = str(value or "")
 
     dot_match = re.search(r"(?<!\d)(\d+(?:\.\d+)+)(?!\d)", text)
@@ -170,10 +172,14 @@ def extract_claude_version(value: Any) -> Version:
         try: return Version(dot_match.group(1))
         except Exception: pass
 
-    hyphen_match = re.search(r"(?<!\d)(\d+)[_-](\d+)(?!\d)", text)
+    hyphen_match = re.search(r"(?<!\d)(\d{1,2})[_-](\d{1,2})(?!\d)", text)
     if hyphen_match is not None:
         try: return Version(f"{hyphen_match.group(1)}.{hyphen_match.group(2)}")
         except Exception: pass
+
+    whole_match = re.search(r"(?<!\d)(\d{1,2})(?!\d)", text)
+    if whole_match is not None:
+        return Version(f"{whole_match.group(1)}.0")
 
     return Version("0.0")
 

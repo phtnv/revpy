@@ -5,6 +5,7 @@ import importlib
 import io
 import json
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -934,6 +935,143 @@ def test_provider_request_bodies() -> bool:
             if key not in expected:
                 print(f"[{case['name']}] unexpected key={key} rec={received[key]!r}")
                 passed = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+# (id or display name, expected version)
+CLAUDE_VERSION_CASES = [
+    ("Claude Opus 4.6"            , "4.6"),
+    ("claude-haiku-4.5-20251001"  , "4.5"),
+    ("claude-sonnet-4-5-20250929" , "4.5"),
+    ("claude-3-5-sonnet-20241022" , "3.5"),
+    ("claude-opus-4-1-20250805"   , "4.1"),
+    # Whole versions, and a date that is not a minor.
+    ("claude-opus-5"              , "5.0"),
+    ("Claude Opus 5"              , "5.0"),
+    ("claude-opus-4-20250514"     , "4.0"),
+    ("claude-3-opus-20240229"     , "3.0"),
+    ("claude-test-model"          , "0.0"),
+]
+
+
+def test_claude_version() -> bool:
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing Claude version extraction... ", end="")
+
+    expected = {text: version for text, version in CLAUDE_VERSION_CASES}
+    received = {text: str(common.extract_claude_version(text)) for text, _ in CLAUDE_VERSION_CASES}
+    passed   = check_equal(expected, received)
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+ATLAS_PRICING = {"prompt": "0.000000435", "completion": "0.00000087", "input_cache_read": "0.0000000036"}
+
+
+def test_model_record_prices() -> bool:
+    """A record's own prices apply when no cost family matches; a configured family still wins."""
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing prices from the model record... ", end="")
+
+    cfg = make_config()
+    family = {"name": "MIMO", "regex": re.compile("mimo-v2\\.5-pro$"), "input_cost": 9.0, "output_cost": 9.0,
+              "cache_read_cost": 9.0, "cache_write_5m_cost": 9.0, "cache_write_1h_cost": 9.0}
+    cfg.providers = {"atlas": make_provider(input_cost=1.0, output_cost=2.0, cost_families=[family])}
+
+    def prices(entry: dict[str, Any]) -> dict[str, Any]:
+        with contextlib.redirect_stdout(io.StringIO()):
+            providers.apply_model(entry)
+        return {"family": cfg.model_cost_family, "input": round(cfg.input_token_cost_usd, 6),
+                "output": round(cfg.output_token_cost_usd, 6), "read": round(cfg.cache_read_cost_usd, 6),
+                "write": round(cfg.cache_write_1h_cost_usd, 6)}
+
+    passed  = check_case_equal("record", {"family": "atlas:model", "input": 0.435, "output": 0.87, "read": 0.0036, "write": 0.435},
+                               prices({"id": "xiaomi/mimo-v2.5", "provider": "atlas", "pricing": ATLAS_PRICING}))
+    passed &= check_case_equal("family wins", {"family": "atlas:MIMO", "input": 9.0, "output": 9.0, "read": 9.0, "write": 9.0},
+                               prices({"id": "xiaomi/mimo-v2.5-pro", "provider": "atlas", "pricing": ATLAS_PRICING}))
+    passed &= check_case_equal("no record", {"family": "atlas", "input": 1.0, "output": 2.0, "read": 0.0, "write": 0.0},
+                               prices({"id": "other/model", "provider": "atlas"}))
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_model_list_filter() -> bool:
+    """A provider name takes its models, any other term is looked for in the id; numbers stay."""
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing model list filter... ", end="")
+
+    cfg = make_config()
+    cfg.providers = {name: make_provider() for name in ("atlas", "gpt", "glm")}
+    real_models = providers.MODELS
+    providers.MODELS = [
+        {"id": "xiaomi/mimo-v2.5-pro", "provider": "atlas"},
+        {"id": "zai-org/glm-5.3"     , "provider": "atlas"},
+        {"id": "gpt-5.6-sol"         , "provider": "gpt"},
+        {"id": "glm-5.3"             , "provider": "glm"},
+    ]
+
+    def rows(terms: list[str]) -> list[str]:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            providers.print_model_list(terms)
+        return [line.split()[0] + " " + line.split()[1] for line in out.getvalue().splitlines()]
+
+    try:
+        passed  = check_case_equal("provider", {"rows": ["1 xiaomi/mimo-v2.5-pro", "2 zai-org/glm-5.3"]}, {"rows": rows(["atlas"])})
+        # 'glm' is a provider, so it takes the glm provider only, not atlas's GLM.
+        passed &= check_case_equal("mixed", {"rows": ["1 xiaomi/mimo-v2.5-pro", "3 gpt-5.6-sol", "4 glm-5.3"]},
+                                   {"rows": rows(["xiaomi", "gpt", "glm"])})
+        passed &= check_case_equal("none", {"rows": ["No model"]}, {"rows": rows(["nothing"])})
+    finally:
+        providers.MODELS = real_models
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+# (label, model, thinking enabled, effort, expected params, can be disabled)
+ATLAS_THINKING_CASES = [
+    ("standard, on"          , "deepseek-ai/deepseek-v4-pro", True , "medium", {"reasoning_effort": "medium"}, True),
+    ("standard, off"         , "qwen/qwen3.8-max"           , False, "high"  , {"reasoning_effort": "none"}  , True),
+    ("glm-5.3 thinks high up", "zai-org/glm-5.3-flash"      , True , "low"   , {"reasoning_effort": "xhigh"} , True),
+    ("glm-5.3 stops at low"  , "zai-org/glm-5.3"            , False, "max"   , {"reasoning_effort": "low"}   , True),
+    ("qwen3.7-plus folds"    , "qwen/qwen3.7-plus"          , True , "max"   , {"reasoning_effort": "xhigh"} , True),
+    ("kimi-k3 cannot stop"   , "moonshotai/kimi-k3"         , False, "high"  , {"reasoning_effort": "low"}   , False),
+    ("mimo takes nothing"    , "xiaomi/mimo-v2.5-pro"       , True , "high"  , {}                            , False),
+    ("unlisted"              , "tencent/hy3"                , True , "high"  , None                          , False),
+]
+
+
+def test_atlas_thinking() -> bool:
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing Atlas Cloud thinking dialect... ", end="")
+
+    cfg = make_config()
+    cfg.providers = {"atlas": make_provider()}
+    cfg.backend   = "atlas"
+    passed        = True
+    for label, model_id, enabled, effort, expected, can_stop in ATLAS_THINKING_CASES:
+        cfg.thinking_effort = effort
+        passed &= check_case_equal(label, {"params": expected, "can stop": can_stop}, {
+            "params"   : chat_api.provider_thinking_params(model_id, enabled, effort),
+            "can stop" : chat_api.thinking_can_be_disabled(model_id),
+        })
+
+    # The vendor's own id still gets the vendor's own dialect.
+    passed &= check_case_equal("z.ai's glm-5.3", {"params": {"thinking": {"type": "disabled"}}},
+                               {"params": chat_api.provider_thinking_params("glm-5.3", False, "high")})
 
     if passed : print(f"{GREEN}PASS{RESET}")
     else      : print(f"{RED}FAIL{RESET}")
@@ -2382,6 +2520,15 @@ def test_image_rename() -> bool:
         if v1_images.rename_image("", "Coat_Final.png", "coat.png")["name"] != "coat.png":
             fail("exp=matched by file, rec=otherwise")
 
+        # Another file differing only in case is taken, on Linux as on Windows.
+        write_file(tmp, "STRAY.png", png)
+        try:
+            v1_images.rename_image("img_aaaa", "", "stray.png")
+            fail("exp=another file's name refused, rec=renamed over it")
+        except v1_images.ImageRequestError:
+            pass
+        os.remove(os.path.join(tmp, "STRAY.png"))
+
         # Over HTTP, which is how mini-img asks: its own route rather than a field of the patch.
         was_required = common.cfg.require_proxy_key
         common.cfg.require_proxy_key = False
@@ -3388,6 +3535,11 @@ if __name__ == "__main__":
         tests_passed += test_responses_non_stream(non_stream_case)
 
     tests_passed += test_provider_request_bodies()
+
+    tests_passed += test_claude_version()
+    tests_passed += test_model_record_prices()
+    tests_passed += test_model_list_filter()
+    tests_passed += test_atlas_thinking()
 
     tests_passed += test_nano_gpt_catalogue()
     tests_passed += test_nano_gpt_catalogue_file()
