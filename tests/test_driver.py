@@ -9,6 +9,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import zlib
 
 from pathlib           import Path
@@ -44,6 +45,7 @@ chat_api    : Any = importlib.import_module("v1_chat_completions")
 resp_api    : Any = importlib.import_module("v1_responses")
 v1_images   : Any = importlib.import_module("v1_images")
 server      : Any = importlib.import_module("server")
+nano_gpt    : Any = importlib.import_module("nano_gpt")
 
 image_orchestrator : Any = importlib.import_module("image_orchestrator")
 
@@ -120,6 +122,10 @@ def make_provider(**overrides: Any) -> dict[str, Any]:
         "store"               : False,
         "background"          : False,
         "extra_body"          : {},
+        "aggregator"          : "",
+        "catalogue_path"      : "",
+        # Never stale, so a canned catalogue is never refetched.
+        "catalogue_hours"     : 0.0,
         "cost_families"       : [],
         "input_cost"          : 0.0,
         "output_cost"         : 0.0,
@@ -928,6 +934,305 @@ def test_provider_request_bodies() -> bool:
             if key not in expected:
                 print(f"[{case['name']}] unexpected key={key} rec={received[key]!r}")
                 passed = False
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+# NanoGPT.
+# The catalogue and the provider listing are canned; nothing is fetched.
+NANO_MIMO = "xiaomi/mimo-v2.5-pro"
+
+NANO_CATALOGUE = [
+    # The base lists no effort levels, so its twin is the only way to think.
+    {"id": "anthropic/claude-sonnet-5"},
+    {"id": "anthropic/claude-sonnet-5:thinking", "reasoning_efforts": ["low", "medium", "high", "xhigh", "max"]},
+    # A twin listing no levels shows nothing about its base.
+    {"id": "some/model"},
+    {"id": "some/model:thinking"},
+    # A twin without a base.
+    {"id": "stepfun/step-3.7-flash:thinking", "reasoning_efforts": ["high"]},
+    # On/off, and a base taking every level its twin does.
+    {"id": NANO_MIMO, "name": "MiMo V2.5 Pro", "reasoning_efforts": ["none", "high"],
+     "pricing": {"prompt": 0.435, "completion": 0.87, "cacheReadInputPer1kTokens": 3.6e-06},
+     "providers": ["gmicloud", "deepinfra", "xiaomi"]},
+    {"id": f"{NANO_MIMO}:thinking", "reasoning_efforts": ["none", "high"]},
+    # No 'none', so the base cannot stop thinking; still a superset of its twin.
+    {"id": "z-ai/glm-5.3", "reasoning_efforts": ["low", "high", "max"]},
+    {"id": "z-ai/glm-5.3:thinking", "reasoning_efforts": ["high", "max"]},
+]
+
+NANO_LISTING = {
+    "canonicalId"              : NANO_MIMO,
+    "supportsProviderSelection": True,
+    "defaultPrice"             : {"inputPer1kTokens": 0.000435, "outputPer1kTokens": 0.00087,
+                                  "cacheReadInputPer1kTokens": 0.0000036, "cacheWriteInputPer1kTokens": 0},
+    "providers": [
+        {"provider": "gmicloud", "available": True,
+         "pricing": {"inputPer1kTokens": 0.00032, "outputPer1kTokens": 0.00064,
+                     "cacheReadInputPer1kTokens": 0.000003, "cacheWriteInputPer1kTokens": 0}},
+        # No cache prices at all.
+        {"provider": "deepinfra", "available": True,
+         "pricing": {"inputPer1kTokens": 0.00105, "outputPer1kTokens": 0.00315}},
+    ],
+}
+
+
+def make_nano_config() -> Any:
+    cfg = make_config()
+    cfg.providers = {"nano": make_provider(aggregator="nano_gpt", base_url="https://nano.test/api/v1")}
+    cfg.backend   = "nano"
+    cfg.model     = NANO_MIMO
+    nano_gpt.CATALOGUE = nano_gpt.merge_thinking_twins([dict(entry) for entry in NANO_CATALOGUE])
+    nano_gpt.LISTINGS  = {NANO_MIMO: NANO_LISTING}
+    nano_gpt.ROUTES    = {}
+    return cfg
+
+
+def nano_prices(cfg: Any) -> dict[str, Any]:
+    return {
+        "family"   : cfg.model_cost_family,
+        "input"    : round(cfg.input_token_cost_usd, 6),
+        "output"   : round(cfg.output_token_cost_usd, 6),
+        "read"     : round(cfg.cache_read_cost_usd, 6),
+        "write_5m" : round(cfg.cache_write_5m_cost_usd, 6),
+    }
+
+
+def test_nano_gpt_catalogue() -> bool:
+    """Twins merge only into a base that can think on its own; search ignores punctuation."""
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing NanoGPT catalogue: thinking twins and search... ", end="")
+
+    make_nano_config()
+    passed = check_case_equal("merge", {"ids": [
+        "anthropic/claude-sonnet-5", "anthropic/claude-sonnet-5:thinking",
+        "some/model", "some/model:thinking",
+        "stepfun/step-3.7-flash:thinking",
+        NANO_MIMO, "z-ai/glm-5.3",
+    ]}, {"ids": [entry["id"] for entry in nano_gpt.CATALOGUE]})
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        nano_gpt.print_catalogue(["MIMO", "v2.5", "pro"])
+    lines = out.getvalue().splitlines()
+    # Numbered by position in the whole catalogue, and marked as the selected model.
+    if len(lines) != 1 or not lines[0].startswith("[6]") or NANO_MIMO not in lines[0]:
+        print(f"search exp=one '[6] {NANO_MIMO}' row, rec={lines} ", end="")
+        passed = False
+
+    url = nano_gpt.listing_url(common.cfg.providers["nano"], f"{NANO_MIMO}:thinking")
+    passed &= check_case_equal("listing url", {"url": "https://nano.test/api/models/xiaomi%2Fmimo-v2.5-pro%3Athinking/providers"}, {"url": url})
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+# (label, model, thinking enabled, effort, expected params)
+NANO_THINKING_CASES = [
+    ("on/off model, any effort enables", NANO_MIMO     , True , "medium", {"reasoning_effort": "high"}),
+    ("on/off model, disabled"          , NANO_MIMO     , False, "medium", {"reasoning_effort": "none"}),
+    ("ladder folds down"               , "z-ai/glm-5.3", True , "xhigh" , {"reasoning_effort": "high"}),
+    ("cannot stop, weakest level"      , "z-ai/glm-5.3", False, "high"  , {"reasoning_effort": "low"}),
+    ("no levels listed"                , "anthropic/claude-sonnet-5", True, "high", {}),
+    ("not in the catalogue"            , "missing/model", True, "high"  , None),
+]
+
+
+def test_nano_gpt_catalogue_file() -> bool:
+    """The catalogue is saved as fetched, read back, and refetched only once stale."""
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing NanoGPT catalogue file: saved, read back, refetched when stale... ", end="")
+
+    cfg    = make_nano_config()
+    passed = True
+    raw    = NANO_CATALOGUE + [{"id": "some/decider", "architecture": {"output_modalities": ["decisions"]}}]
+    calls  : list[tuple[str, str]] = []
+
+    def unreachable(url: str, **kwargs: Any) -> Any:
+        calls.append(("GET", url))
+        raise httpx.ConnectError("unreachable")
+
+    def restart() -> bool:
+        nano_gpt.CATALOGUE = []
+        nano_gpt.CATALOGUE_FETCHED_AT = 0.0
+        return nano_gpt.ensure_catalogue()
+
+    def saved() -> dict[str, Any]:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    real_httpx = nano_gpt.httpx
+    with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+        path = os.path.join(tmp, "nano_catalogue.json")
+        cfg.providers["nano"].update(catalogue_path=path, catalogue_hours=24.0)
+        nano_gpt.httpx = fake_httpx([], [{"data": raw}, {"data": raw}], calls)
+        try:
+            # No file yet: fetched, and saved unfiltered.
+            first     = restart()
+            file_ids  = [entry["id"] for entry in saved()["data"]]
+            first_get = len(calls)
+
+            # A fresh file is read without asking NanoGPT.
+            second     = restart()
+            second_get = len(calls)
+            loaded     = len(nano_gpt.CATALOGUE)
+
+            # A stale one is refetched and saved again.
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"fetched_at": time.time() - 25*3600, "data": raw}, f)
+            third     = restart()
+            third_get = len(calls)
+            refreshed = time.time() - saved()["fetched_at"] < 60
+
+            # A stale one that cannot be refetched is still used.
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"fetched_at": time.time() - 25*3600, "data": raw}, f)
+            nano_gpt.httpx = SimpleNamespace(get=unreachable)
+            fourth = restart()
+            kept   = len(nano_gpt.CATALOGUE)
+
+            # A period of 0 never goes stale.
+            cfg.providers["nano"]["catalogue_hours"] = 0.0
+            before = len(calls)
+            fifth  = restart()
+            fifth_get = len(calls) - before
+        finally:
+            nano_gpt.httpx = real_httpx
+
+    passed &= check_case_equal("catalogue file", {
+        "first": True, "saved unfiltered": len(raw), "first fetches": 1,
+        "second": True, "second fetches": 1, "loaded": 7,
+        "third": True, "third fetches": 2, "refreshed": True,
+        "fourth": True, "stale kept": 7,
+        "fifth": True, "fifth fetches": 0,
+    }, {
+        "first": first, "saved unfiltered": len(file_ids), "first fetches": first_get,
+        "second": second, "second fetches": second_get, "loaded": loaded,
+        "third": third, "third fetches": third_get, "refreshed": refreshed,
+        "fourth": fourth, "stale kept": kept,
+        "fifth": fifth, "fifth fetches": fifth_get,
+    })
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_nano_gpt_request() -> bool:
+    """Thinking goes out as reasoning_effort; routing is a hard pin, or cache-aware auto."""
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing NanoGPT request: thinking and routing... ", end="")
+
+    cfg    = make_nano_config()
+    passed = True
+    for label, model_id, enabled, effort, expected in NANO_THINKING_CASES:
+        received = chat_api.provider_thinking_params(model_id, enabled, effort)
+        passed &= check_case_equal(label, {"params": expected}, {"params": received})
+
+    prepared = {"messages": [{"role": "user", "content": "Hello."}], "system_segments": [],
+                "system_summary_text": "", "lorebook_at_end_text": "", "max_tokens": 256}
+    messages = [{"role": "user", "content": "Hello."}]
+    base     = {"model": NANO_MIMO, "messages": messages, "max_tokens": 256, "reasoning_effort": "high"}
+    cfg.thinking_enabled = True
+
+    cfg.cache_en = True
+    passed &= check_case_equal("auto, caching", {**base, "caching": True}, chat_api.build_body(prepared))
+    cfg.cache_en = False
+    passed &= check_case_equal("auto, no caching", base, chat_api.build_body(prepared))
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        nano_gpt.select_provider(2)
+    cfg.cache_en = True
+    passed &= check_case_equal("pinned", {**base, "provider": {"only": ["deepinfra"], "allow_fallbacks": False}},
+                               chat_api.build_body(prepared))
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_nano_gpt_selection() -> bool:
+    """Prices follow the route; a model returns to its pinned provider while it still serves it."""
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing NanoGPT selection: providers and prices... ", end="")
+
+    cfg    = make_nano_config()
+    passed = True
+    calls  : list[tuple[str, str]] = []
+    real_httpx = nano_gpt.httpx
+    nano_gpt.httpx = fake_httpx([], [NANO_LISTING, NANO_LISTING, NANO_LISTING], calls)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            nano_gpt.select_provider(0)
+            auto = nano_prices(cfg)
+            nano_gpt.select_provider(2)
+            pinned = nano_prices(cfg)
+            out_of_range = nano_gpt.select_provider(3)
+
+            # Selecting the model again keeps its provider.
+            cfg.backend, cfg.model = "claude", "claude-test-model"
+            cfg.providers["claude"] = make_provider(api="messages")
+            not_nano = nano_gpt.apply_model_by_id("claude/claude-test-model")
+            again    = nano_gpt.apply_model_by_id(f"nano/{NANO_MIMO}")
+            kept     = nano_gpt.ROUTES[NANO_MIMO]
+
+            # A provider that no longer serves the model falls back to Auto.
+            nano_gpt.ROUTES[NANO_MIMO] = "gone"
+            nano_gpt.apply_model_by_id(f"nano/{NANO_MIMO}")
+            dropped = nano_gpt.ROUTES[NANO_MIMO]
+    finally:
+        nano_gpt.httpx = real_httpx
+
+    passed &= check_case_equal("auto prices", {"family": "nano:auto", "input": 0.435, "output": 0.87, "read": 0.0036, "write_5m": 0.435}, auto)
+    # No cache prices: reads and writes bill as input.
+    passed &= check_case_equal("pinned prices", {"family": "nano:deepinfra", "input": 1.05, "output": 3.15, "read": 1.05, "write_5m": 1.05}, pinned)
+    passed &= check_case_equal("selection", {
+        "out of range": None, "not nano": False, "again": True, "backend": "nano", "kept": "deepinfra", "dropped": "",
+        "listing url": "https://nano.test/api/models/xiaomi%2Fmimo-v2.5-pro/providers",
+    }, {
+        "out of range": out_of_range, "not nano": not_nano, "again": again, "backend": cfg.backend, "kept": kept, "dropped": dropped,
+        "listing url": calls[0][1] if calls else "",
+    })
+
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_nano_gpt_reported_cost() -> bool:
+    """The billed cost is the tracked total; the computed one is shown only when it strays."""
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing NanoGPT reported cost... ", end="")
+
+    cfg = make_nano_config()
+    with contextlib.redirect_stdout(io.StringIO()):
+        nano_gpt.apply_prices(NANO_MIMO, "")
+
+    # 72 uncached, 192 cached and 2 output tokens, as NanoGPT billed them.
+    usage  = {"prompt_tokens": 264, "completion_tokens": 2, "prompt_tokens_details": {"cached_tokens": 192},
+              "cost": 3.37512e-05}
+    passed = True
+
+    for label, cost, warns in [("matching", 3.37512e-05, False), ("stale prices", 5e-05, True)]:
+        counts = chat_api.parse_usage({**usage, "cost": cost})
+        before = common.session_cost_snapshot()["total_spent_usd"]
+        out    = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            common.print_usage(counts)
+        spent = common.session_cost_snapshot()["total_spent_usd"] - before
+
+        passed &= check_case_equal(label, {"spent": round(cost, 10), "warns": warns},
+                                   {"spent": round(spent, 10), "warns": "WARNING" in out.getvalue()})
+
+    passed &= check_case_equal("unreported", {"cost": None}, {"cost": chat_api.parse_usage({"prompt_tokens": 1})["reported_cost"]})
 
     if passed : print(f"{GREEN}PASS{RESET}")
     else      : print(f"{RED}FAIL{RESET}")
@@ -2987,6 +3292,13 @@ if __name__ == "__main__":
         tests_passed += test_responses_non_stream(non_stream_case)
 
     tests_passed += test_provider_request_bodies()
+
+    tests_passed += test_nano_gpt_catalogue()
+    tests_passed += test_nano_gpt_catalogue_file()
+    tests_passed += test_nano_gpt_request()
+    tests_passed += test_nano_gpt_selection()
+    tests_passed += test_nano_gpt_reported_cost()
+    make_config()
 
     tests_passed += test_image_extraction()
 

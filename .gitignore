@@ -4,3 +4,4 @@ chat_snapshot*
 revpy_error.log
 generated_images/
 test_error_log.txt
+*_catalogue.json

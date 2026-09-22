@@ -13,6 +13,7 @@ from waitress   import serve
 from werkzeug.exceptions import RequestEntityTooLarge
 
 import image_orchestrator
+import nano_gpt
 import v1_messages
 import providers
 import v1_chat_completions
@@ -143,9 +144,17 @@ def finish_model_switch(switched: bool) -> None:
         active_backend().after_model_switch()
 
 
+def apply_model_by_id(model_id: str) -> bool:
+    """
+    Aggregator models are not in the shared list, so their own module is asked first.
+    Otherwise the registry would take one as configured, and lose its prices.
+    """
+    return nano_gpt.apply_model_by_id(model_id) or providers.apply_model_by_id(model_id)
+
+
 def cli_refresh_models() -> None:
     providers.refresh_models(cfg.model_list_timeout_seconds)
-    finish_model_switch(providers.apply_model_by_id(f"{cfg.backend}/{cfg.model}"))
+    finish_model_switch(apply_model_by_id(f"{cfg.backend}/{cfg.model}"))
 
 
 
@@ -160,9 +169,24 @@ CLI_CMD_MODEL_INFO = """\
       Alias: r
 """
 
+CLI_CMD_NANO_INFO = """\
+  nano command, the NanoGPT catalogue. Alias: n.
+    nano                   Show the selected NanoGPT model, its provider and prices.
+    nano list [terms]      List the catalogue, or only the models matching every term.
+      Alias: l
+    nano <uint>            Select a model from the catalogue.
+    nano provider          List the providers of the selected model.
+      Alias: p
+    nano provider <uint>   Select a provider. 0 lets NanoGPT route the model.
+    nano refresh           Request the catalogue and the selected model's providers again.
+      Alias: r
+    nano help              Display this message.
+      Alias: ?
+"""
+
 CLI_CMD_CACHE_INFO = """\
   cache command. Alias: c.
-    cache <bool>          Toggle all caching on/off.
+    cache <bool>          Toggle all caching on/off. On NanoGPT, cache-aware automatic routing.
     cache system <bool>   Toggle caching of system messages.
     cache system <5m|1h>  Set cache duration for the system messages.
       Alias: sys, s
@@ -524,6 +548,42 @@ def handle_image_command(line: str, parts: List[str]) -> None:
     print(CLI_CMD_IMAGE_INFO)
 
 
+def handle_nano_command(parts: List[str]) -> None:
+    """The 'nano' CLI command group. Selecting a model here switches the active backend."""
+    if len(parts) < 2:
+        nano_gpt.print_status()
+        return
+
+    arg1 = parts[1].lower()
+    if arg1 in {"?", "help"}:
+        print(CLI_CMD_NANO_INFO)
+        return
+    if arg1 in {"l", "list"}:
+        nano_gpt.print_catalogue(parts[2:])
+        return
+    if arg1 in {"r", "refresh"}:
+        finish_model_switch(nano_gpt.refresh())
+        return
+    if arg1 in {"p", "provider", "providers"}:
+        if len(parts) < 3:
+            nano_gpt.print_providers()
+            return
+        try: index = int(parts[2])
+        except Exception: pass
+        else:
+            nano_gpt.select_provider(index)
+            return
+        print(CLI_CMD_NANO_INFO)
+        return
+
+    try: index = int(arg1)
+    except Exception: pass
+    else:
+        finish_model_switch(nano_gpt.select_model_by_number(index))
+        return
+    print(CLI_CMD_NANO_INFO)
+
+
 def admin_cli_loop() -> None:
     print("Runtime CLI ready. Type 'help' for commands.\n")
 
@@ -545,6 +605,12 @@ def admin_cli_loop() -> None:
 
         try:
             if cmd in {"c", "cache"}:
+                # NanoGPT has no markers, only cache-aware routing, so only the switch applies.
+                if nano_gpt.is_active():
+                    if parts_l > 1 and parts[1].lower() in ENABLE_VALUES | DISABLE_VALUES:
+                        cfg.cache_en = parts[1].lower() in ENABLE_VALUES
+                    nano_gpt.print_cache_status()
+                    continue
                 if providers.api_style() != "messages":
                     print(f"Cache markers are an Anthropic-protocol feature. Backend '{cfg.backend}' has no explicit cache control (use EXTRA_BODY if the provider supports one).")
                     continue
@@ -713,6 +779,10 @@ def admin_cli_loop() -> None:
                 handle_image_command(line, parts)
                 continue
 
+            if cmd in {"n", "nano"}:
+                handle_nano_command(parts)
+                continue
+
             if cmd == "status":
                 cfg.print_status()
                 continue
@@ -758,6 +828,7 @@ def admin_cli_loop() -> None:
                 print(CLI_CMD_CACHE_INFO)
                 print(CLI_CMD_IMAGE_INFO)
                 print(CLI_CMD_MODEL_INFO)
+                print(CLI_CMD_NANO_INFO)
                 print(CLI_CMD_PREFILL_INFO)
                 print(CLI_CMD_THINK_INFO)
                 print("  reload         Reload runtime settings from .env.")
@@ -2018,11 +2089,14 @@ if __name__ == "__main__":
 
     print_provider_table()
     providers.refresh_models(cfg.model_list_timeout_seconds)
+    # Read from its file, and refetched only when older than its refresh period.
+    if nano_gpt.provider_name():
+        nano_gpt.ensure_catalogue()
 
     # MODEL is a bare id or "provider/model-id".
     # The prefixed form resolves without a model list.
     # It is all that still works when a provider's /models request failed, so prefer it.
-    if not providers.apply_model_by_id(cfg.model):
+    if not apply_model_by_id(cfg.model):
         print()
         print(f"MODEL '{cfg.model}' matches no model of any configured provider.")
         print("Set MODEL=provider/model-id in .env, using one of the providers listed above.")

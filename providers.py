@@ -162,6 +162,7 @@ def refresh_models(timeout_s: float) -> None:
     Fetches the model list of every configured provider and stores them for CLI use.
 
     Providers with a <NAME>_MODELS override skip the /models request entirely.
+    Aggregators are skipped too; their catalogues have their own CLI command (see nano_gpt).
     A failing provider is skipped with a warning; it does not block the others.
     The requests run in parallel but results are collected in declaration order.
     So the list, and the CLI numbering, does not depend on response order.
@@ -169,12 +170,13 @@ def refresh_models(timeout_s: float) -> None:
     global MODELS
 
     models: List[Dict[str, Any]] = []
+    listed = {name: provider for name, provider in cfg.providers.items() if not provider["aggregator"]}
 
-    if cfg.providers:
-        with ThreadPoolExecutor(max_workers=len(cfg.providers)) as pool:
+    if listed:
+        with ThreadPoolExecutor(max_workers=len(listed)) as pool:
             fetches = [
                 (name, provider, None if provider["models"] else pool.submit(fetch_provider_models, name, provider, timeout_s))
-                for name, provider in cfg.providers.items()
+                for name, provider in listed.items()
             ]
 
             for name, provider, future in fetches:
@@ -199,6 +201,12 @@ def print_model_list() -> None:
     """
     with MODEL_LOCK:
         models = list(MODELS)
+
+    # An aggregator model is never in this list, so say what is selected instead.
+    active = cfg.providers.get(cfg.backend)
+    if active is not None and active["aggregator"]:
+        print(f"Selected: {cfg.backend}/{cfg.model}, from an aggregator catalogue. See 'nano'.")
+
     if not models:
         print_no_models_available()
         return

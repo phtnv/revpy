@@ -1,6 +1,6 @@
 """
 The /chat/completions backend: the OpenAI-style endpoint every compatible provider implements.
-GLM, Kimi, MiMo and Aion are served from here.
+GLM, Kimi, MiMo and Aion are served from here, and so is the NanoGPT aggregator (see nano_gpt).
 
 OpenAI's own models are better served over /responses (see v1_responses), which returns reasoning.
 So nothing here carries OpenAI model knowledge beyond the name of the token-limit field.
@@ -11,6 +11,8 @@ An OpenAI-compatible gateway declared here still works -- you just lose the reas
 import httpx
 import json
 import re
+
+import nano_gpt
 
 from packaging.version import Version
 from typing            import Any, Dict, Iterator, List, Optional, Tuple
@@ -148,7 +150,10 @@ def provider_thinking_params(model_id: str, thinking_enabled: bool, thinking_eff
     Returns the params of the first dialect that recognizes model_id, or None when none matches.
     None means no passthrough, and EXTRA_BODY is the escape hatch.
     An empty dict means the model is recognized but offers no thinking controls at all.
+    NanoGPT speaks one dialect for every model it serves, so it is asked instead.
     """
+    if nano_gpt.is_active():
+        return nano_gpt.thinking_params(model_id, thinking_enabled, thinking_effort)
     for dialect in THINKING_DIALECTS:
         params = dialect(model_id, thinking_enabled, thinking_effort)
         if params is not None:
@@ -273,6 +278,9 @@ def build_body(prepared: Dict[str, Any]) -> Dict[str, Any]:
     if thinking_params is not None:
         body.update(thinking_params)
 
+    if nano_gpt.is_active():
+        body.update(nano_gpt.route_params(cfg.model))
+
     body.update(provider["extra_body"])
 
     return body
@@ -300,17 +308,22 @@ def parse_usage(usage: Any) -> Dict[str, Any]:
     cached_tokens = min(cached_tokens, prompt_tokens)
     write_tokens  = min(write_tokens, prompt_tokens - cached_tokens)
 
+    # NanoGPT reports what it billed; None when a provider does not.
+    raw_cost      = usage.get("cost")
+    reported_cost = None if raw_cost is None else max(0.0, float(raw_cost))
+
     return {
-        "prompt"     : prompt_tokens,
-        "completion" : completion_tokens,
-        "total"      : max(0, int(usage.get("total_tokens", prompt_tokens + completion_tokens) or 0)),
-        "cached"     : cached_tokens,
+        "prompt"        : prompt_tokens,
+        "completion"    : completion_tokens,
+        "total"         : max(0, int(usage.get("total_tokens", prompt_tokens + completion_tokens) or 0)),
+        "cached"        : cached_tokens,
         # One cache rate and no TTL choice here, so every write is a 5m write.
         # providers.apply_model prices both buckets identically.
-        "write_1h"   : 0,
-        "write_5m"   : write_tokens,
-        "uncached"   : prompt_tokens - cached_tokens - write_tokens,
-        "reasoning"  : reported_reasoning(completion_details),
+        "write_1h"      : 0,
+        "write_5m"      : write_tokens,
+        "uncached"      : prompt_tokens - cached_tokens - write_tokens,
+        "reasoning"     : reported_reasoning(completion_details),
+        "reported_cost" : reported_cost,
     }
 
 
@@ -373,6 +386,9 @@ def generate_stream(prepared: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
     provider = cfg.providers[cfg.backend]
     body     = build_body(prepared)
     body["stream"] = True
+    # Without it NanoGPT streams no usage, and the turn would be tracked as free.
+    if nano_gpt.is_active():
+        body["stream_options"] = {"include_usage": True}
 
     print_payload(body)
 

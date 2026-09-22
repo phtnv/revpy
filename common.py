@@ -19,6 +19,10 @@ UINT64_MAX     = 2**64 - 1
 THINK_EFFORT_ORDER  = ("low", "medium", "high", "xhigh", "max")
 MAX_TOKENS_PARAMS   = {"auto", "max_tokens", "max_completion_tokens"}
 REASONING_SUMMARIES = {"none", "auto", "concise", "detailed"}
+# "" is a plain provider. See nano_gpt.py.
+AGGREGATORS         = {"", "nano_gpt"}
+# How far the cost computed from fetched prices may stray from a reported cost before it is shown.
+REPORTED_COST_TOLERANCE = 0.05
 
 # Image generation enums, as accepted by /images/generations on the gpt-image family.
 # 'transparent' is deliberately absent: gpt-image-2 does not support it.
@@ -273,6 +277,13 @@ class RuntimeConfig:
                                        turn (default false); /responses only
             <NAME>_EXTRA_BODY          json5 object merged verbatim into every request
                                        (the escape hatch for provider thinking/caching dialects)
+            <NAME>_AGGREGATOR          'nano_gpt' for NanoGPT; its catalogue is kept out of the
+                                       shared model list (see nano_gpt.py); /chat/completions only
+            <NAME>_CATALOGUE_PATH      where an aggregator's catalogue is saved
+                                       (default <name>_catalogue.json)
+            <NAME>_CATALOGUE_REFRESH_HOURS
+                                       refetch the saved catalogue once older than this
+                                       (default 24; 0 refetches only on 'nano refresh')
             <NAME>_INPUT_TOKEN_COST_USD, <NAME>_OUTPUT_TOKEN_COST_USD,
             <NAME>_CACHE_READ_COST_USD, <NAME>_CACHE_WRITE_COST_USD,
             <NAME>_CACHE_WRITE_5M_COST_USD, <NAME>_CACHE_WRITE_1H_COST_USD
@@ -315,6 +326,14 @@ class RuntimeConfig:
             print(f"WARNING: {prefix}_REASONING_SUMMARY must be in {REASONING_SUMMARIES}. Defaulting to 'auto'.")
             reasoning_summary = "auto"
 
+        aggregator = os.getenv(f"{prefix}_AGGREGATOR", "").strip().lower()
+        if aggregator not in AGGREGATORS:
+            print(f"WARNING: {prefix}_AGGREGATOR must be in {sorted(AGGREGATORS - {''})}. Ignoring.")
+            aggregator = ""
+        if aggregator and api != "chat":
+            print(f"WARNING: {prefix}_AGGREGATOR needs '{name}' in {API_STYLE_VARS['chat']}. Ignoring.")
+            aggregator = ""
+
         input_cost = getenv_float(f"{prefix}_INPUT_TOKEN_COST_USD", 0.0)
         write_cost = getenv_float(f"{prefix}_CACHE_WRITE_COST_USD", input_cost)
 
@@ -336,6 +355,9 @@ class RuntimeConfig:
             # See v1_responses.generate_stream and the README.
             "background"          : getenv_bool(f"{prefix}_BACKGROUND", False),
             "extra_body"          : extra_body,
+            "aggregator"          : aggregator,
+            "catalogue_path"      : os.getenv(f"{prefix}_CATALOGUE_PATH", f"{name}_catalogue.json").strip(),
+            "catalogue_hours"     : max(0.0, getenv_float(f"{prefix}_CATALOGUE_REFRESH_HOURS", 24.0)),
             "cost_families"       : self.parse_cost_families(prefix),
             "input_cost"          : input_cost,
             "output_cost"         : getenv_float(f"{prefix}_OUTPUT_TOKEN_COST_USD"   , 0.0),
@@ -1110,6 +1132,8 @@ def usage_to_cost_tokens(counts: Dict[str, Any]) -> Dict[str, Any]:
         "output"         : counts["completion"],
         # Splits the output line into thinking and visible text; None when unreported.
         "reasoning"      : counts["reasoning"],
+        # What the provider billed, when it says; None otherwise. See track_usage().
+        "reported_cost"  : counts.get("reported_cost"),
     }
 
 
@@ -1215,6 +1239,8 @@ def track_usage(tokens: Dict[str, Any]) -> None:
     Backends are responsible for mapping their provider's usage payload to this
     shape (for providers without cache writes, the write counts are simply 0).
 
+    The optional 'reported_cost' is what the provider billed; it replaces the computed total.
+
     The optional 'reasoning' key splits output tokens into thinking and visible text.
     Both bill at the output rate.
     Leave it out (or None) when the provider does not report the count.
@@ -1247,6 +1273,15 @@ def track_usage(tokens: Dict[str, Any]) -> None:
 
     output_cost        = tok_usd(output_tok, cfg.output_token_cost_usd)
     request_total_cost = total_input_cost + output_cost
+
+    # Aggregators report what they actually billed, and that is the total tracked.
+    # The computed total only checks the fetched prices, so it is shown only when it strays.
+    reported_cost = tokens.get("reported_cost")
+    computed_cost = request_total_cost
+    if reported_cost is not None:
+        request_total_cost = reported_cost
+        if abs(computed_cost - reported_cost) > REPORTED_COST_TOLERANCE*max(computed_cost, reported_cost):
+            print(f"WARNING: {cfg.backend} billed {fmt_usd(reported_cost)}, the fetched prices give {fmt_usd(computed_cost)}. The prices may be out of date.")
 
     cache_write_extra_cost = (
         tok_usd(ephemeral_1h, cfg.cache_write_1h_cost_usd - cfg.input_token_cost_usd)

@@ -133,11 +133,9 @@ Well, this is a server-side issue then. You can open an issue here on GitHub. Th
 A red `Proxy error (not an API response)` line means the fault is in the proxy rather than something the provider refused; the full traceback for those goes to `ERROR_LOG_PATH`.
 
 ## Command-Line Interface
-
 The proxy has a small CLI (command-line interface) embedded in it. In the same terminal you launched `server.py`, type `help` to list all the available commands. Type `quit` to quit the server.
 
 ## Model selection
-
 At startup the proxy fetches the model list of every configured provider, in the order the provider lists are given above.
 
 In CLI type `m` to see the available model list (along with the currently selected model).
@@ -148,8 +146,38 @@ CLI model selection is runtime-only. To make a model the default after restart, 
 
 If a provider's `/models` request fails, the proxy warns and carries on with the others.
 
-## Caching
+## NanoGPT
+[NanoGPT](https://nano-gpt.com) is an aggregator: one key, hundreds of models, and for many open-weights models a choice of the provider serving them. Declare it as a `/chat/completions` provider and mark it an aggregator:
 
+```ini
+V1_CHAT_COMPLETIONS_PROVIDERS=nano
+NANO_BASE_URL=https://nano-gpt.com/api/v1
+NANO_API_KEY=your_nanogpt_api_key
+NANO_AGGREGATOR=nano_gpt
+```
+
+Its catalogue is kept out of the `m` list and has a command of its own. It is saved to `nano_catalogue.json` and read back at startup, and refetched once it is older than `NANO_CATALOGUE_REFRESH_HOURS` (default 24; 0 refetches only on `nano refresh`). If a refetch fails, the saved one is still used. `NANO_CATALOGUE_PATH` moves the file. Provider listings are not saved; they are fetched when you select a model, so the prices you pin are current.
+
+```text
+nano list mimo pro     Search the catalogue. Every term must match; punctuation is ignored.
+nano list              The whole catalogue.
+nano 544               Select model 544. Lists its providers, with prices, speed and caching.
+nano provider 3        Pin provider 3. 'nano provider 0' lets NanoGPT route the model.
+nano                   The selected model, provider and prices.
+nano refresh           Fetch and save the catalogue now, and the selected model's providers.
+```
+
+A pinned provider is strict: if it is down the request fails, and you pick another. The proxy never routes around your choice. Each model remembers the provider you pinned for it until the proxy restarts.
+
+With Auto, `c 1` asks NanoGPT for a provider that caches and to keep to it; `c 0` leaves the choice to NanoGPT. A pinned provider caches on its own if it can, whatever `c` says.
+
+Many models come twice, as `model` and `model:thinking`. Where the plain model takes every effort level its twin does, only the plain one is listed, and thinking is switched with `t` like everywhere else: it is sent as `reasoning_effort`, folded onto the levels the model lists. Models that only turn thinking on or off take any effort as on. Some providers ignore it (atlascloud always thinks on `mimo-v2.5-pro`).
+
+Prices come from NanoGPT, so none are configured. Each response also reports what NanoGPT actually billed, and that is the cost tracked. The cost computed from the fetched prices is shown only when it differs by more than 5% — a hint to `nano refresh`.
+
+To start on a NanoGPT model, `MODEL=nano/xiaomi/mimo-v2.5-pro` works too, routed automatically.
+
+## Caching
 Everything in this section is an Anthropic-protocol feature and applies to providers declared in `V1_MESSAGES_PROVIDERS`. For everyone else see [Caching on OpenAI-style backends](#caching-on-openai-style-backends). For a detailed guide how caching works, you can read Anthropic's [official docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
 
 The short version is that Anthropic provides you up to 4 markers to place at any user (that's you), assistant (that's the LLM) or system (that's the bot definitions, advanced prompts and summaries) messages in your chat. Messages up to and including these markers will be cached.
@@ -176,7 +204,6 @@ In any case, for every message the proxy will display both the session and the c
 In CLI, use `c 0` to disable caching globally and `c 1` to enable caching globally again. Individual markers still depend on their own settings.
 
 ### The four markers
-
 The proxy can place up to four markers in your chat, controlled from CLI and variables in `.env`.
 
 #### 1 auto marker
@@ -215,13 +242,11 @@ For reasons described above, the system message is split into the core definitio
 For lorebook-heavy bots, you can consider disabling all except the system cache markers.
 
 ### Caching on OpenAI-style backends
-
 None of the above applies to providers on `/chat/completions` or `/responses`: they cache automatically, with no markers to place and no TTL to choose, so the `c` commands do nothing while one of them is selected. OpenAI caches prompts from 1024 tokens up, and bills a cache hit at the `cache_read` rate. From `gpt-5.6` on it also charges for the write, at 1.25x the input rate, which the proxy reports in the usual cache-cost line — configure it per model with `cache_write` in `<NAME>_MODEL_<FAMILY>_COST`. Providers that write for free simply leave `cache_write` at the input price, which nets those tokens to zero.
 
 Since the cache still keys on a stable prefix, the big gotcha above is unchanged: a lorebook that shuffles its entries invalidates everything after it.
 
 ## Thinking (reasoning, `<think></think>` blocks in Janitor)
-
 Thinking can be enabled/disabled from the CLI. Some parameters (prefill, temperature) are incompatible with thinking, they are automatically disabled when thinking is enabled.
 
 Disable thinking
@@ -283,7 +308,6 @@ OpenAI, GLM, Kimi and MiMo report that count. Anthropic and Aion do not, and rat
 Because reasoning tokens also count against the output limit, a small `max_tokens` can be consumed entirely by thinking and leave an empty message; the proxy warns when it sees that, but the fix is to raise `max_tokens` in Janitor or lower the effort.
 
 ### Thinking preservation
-
 Anthropic *does* allow you to preserve thinking blocks and send them back to Claude. Not as the raw `<think></think>` text blocks, but as special signed and encoded blocks from Anthropic. Under the hood they're the same text you see in `<think></think>`, but signed by Anthropic (why, yes, this is indeed what the model was thinking, officer). Janitor does not save these blocks.
 
 This proxy can preserve these blocks if `PRESERVE_THINKING_BLOCKS > 0`. In that case, these special blocks will be appended to the end of the assistant message with the `~~~` prefix (making them invisible unless you're editing the message). When the message is re-sent, the proxy extracts these preserved blocks from the message and sends them to Anthropic in the appropriate fields.
@@ -295,7 +319,6 @@ Note that because your chats will have these invisible thinking blocks embedded 
 The number in `PRESERVE_THINKING_BLOCKS` controls how many assistant messages from end will have their thoughts preserved. `inf` is accepted meaning all the assistant messages. Naturally, using this feature makes thinking contribute to input tokens.
 
 ## Summaries
-
 The proxy supports summarizing and replacing arbitrary messages!
 
 In any **assistant** message add the following text at the end:
@@ -331,11 +354,9 @@ I was born at a very young age...
 The proxy should print a warning if you made mistakes with your tags somewhere (forgot to close one, mistyped the tag, etc...).
 
 ## Image generation
-
 Image generation is optional and separate from chat. Selecting or invoking an image model never changes `MODEL`, the active backend, or the text prices your conversation uses.
 
 Turn it on in `.env`:
-
 ```ini
 IMAGE_GENERATION_ENABLED=true
 IMAGE_PROVIDER=gpt
@@ -346,7 +367,6 @@ IMAGE_OUTPUT_DIR=generated_images
 `IMAGE_PROVIDER` may reuse a provider declared in one of the text-provider lists, or name a standalone `<NAME>_BASE_URL` / `<NAME>_API_KEY` block. That lets you chat through one provider and generate images through another without adding image-only models to the chat `model` list.
 
 ### Chat trigger
-
 Put an `<image_generation>` block in a user message. The proxy strips the block before sending the conversation to the text model, and only blocks in the latest user message can trigger generation:
 
 ```xml
@@ -371,7 +391,6 @@ Allowed overrides are `prompt`, `size`, `quality`, `output_format`, `background`
 `filename` is a bare name, never a path. Existing files are not overwritten; an index is appended. `size` may be `auto` or a valid model size; for `gpt-image-2`, `background: transparent` is rejected.
 
 ### Direct endpoints
-
 ```text
 POST  /v1/images/generations   text to image
 POST  /v1/images/edits         image to image
@@ -394,7 +413,6 @@ client.images.edit(model="gpt-image-2", image=[open("a.png","rb"), open("b.png",
 `GET /` reports image defaults, limits and the resolved output directory for clients that want to prefill controls.
 
 ### Editing
-
 For chat-triggered edits, put reference images in console slots:
 
 ```text
@@ -443,12 +461,10 @@ image edit mask clear
 A mask set this way applies to every edit that does not name one of its own. A request that wants none says so with `mask: false` (or `"none"`/`"off"`) — leaving the key out still inherits the console's, which is the trap that value exists to avoid.
 
 ### Inline references
-
 Any reference — a mask included — may be given as a base64 `data:` URL instead of a path:
 
 ```json
-{"prompt": "…", "images": ["/home/you/pictures/coat.png"],
- "mask": "data:image/png;base64,iVBORw0KGgo…"}
+{"prompt": "…", "images": ["/home/you/pictures/coat.png"], "mask": "data:image/png;base64,iVBORw0KGgo…"}
 ```
 
 The two encodings mix freely, which is the point: large references stay on disk while something the caller holds only in memory — a mask drawn in an editor, a picture that was never a file — rides along inline. Inline bytes reach no filesystem, so the path allowlist does not apply to them, and they are held to exactly the checks an upload gets, `IMAGE_EDIT_MAX_BYTES` included (measured before decoding). Content decides the format; the mediatype in the URL is advisory.
@@ -458,7 +474,6 @@ A mask that arrived as bytes is written into `masks/` under the output directory
 Image calls retry gateway-class failures (502/503/504/520/522/524 and dropped connections). Tune with `IMAGE_RETRY_ATTEMPTS` and `IMAGE_RETRY_BACKOFF_SECONDS`.
 
 ### Batches, Manifest, Cost
-
 `batch: true` submits through the provider Batch API instead of generating immediately. It cannot return an image inside a chat turn. The proxy assigns each submitted batch a small number, persists it, and can poll unfinished batches in the background:
 
 ```text
@@ -506,7 +521,6 @@ GPT_IMAGE_MODEL_GPTIMAGE2_COST={text_input: 5.00, image_input: 8.00, image_outpu
 `IMAGE_PRICE_TABLE` is used only when the provider returns no image usage object; those costs are flagged as estimates.
 
 ## Code layout
-
 The backend boundary is the upstream wire protocol — one module per protocol, each exposing the same five entry points:
 
 | Module                   | Speaks                              | Declared in                     |
@@ -518,13 +532,12 @@ The backend boundary is the upstream wire protocol — one module per protocol, 
 Which module serves a provider is the list you declared it in, and nothing else. Selecting one of its models is what binds the backend.
 
 Around them:
-
 - **`server.py`** — the HTTP endpoint Janitor talks to, the runtime CLI, and every model-agnostic transform (summary blocks, lorebook handling, chat snapshots). It picks the backend module per request; the Anthropic-protocol features are the only place it asks which one it got.
 - **`providers.py`** — the registry every backend shares: provider config, the aggregated model list, model selection and pricing, HTTP transport, and the request message list the two OpenAI-style modules build from. It imports none of the backends, so a provider can never depend on the endpoint that happens to be selected.
 - **`common.py`** — configuration from `.env`, cost accounting, text helpers, error rendering.
+- **`nano_gpt.py`** — the NanoGPT catalogue, provider selection, thinking and prices. Requests still go through `v1_chat_completions.py`.
 
 Image generation is secondary and separate from chat backend selection:
-
 - **`v1_images.py`** — `/v1/images/*` validation, transport, storage, manifests, batches and image cost accounting.
 - **`image_orchestrator.py`** — parses `<image_generation>` blocks and decides whether a chat turn still needs the text model.
 
@@ -532,4 +545,4 @@ Tests live in `tests/` and run with `python tests/test_driver.py`. They need no 
 
 ## If you've read this far...
 
-Check out my [bot](https://janitorai.com/profiles/c71e4e8f-c4bc-478a-9cb7-6f90cdb5cb16_profile-of-narrava)!
+Check out my [bots](https://janitorai.com/profiles/c71e4e8f-c4bc-478a-9cb7-6f90cdb5cb16_profile-of-narrava)!
