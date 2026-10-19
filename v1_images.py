@@ -1169,6 +1169,12 @@ def reference_param(reference: ReferenceImage) -> Dict[str, str]:
     return {"image_url": f"data:{reference.mime};base64,{base64.b64encode(payload).decode('ascii')}"}
 
 
+def supports_image_moderation(model: str) -> bool:
+    """GPT Image models support moderation, including provider-prefixed model IDs."""
+    model = model.rsplit("/", 1)[-1].strip().lower()
+    return model.startswith("gpt-image-") or model == "chatgpt-image-latest"
+
+
 def build_body(req: ImageRequest) -> Dict[str, Any]:
     """
     The provider request.
@@ -1184,6 +1190,8 @@ def build_body(req: ImageRequest) -> Dict[str, Any]:
     }
     if req.size    != "auto" : body["size"]    = req.size
     if req.quality != "auto" : body["quality"] = req.quality
+    if supports_image_moderation(cfg.image_model):
+        body["moderation"] = "low"
 
     # A batched edit carries its references inline, since the Batch API accepts no multipart upload.
     # Verified against the provider.
@@ -1228,6 +1236,8 @@ def build_edit_form(req: ImageRequest) -> Tuple[Dict[str, str], List[Tuple[str, 
     }
     if req.size    != "auto" : data["size"]    = req.size
     if req.quality != "auto" : data["quality"] = req.quality
+    if supports_image_moderation(cfg.image_model):
+        data["moderation"] = "low"
 
     files: List[Tuple[str, Any]] = [
         ("image[]", (reference.filename(), reference.open(), reference.mime))

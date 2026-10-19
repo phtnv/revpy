@@ -2288,6 +2288,7 @@ def test_image_edit_form() -> bool:
             "model": "gpt-image-2", "prompt": "make it blue", "n": "1",
             "output_format": "png", "background": "opaque",
             "size": "1024x1024", "quality": "high",
+            "moderation": "low",
         }
         if not check_equal(expected_data, data):
             passed = False
