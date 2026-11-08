@@ -1107,6 +1107,103 @@ DEEPINFRA_THINKING_CASES = [
 ]
 
 
+def test_gemini_proxy_thinking() -> bool:
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing Gemini proxy controls and endpoint isolation... ", end="")
+    cfg = make_config()
+    cfg.backend = "renamed"
+    passed = True
+    prepared = {"messages": [{"role": "user", "content": "hi"}], "system_segments": [],
+                "system_summary_text": "", "lorebook_at_end_text": "", "max_tokens": 4096}
+    for host in ("api.atlascloud.ai", "api.deepinfra.com"):
+        cfg.providers = {cfg.backend: make_provider(base_url=f"https://{host}/v1")}
+        for name in ("2.5-flash", "2.5-flash-lite", "2.5-pro", "3-flash-preview",
+                     "3-flash-preview-developer", "3.1-pro", "3.1-pro-preview", "3.1-flash-lite",
+                     "3.5-flash", "3.7-flash", "3.8-flash-developer", "4-argon", "4-argon-developer"):
+            cfg.model = "google/gemini-" + name
+            for effort in common.THINK_EFFORT_ORDER:
+                cfg.thinking_enabled = True
+                cfg.thinking_effort = effort
+                folded = effort if effort in ("low", "medium") else "high"
+                native = host == "api.atlascloud.ai" and name.startswith("2.5-")
+                expected = ({"google": {"thinking_config": {"thinking_budget":
+                            {"low": 1024, "medium": 8192, "high": 24576}[folded]}}}
+                            if native else {"reasoning_effort": folded})
+                passed &= check_case_equal(name + effort, expected,
+                    chat_api.provider_thinking_params(cfg.model, True, effort))
+                body = chat_api.build_body(prepared)
+                passed &= check_case_equal("wire " + name, expected,
+                    {k: body[k] for k in expected})
+            cfg.thinking_enabled = False
+            expected_off = "none" if name in ("2.5-flash", "2.5-flash-lite") else (
+                "minimal" if name in ("3-flash-preview", "3-flash-preview-developer", "3.1-flash-lite", "3.5-flash") else "low")
+            off = ({"google": {"thinking_config": {"thinking_budget": 128 if name == "2.5-pro" else 0}}}
+                   if native else {"reasoning_effort": expected_off})
+            passed &= check_case_equal("off " + name, off,
+                chat_api.provider_thinking_params(cfg.model, False, "max"))
+            passed &= check_case_equal("can stop " + name, {"stop": name in ("2.5-flash", "2.5-flash-lite")},
+                {"stop": chat_api.thinking_can_be_disabled(cfg.model)})
+        cfg.model = "google/gemini-3.5-flash"
+        cfg.providers[cfg.backend]["extra_body"] = {"reasoning_effort": "high"}
+        passed &= check_case_equal("explicit override", {"effort": "high"},
+            {"effort": chat_api.build_body(prepared)["reasoning_effort"]})
+        for name in ("google/gemini-3-pro-image", "google/gemini-2.5-flash-image", "google/gemini-5-pro"):
+            passed &= check_case_equal("excluded " + name, {"params": None},
+                {"params": chat_api.provider_thinking_params(name, True, "high")})
+    cfg.providers[cfg.backend]["base_url"] = "https://other.test/v1"
+    passed &= check_case_equal("unrelated endpoint", {"params": None},
+        {"params": chat_api.provider_thinking_params("google/gemini-3.5-flash", True, "high")})
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
+def test_gemini_output_bounds() -> bool:
+    global tests_ttl
+    tests_ttl += 1
+    print("Testing Gemini request output bounds... ", end="")
+    cfg = make_config()
+    cfg.backend = "renamed"
+    passed = True
+    prepared = {"messages": [{"role": "user", "content": "hi"}], "system_segments": [],
+                "system_summary_text": "", "lorebook_at_end_text": "", "max_tokens": 1_000_000}
+    for host in ("api.atlascloud.ai", "api.deepinfra.com"):
+        cfg.providers = {cfg.backend: make_provider(base_url=f"https://{host}/v1")}
+        provider = cfg.providers[cfg.backend]
+        for model in ("google/gemini-2.5-flash", "google/gemini-2.5-flash-lite", "google/gemini-2.5-pro", "google/gemini-3.1-pro-preview",
+                      "google/gemini-3.5-flash", "google/gemini-3.8-flash-developer", "google/gemini-4-argon"):
+            cfg.model = model
+            ceiling = 65535 if host == "api.atlascloud.ai" and model == "google/gemini-2.5-flash-lite" else 65536
+            for field in ("max_tokens", "max_completion_tokens"):
+                provider["max_tokens_param"] = field
+                for requested, expected in ((1, 1), (8192, 8192), (65536, 65536), (65537, 65536),
+                                            (1_000_000, 65536), (0, 1)):
+                    prepared["max_tokens"] = requested
+                    body = chat_api.build_body(prepared)
+                    passed &= check_case_equal(model + field, {"limit": min(expected, ceiling), "source": requested},
+                        {"limit": body[field], "source": prepared["max_tokens"]})
+                provider["extra_body"] = {field: 1_000_000}
+                passed &= check_case_equal("override bounded", {"limit": ceiling},
+                    {"limit": chat_api.build_body(prepared)[field]})
+                provider["extra_body"] = {}
+        # The effective outgoing model determines whether the rule applies.
+        cfg.model = "google/gemini-3.5-flash"
+        provider["extra_body"] = {"model": "other/model", "max_completion_tokens": 1_000_000}
+        passed &= check_case_equal("model override", {"limit": 1_000_000},
+            {"limit": chat_api.build_body(prepared)["max_completion_tokens"]})
+    for host, model in (("other.test", "google/gemini-3.5-flash"),
+                        ("api.deepinfra.com", "google/gemini-5-pro"),
+                        ("api.atlascloud.ai", "google/gemini-3-pro-image"),
+                        ("api.atlascloud.ai", "xiaomi/mimo-v2.5-pro")):
+        body = {"model": model, "max_tokens": 1_000_000}
+        chat_api.bound_gemini_proxy_output(body, make_provider(base_url=f"https://{host}/v1"))
+        passed &= check_case_equal("unrelated route/model", {"limit": 1_000_000}, {"limit": body["max_tokens"]})
+    if passed : print(f"{GREEN}PASS{RESET}")
+    else      : print(f"{RED}FAIL{RESET}")
+    return passed
+
+
 def test_atlas_thinking() -> bool:
     global tests_ttl
     tests_ttl += 1
@@ -3596,6 +3693,8 @@ if __name__ == "__main__":
     tests_passed += test_model_list_filter()
     tests_passed += test_chat_model_tags()
     tests_passed += test_atlas_thinking()
+    tests_passed += test_gemini_proxy_thinking()
+    tests_passed += test_gemini_output_bounds()
 
     tests_passed += test_nano_gpt_catalogue()
     tests_passed += test_nano_gpt_catalogue_file()

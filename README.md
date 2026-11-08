@@ -148,6 +148,16 @@ CLI model selection is runtime-only. To make a model the default after restart, 
 
 If a provider's `/models` request fails, the proxy warns and carries on with the others.
 
+## Gemini through Atlas Cloud and DeepInfra
+
+Gemini text models use the shared thinking toggle and effort setting. `xhigh` and `max` map to `high`. Atlas Gemini 2.5 converts effort to a token budget; `THINKING_BUDGET` does not apply. The CLI shows the setting sent to the provider. Models that cannot disable thinking use their lowest supported setting instead. Provider `EXTRA_BODY` overrides take precedence.
+
+Outgoing token limits are automatically bounded to 1–65,536 (1–65,535 for Atlas Gemini 2.5 Flash-Lite), including limits set through `EXTRA_BODY`. Your configured value is unchanged.
+
+Prompt caching is automatic and best-effort. Keep stable content at the beginning of the conversation and changing content at the end. `CACHE_EN` and Claude cache markers/TTLs do not apply. DeepInfra accepts an optional session-scoped `prompt_cache_key` through `INFRA_EXTRA_BODY`; its paid cache-retention controls do not support Gemini.
+
+Cache hits do not necessarily mean discounted input. Revpy uses the provider's reported cost when available, otherwise the model's published rates.
+
 ## NanoGPT
 [NanoGPT](https://nano-gpt.com) is an aggregator: one key, hundreds of models, and for many open-weights models a choice of the provider serving them. Declare it as a `/chat/completions` provider and mark it an aggregator:
 

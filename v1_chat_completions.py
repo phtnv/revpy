@@ -11,6 +11,7 @@ An OpenAI-compatible gateway declared here still works -- you just lose the reas
 import httpx
 import json
 import re
+from urllib.parse import urlsplit
 
 import nano_gpt
 
@@ -143,7 +144,8 @@ def mimo_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort:
     return {"thinking": {"type": "enabled" if thinking_enabled else "disabled"}}
 
 
-# Atlas Cloud and DeepInfra take reasoning_effort for every model, not the vendors' own controls.
+# Atlas Cloud and DeepInfra use reasoning_effort for the models in these tables.
+# Gemini has a separate, endpoint-aware mapping below (Atlas 2.5 needs native budgets).
 # What each level does varies by model, so these tables are measured, not documented (2026-09-22).
 # Each row: model id pattern, the levels that make it think (weakest first), the level that stops it.
 # "" means nothing stops it. Unlisted models get nothing; EXTRA_BODY is the escape hatch there.
@@ -191,8 +193,45 @@ def deepinfra_thinking_params(model_id: str, thinking_enabled: bool, thinking_ef
     return table_thinking_params(DEEPINFRA_THINKING, model_id, thinking_enabled, thinking_effort)
 
 
+GEMINI_EFFORTS = ("low", "medium", "high")
+# Explicit text families only: image/audio models and future versions need their own verification.
+GEMINI_MODEL_RE = re.compile(
+    r"^google/gemini-(?:2\.5-(?:pro|flash(?:-lite)?)|3\.1-pro|"
+    r"3-flash|3\.1-flash-lite|3\.[5678]-flash|3\.5-flash-lite|4-argon)(?:-preview)?(?:-developer)?$"
+)
+
+
+def gemini_proxy_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[Dict[str, Any]]:
+    """Google's OpenAI effort ladder on Atlas/DeepInfra (checked 2026-11-08).
+
+    Gemini 2.5 maps low/medium/high to budgets 1024/8192/24576; 3+ uses levels.
+    Do not send native thinking budgets to 3+: Google deprecates/rejects them.
+    Endpoint identity matters: both proxies use exactly the same Google model ids.
+    NanoGPT is dispatched separately, using its catalogue rather than this table.
+    """
+    host = urlsplit(cfg.providers.get(cfg.backend, {}).get("base_url", "")).hostname
+    if host not in ("api.atlascloud.ai", "api.deepinfra.com") or not GEMINI_MODEL_RE.fullmatch(model_id):
+        return None
+    if host == "api.atlascloud.ai" and model_id.startswith("google/gemini-2.5-"):
+        # Atlas ignores effort=none on Flash, but honors Google's explicit zero budget.
+        # Use the official OpenAI compatibility budget mapping for the whole 2.5 family.
+        effort = effort_params(GEMINI_EFFORTS, "", True, thinking_effort)["reasoning_effort"]
+        budget = {"low": 1024, "medium": 8192, "high": 24576}[effort]
+        if not thinking_enabled:
+            budget = 128 if model_id == "google/gemini-2.5-pro" else 0
+        return {"google": {"thinking_config": {"thinking_budget": budget}}}
+    if thinking_enabled:
+        return effort_params(GEMINI_EFFORTS, "", True, thinking_effort)
+
+    if model_id in ("google/gemini-2.5-flash", "google/gemini-2.5-flash-lite"):
+        return {"reasoning_effort": "none"}
+    # Minimal is a reduced-thinking mode, not a guarantee of zero reasoning.
+    minimal = re.fullmatch(r"google/gemini-3(?:\.[156])?-flash(?:-lite)?(?:-preview)?(?:-developer)?", model_id)
+    return {"reasoning_effort": "minimal" if minimal else "low"}
+
+
 THINKING_DIALECTS = (aion_thinking_params, glm_thinking_params, kimi_thinking_params, mimo_thinking_params,
-                     atlas_thinking_params, deepinfra_thinking_params)
+                     gemini_proxy_thinking_params, atlas_thinking_params, deepinfra_thinking_params)
 
 
 def provider_thinking_params(model_id: str, thinking_enabled: bool, thinking_effort: str) -> Optional[Dict[str, Any]]:
@@ -220,6 +259,11 @@ def thinking_can_be_disabled(model_id: str) -> bool:
     So it can when "off" sends something other than the weakest "on" does.
     Models that keep reasoning regardless (kimi-k3) get the weakest setting the API offers.
     """
+    gemini = gemini_proxy_thinking_params(model_id, False, cfg.thinking_effort)
+    if gemini is not None:
+        return gemini.get("reasoning_effort") == "none" or (
+            gemini.get("google", {}).get("thinking_config", {}).get("thinking_budget") == 0
+        )
     off = provider_thinking_params(model_id, False, cfg.thinking_effort)
     return off != provider_thinking_params(model_id, True, THINK_EFFORT_ORDER[0])
 
@@ -237,13 +281,15 @@ def resolve_thinking() -> None:
         print(f"Thinking passthrough: nothing to send ('{cfg.model}' has no thinking controls).")
         return
 
-    effort = params.get("reasoning_effort")
+    budget = params.get("google", {}).get("thinking_config", {}).get("thinking_budget")
+    effort = params.get("reasoning_effort", budget)
     if not cfg.thinking_enabled:
         if thinking_can_be_disabled(cfg.model) : print("Thinking passthrough: disabled.")
         else                                   : print(f"Thinking passthrough: '{cfg.model}' cannot stop reasoning; sending the weakest setting it has ('{effort}').")
         return
 
-    if effort is None : print(f"Thinking passthrough: enabled ('{cfg.model}' has no effort control).")
+    if budget is not None : print(f"Thinking passthrough: enabled with budget {budget} (from '{cfg.thinking_effort}').")
+    elif effort is None : print(f"Thinking passthrough: enabled ('{cfg.model}' has no effort control).")
     else              : print(f"Thinking passthrough: enabled with effort '{effort}' (from '{cfg.thinking_effort}').")
 
 
@@ -270,6 +316,12 @@ def print_think_status() -> None:
 
     # What the current settings actually send, versus what the model can do at all.
     actual = provider_thinking_params(cfg.model, cfg.thinking_enabled, cfg.thinking_effort) or {}
+    budget = actual.get("google", {}).get("thinking_config", {}).get("thinking_budget")
+    if budget is not None:
+        state = "enabled" if cfg.thinking_enabled else ("disabled" if thinking_can_be_disabled(cfg.model) else "always on")
+        print(f"  Thinking            {state} (sent budget {budget})")
+        print(f"  Thinking effort     {cfg.thinking_effort} (mapped to token budget)")
+        return
     if   cfg.thinking_enabled                : print( "  Thinking enabled    ✅")
     elif thinking_can_be_disabled(cfg.model) : print( "  Thinking enabled    ❌")
     else                                     : print(f"  Thinking enabled    ❌  (always on for '{cfg.model}', sent as '{actual.get('reasoning_effort')}')")
@@ -305,10 +357,28 @@ def apply_sampling(body: Dict[str, Any]) -> None:
     # top_k is not part of the OpenAI schema; providers that accept it can get it via EXTRA_BODY.
 
 
+def bound_gemini_proxy_output(body: Dict[str, Any], provider: Dict[str, Any]) -> None:
+    """Keep Gemini text requests within the proxies' single-response output budget.
+
+    Google documents 65,536 for these models; DeepInfra rejects 65,537 despite
+    advertising a million-token max_tokens in its catalogue. Atlas Flash-Lite 2.5
+    stops at 65,535. Gemini 4 long decode requires a separate continuation protocol.
+    Apply after EXTRA_BODY so an override cannot reintroduce an invalid limit.
+    """
+    host = urlsplit(provider.get("base_url", "")).hostname
+    if host not in ("api.atlascloud.ai", "api.deepinfra.com") or not GEMINI_MODEL_RE.fullmatch(body.get("model", "")):
+        return
+    limit = 65_535 if host == "api.atlascloud.ai" and body["model"] == "google/gemini-2.5-flash-lite" else 65_536
+    for field in ("max_tokens", "max_completion_tokens"):
+        value = body.get(field)
+        if isinstance(value, int) and not isinstance(value, bool):
+            body[field] = min(limit, max(1, value))
+
+
 def build_body(prepared: Dict[str, Any]) -> Dict[str, Any]:
     """
     Builds the chat completion request from a prepared chat request.
-    The provider's EXTRA_BODY is merged in verbatim last.
+    EXTRA_BODY overrides are merged before applying Gemini output bounds.
     """
     provider = cfg.providers[cfg.backend]
     messages = build_message_list(prepared)
@@ -335,6 +405,7 @@ def build_body(prepared: Dict[str, Any]) -> Dict[str, Any]:
         body.update(nano_gpt.route_params(cfg.model))
 
     body.update(provider["extra_body"])
+    bound_gemini_proxy_output(body, provider)
 
     return body
 
